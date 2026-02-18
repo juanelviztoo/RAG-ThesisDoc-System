@@ -1,0 +1,11 @@
+index:
+  collection_name: "skripsi_naive"
+
+retrieval:
+  mode: "hybrid"
+  rrf_k: 60
+
+bm25:
+  use_sastrawi: true
+  k1: 1.5
+  b: 0.75

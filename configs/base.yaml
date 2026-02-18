@@ -1,0 +1,32 @@
+project:
+  name: "rag-skripsi-system"
+
+paths:
+  data_raw_dir: "data_raw"
+  runs_dir: "runs"
+
+index:
+  persist_dir: "data_index/chroma"
+  collection_name: "skripsi_naive"
+
+chunking:
+  chunk_size: 1200
+  chunk_overlap: 200
+
+retrieval:
+  top_k: 8
+  mode: "dense"   # dense | hybrid
+  rrf_k: 60
+
+bm25:
+  k1: 1.5
+  b: 0.75
+  use_sastrawi: false
+
+memory:
+  enabled: false
+  window: 4
+
+llm:
+  provider: "groq"   # groq | ollama
+  model: "llama3-8b-8192"

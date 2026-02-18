@@ -1,0 +1,5 @@
+index:
+  collection_name: "skripsi_naive"
+
+retrieval:
+  mode: "dense"

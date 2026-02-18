@@ -1,0 +1,8 @@
+index:
+  collection_name: "skripsi_structured"
+
+# nanti bisa berkembang jadi dual collection:
+# index:
+#   collections:
+#     narrative: "skripsi_structured_narasi"
+#     citations: "skripsi_structured_sitasi"
