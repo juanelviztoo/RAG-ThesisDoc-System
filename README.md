@@ -1,4 +1,4 @@
-# rag-skripsi-system
+# Retrieval-Augmented Generation (RAG) pada Dokumen Skripsi Menggunakan Hybrid Retrieval dan Metadata Filtering dengan Mekanisme Cross-Encoder Reranking serta Post-Hoc Verification
 
 Prototipe sistem RAG untuk dokumen skripsi: Naive RAG -> Hybrid Retrieval -> Proposed Method (bertahap).
 
