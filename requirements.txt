@@ -24,10 +24,16 @@ pyyaml
 rank-bm25
 Sastrawi
 
-# Optional LLM clients (gunakan salah satu sesuai provider)
-ollama
-groq
+# LLM providers - LangChain integrations (gunakan salah satu sesuai provider)
 langchain-groq
+langchain-openai
+langchain-ollama
+
+# Provider SDKs
+groq
+openai
+tiktoken
+ollama
 
 # Utilities
 tqdm
