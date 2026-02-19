@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import streamlit as st  # nanti dipasang di requirements
 from dotenv import load_dotenv
+from pathlib import Path
 
 from src.core.config import load_config
 from src.core.run_manager import RunManager
@@ -20,7 +21,7 @@ def main():
     cfg = load_config(config_path)
 
     # init run
-    rm = RunManager(runs_dir=cfg["paths"]["runs_dir"], config=cfg).start()
+    rm = RunManager(runs_dir=Path(cfg["paths"]["runs_dir"]), config=cfg).start()
     logger = setup_logger(rm.app_log_path)
     logger.info(f"Run started: {rm.run_id}")
 

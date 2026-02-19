@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,7 +50,7 @@ class RunManager:
 
     def start(self) -> "RunManager":
         self.run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.run_path = self.runs_dir / self.run_id
+        self.run_path = Path(self.runs_dir) / self.run_id
         self.run_path.mkdir(parents=True, exist_ok=True)
 
         self.config_hash = sha256_json(self.config)
