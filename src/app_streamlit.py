@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-import streamlit as st  # nanti dipasang di requirements
-from dotenv import load_dotenv
 from pathlib import Path
 
+import streamlit as st  # nanti dipasang di requirements
+from dotenv import load_dotenv
+
 from src.core.config import load_config
-from src.core.run_manager import RunManager
 from src.core.logger import setup_logger
+from src.core.run_manager import RunManager
 from src.rag.generate import generate_answer
 
 
@@ -31,7 +32,9 @@ def main():
     st.sidebar.write("Mode:", cfg["retrieval"]["mode"])
     st.sidebar.write("LLM Provider (env):", os.getenv("LLM_PROVIDER", "(not set)"))
 
-    st.info("UI scaffold siap. V1 Retrieval belum diimplementasikan, jadi saat ini konteks masih dummy.")
+    st.info(
+        "UI scaffold siap. V1 Retrieval belum diimplementasikan, jadi saat ini konteks masih dummy."
+    )
 
     user_q = st.text_input("Tanya sesuatu:")
     if st.button("Kirim") and user_q.strip():

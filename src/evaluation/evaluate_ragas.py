@@ -14,6 +14,7 @@ def main():
 
     run_path = Path(args.runs_dir) / args.run_id
     dataset_path = run_path / "eval_dataset.json"
+    _ = dataset_path
 
     # TODO: implement RAGAS metrics read from dataset_path
     raise NotImplementedError("RAGAS evaluation belum diimplementasikan (scaffold).")

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 
 
 def _get_cfg(cfg: Dict[str, Any], path: List[str], default=None):
@@ -25,7 +24,9 @@ def _build_llm(cfg: Dict[str, Any]):
     """
     load_dotenv()  # membaca .env (jika ada) - aman walau dipanggil berkali-kali
 
-    provider = (os.getenv("LLM_PROVIDER") or _get_cfg(cfg, ["llm", "provider"], "groq")).strip().lower()
+    provider = (
+        (os.getenv("LLM_PROVIDER") or _get_cfg(cfg, ["llm", "provider"], "groq")).strip().lower()
+    )
     temperature = float(_get_cfg(cfg, ["llm", "temperature"], 0.2))
     max_tokens = _get_cfg(cfg, ["llm", "max_tokens"], 512)
     timeout = _get_cfg(cfg, ["llm", "timeout"], 60)
@@ -41,7 +42,9 @@ def _build_llm(cfg: Dict[str, Any]):
         api_key = os.getenv("GROQ_API_KEY")
         model = os.getenv("GROQ_MODEL") or model_fallback or "llama3-8b-8192"
         if not api_key:
-            raise ValueError("GROQ_API_KEY belum di-set. Isi di file .env (lokal) sebelum memanggil LLM.")
+            raise ValueError(
+                "GROQ_API_KEY belum di-set. Isi di file .env (lokal) sebelum memanggil LLM."
+            )
 
         return ChatGroq(
             api_key=api_key,
@@ -59,7 +62,9 @@ def _build_llm(cfg: Dict[str, Any]):
         api_key = os.getenv("OPENAI_API_KEY")
         model = os.getenv("OPENAI_MODEL") or model_fallback or "gpt-4o-mini"
         if not api_key:
-            raise ValueError("OPENAI_API_KEY belum di-set. Isi di file .env (lokal) sebelum memanggil LLM.")
+            raise ValueError(
+                "OPENAI_API_KEY belum di-set. Isi di file .env (lokal) sebelum memanggil LLM."
+            )
 
         # ChatOpenAI supports api_key=... directly (or env)
         return ChatOpenAI(
@@ -98,20 +103,28 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     max_ctx = 8
     contexts = contexts[:max_ctx]
 
-    ctx_block = "\n\n".join([f"[CTX {i+1}]\n{c}" for i, c in enumerate(contexts)]) if contexts else "(Tidak ada konteks.)"
+    ctx_block = (
+        "\n\n".join([f"[CTX {i+1}]\n{c}" for i, c in enumerate(contexts)])
+        if contexts
+        else "(Tidak ada konteks.)"
+    )
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system",
-             "Kamu adalah asisten QA untuk dokumen akademik. "
-             "Jawab dalam Bahasa Indonesia, ringkas tapi jelas. "
-             "Gunakan HANYA informasi dari konteks. "
-             "Jika tidak cukup, katakan 'Tidak ditemukan pada dokumen'."),
-            ("human",
-             "Pertanyaan:\n{question}\n\nKonteks:\n{context}\n\n"
-             "Instruksi:\n"
-             "- Beri jawaban final.\n"
-             "- Jika mengutip fakta penting, sebutkan CTX mana yang mendukung (mis. [CTX 2]).")
+            (
+                "system",
+                "Kamu adalah asisten QA untuk dokumen akademik. "
+                "Jawab dalam Bahasa Indonesia, ringkas tapi jelas. "
+                "Gunakan HANYA informasi dari konteks. "
+                "Jika tidak cukup, katakan 'Tidak ditemukan pada dokumen'.",
+            ),
+            (
+                "human",
+                "Pertanyaan:\n{question}\n\nKonteks:\n{context}\n\n"
+                "Instruksi:\n"
+                "- Beri jawaban final.\n"
+                "- Jika mengutip fakta penting, sebutkan CTX mana yang mendukung (mis. [CTX 2]).",
+            ),
         ]
     )
 

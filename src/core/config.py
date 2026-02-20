@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
-import copy
 
 import yaml  # akan dipasang nanti di requirements
 
@@ -25,7 +25,9 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def load_config(config_path: str | Path, base_path: str | Path = "configs/base.yaml") -> Dict[str, Any]:
+def load_config(
+    config_path: str | Path, base_path: str | Path = "configs/base.yaml"
+) -> Dict[str, Any]:
     base = load_yaml(base_path)
     override = load_yaml(config_path)
     cfg = deep_merge(base, override)

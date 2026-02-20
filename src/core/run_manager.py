@@ -3,11 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def now_iso_jakarta() -> str:
@@ -69,8 +68,7 @@ class RunManager:
             "config": self.config,  # snapshot sekali per-run
         }
         (self.run_path / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return self
 

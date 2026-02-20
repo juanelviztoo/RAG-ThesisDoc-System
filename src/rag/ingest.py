@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
-from src.core.config import load_config, ConfigPaths
+from src.core.config import ConfigPaths, load_config
 
 
 def ingest(cfg: Dict[str, Any]) -> None:
@@ -18,7 +17,9 @@ def ingest(cfg: Dict[str, Any]) -> None:
     """
     paths = ConfigPaths.from_cfg(cfg)
     collection_name = cfg["index"]["collection_name"]
-    print(f"[INGEST] data_raw_dir={paths.data_raw_dir} persist_dir={paths.persist_dir} collection={collection_name}")
+    print(
+        f"[INGEST] data_raw_dir={paths.data_raw_dir} persist_dir={paths.persist_dir} collection={collection_name}"
+    )
 
     # TODO (V1): implement PDF loader + naive chunking + embedding + chroma upsert
     # Nanti diisikan saat mulai coding versi 1.0
