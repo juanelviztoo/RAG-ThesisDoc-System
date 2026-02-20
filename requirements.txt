@@ -1,3 +1,7 @@
+# Coding Helper (formatter & linter)
+black
+ruff
+
 # Core RAG framework
 langchain
 langchain-community

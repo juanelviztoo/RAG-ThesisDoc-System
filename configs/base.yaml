@@ -9,6 +9,10 @@ index:
   persist_dir: "data_index/chroma"
   collection_name: "skripsi_naive"
 
+embeddings:
+  model_name: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  device: "cpu"
+
 chunking:
   chunk_size: 1200
   chunk_overlap: 200
