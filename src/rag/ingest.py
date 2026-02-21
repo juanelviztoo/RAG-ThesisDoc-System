@@ -161,13 +161,19 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
     logger.info(f"Chroma count: {col.count()}")
 
     logger.info("=== INGEST DONE ===")
-    print(f"[OK] Ingest selesai. run_id={rm.run_id} | collection={collection_name} | count={col.count()}")
+    print(
+        f"[OK] Ingest selesai. run_id={rm.run_id} | collection={collection_name} | count={col.count()}"
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path config yaml (e.g., configs/v1.yaml)")
-    ap.add_argument("--reset", action="store_true", help="Hapus collection lama sebelum ingest (disarankan saat re-index)")
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="Hapus collection lama sebelum ingest (disarankan saat re-index)",
+    )
     ap.add_argument("--pdf_glob", default="*.pdf", help="Pattern PDF (default: *.pdf)")
     args = ap.parse_args()
 
