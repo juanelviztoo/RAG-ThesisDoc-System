@@ -35,6 +35,7 @@ llm:
   # provider bisa dioverride oleh env var: LLM_PROVIDER
   # pilihan: groq | openai | ollama
   provider: "groq"
+  max_chars_per_ctx: 1800
 
   # model default (fallback kalau env var model tidak di-set)
   # groq    : llama3-8b-8192
