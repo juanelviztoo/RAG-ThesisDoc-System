@@ -43,6 +43,7 @@ ollama
 tqdm
 numpy
 pandas
+pillow
 
 # Evaluation (RAGAS) - cukup berat tapi aman ditaruh dari awal
 ragas
