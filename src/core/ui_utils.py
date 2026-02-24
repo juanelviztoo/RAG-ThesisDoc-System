@@ -224,12 +224,9 @@ def render_pdf_viewer(
         rects_all: list[fitz.Rect] = []
         total_hits = 0
         for term in terms:
-            try:
-                rects = page_obj2.search_for(term, hit_max=max_hits_per_term)
-            except TypeError:
-                # kompatibilitas versi lama fitz (tanpa hit_max)
-                rects = page_obj2.search_for(term)
-                rects = rects[:max_hits_per_term]
+            # Portable untuk semua versi PyMuPDF: ambil semua lalu slice sendiri
+            rects = page_obj2.search_for(term)
+            rects = rects[:max_hits_per_term]
             rects_all.extend(rects)
             total_hits += len(rects)
 
