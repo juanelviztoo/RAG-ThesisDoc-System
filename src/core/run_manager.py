@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def now_iso_jakarta() -> str:
@@ -49,7 +49,7 @@ class RunManager:
 
     def start(self) -> "RunManager":
         self.run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.run_path = self.runs_dir / self.run_id
+        self.run_path = Path(self.runs_dir) / self.run_id
         self.run_path.mkdir(parents=True, exist_ok=True)
 
         self.config_hash = sha256_json(self.config)
@@ -68,8 +68,7 @@ class RunManager:
             "config": self.config,  # snapshot sekali per-run
         }
         (self.run_path / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return self
 

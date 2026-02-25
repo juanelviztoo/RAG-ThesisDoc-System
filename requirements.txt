@@ -1,0 +1,50 @@
+# Coding Helper (formatter & linter)
+black
+ruff
+
+# Core RAG framework
+langchain
+langchain-community
+langchain-chroma
+langchain-huggingface
+langchain-text-splitters
+
+# Vector DB
+chromadb
+
+# PDF loader (minimal) + (opsional lebih bagus)
+pypdf
+pymupdf
+
+# Embeddings
+sentence-transformers
+
+# UI + config
+streamlit
+python-dotenv
+pyyaml
+
+# Hybrid retrieval (V2)
+rank-bm25
+Sastrawi
+
+# LLM providers - LangChain integrations (gunakan salah satu sesuai provider)
+langchain-groq
+langchain-openai
+langchain-ollama
+
+# Provider SDKs
+groq
+openai
+tiktoken
+ollama
+
+# Utilities
+tqdm
+numpy
+pandas
+pillow
+
+# Evaluation (RAGAS) - cukup berat tapi aman ditaruh dari awal
+ragas
+datasets

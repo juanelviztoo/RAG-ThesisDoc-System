@@ -9,6 +9,11 @@ index:
   persist_dir: "data_index/chroma"
   collection_name: "skripsi_naive"
 
+embeddings:
+  # ganti jadi intfloat/multilingual-e5-base atau large nantinya
+  model_name: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  device: "cpu"
+
 chunking:
   chunk_size: 1200
   chunk_overlap: 200
@@ -28,5 +33,18 @@ memory:
   window: 4
 
 llm:
-  provider: "groq"   # groq | ollama
+  # provider bisa dioverride oleh env var: LLM_PROVIDER
+  # pilihan: groq | openai | ollama
+  provider: "groq"
+  max_chars_per_ctx: 1800
+
+  # model default (fallback kalau env var model tidak di-set)
+  # groq    : llama3-8b-8192
+  # openai  : gpt-4o-mini
+  # ollama  : llama3
   model: "llama3-8b-8192"
+
+  temperature: 0.2
+  max_tokens: 512
+  timeout: 60
+  max_retries: 2
