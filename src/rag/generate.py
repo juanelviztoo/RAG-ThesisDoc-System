@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
@@ -135,11 +135,69 @@ def _build_context_block(
     return ("\n\n".join(parts) if parts else "(Tidak ada konteks.)"), len(ctxs)
 
 
-_CITATION_RE = re.compile(r"\[CTX\s*\d+\]", re.IGNORECASE)
+# Terima [CTX 2], [CTX2], (CTX 2), CTX 2
+_CITATION_RE = re.compile(r"(\[CTX\s*\d+\]|\(CTX\s*\d+\)|\bCTX\s*\d+\b)", re.IGNORECASE)
+
+
+def _normalize_citations(text: str) -> str:
+    """Ubah variasi sitasi jadi format standar [CTX n]."""
+    t = text or ""
+    # (CTX 2) -> [CTX 2]
+    t = re.sub(r"\(CTX\s*(\d+)\)", r"[CTX \1]", t, flags=re.IGNORECASE)
+    # CTX 2 -> [CTX 2] (jaga agar tidak dobel)
+    t = re.sub(r"(?<!\[)\bCTX\s*(\d+)\b(?!\])", r"[CTX \1]", t, flags=re.IGNORECASE)
+    return t
 
 
 def _has_citation(text: str) -> bool:
     return bool(_CITATION_RE.search(text or ""))
+
+
+_BUKTI_SPLIT_RE = re.compile(r"\bBukti\s*:\s*", re.IGNORECASE)
+
+
+def _enforce_qa_format(out: str) -> str:
+    """
+    Pastikan output selalu punya:
+      Jawaban: ...
+      Bukti: ...
+    Agar parse_answer() dan UI stabil walau LLM kadang bandel.
+    """
+    t = (out or "").strip()
+    if not t:
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    # kalau sudah "Tidak ditemukan", pastikan format lengkap
+    if "tidak ditemukan pada dokumen" in t.lower():
+        # jika user cuma nulis satu kalimat tanpa bukti
+        if "bukti" not in t.lower():
+            return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+        # kalau sudah ada bukti, biarkan lewat bawah
+        # (tetap akan dinormalisasi)
+
+    has_jawaban = re.search(r"^\s*Jawaban\s*:", t, flags=re.IGNORECASE | re.MULTILINE) is not None
+    has_bukti = re.search(r"\bBukti\s*:", t, flags=re.IGNORECASE) is not None
+
+    # kasus LLM: tidak ada "Jawaban:" tapi ada "Bukti:"
+    if (not has_jawaban) and has_bukti:
+        parts = _BUKTI_SPLIT_RE.split(t, maxsplit=1)
+        head = (parts[0] or "").strip()
+        tail = (parts[1] or "").strip() if len(parts) > 1 else "-"
+        # pastikan tail minimal ada sesuatu
+        if not tail:
+            tail = "-"
+        # kalau tail tidak diawali '-' dan bukan '-', biarkan (parse_answer akan handle)
+        return f"Jawaban: {head}\nBukti:\n{tail}"
+
+    # kasus LLM: tidak ada "Jawaban:" dan tidak ada "Bukti:" -> bungkus saja
+    if (not has_jawaban) and (not has_bukti):
+        return f"Jawaban: {t}\nBukti: -"
+
+    # kasus LLM: ada Jawaban tapi tidak ada Bukti -> tambahkan Bukti placeholder
+    if has_jawaban and (not has_bukti):
+        return t.rstrip() + "\n\nBukti: -"
+
+    return t
 
 
 def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> str:
@@ -170,7 +228,9 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "Aturan ketat:\n"
                 "1) Jawab dalam Bahasa Indonesia, formal, ringkas, dan jelas.\n"
                 "2) Gunakan HANYA informasi dari konteks. Jangan menambah asumsi.\n"
-                "3) Jika konteks tidak cukup untuk menjawab, tulis persis: 'Tidak ditemukan pada dokumen.'\n"
+                "3) Jika konteks tidak cukup untuk menjawab, tulis persis:\n"
+                "   Jawaban: Tidak ditemukan pada dokumen.\n"
+                "   Bukti: -\n"
                 "4) Setiap klaim faktual WAJIB disertai sitasi [CTX n].\n"
                 "5) Jangan menyebut hal di luar konteks (mis. nama penulis, tahun, atau metode lain) jika tidak ada di CTX.\n"
                 "6) Jangan menyebut [CTX] yang tidak ada (hanya 1..N sesuai konteks).",
@@ -183,7 +243,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "- Jawab pertanyaan secara langsung.\n"
                 "- Ambil bukti hanya dari konteks.\n\n"
                 "Format jawaban WAJIB (ikuti persis):\n"
-                "<jawaban satu paragraf ringkas namun informatif secara keseluruhan>\n"
+                "Jawaban: <jawaban satu paragraf ringkas namun informatif secara keseluruhan>\n"
                 "Bukti:\n"
                 "- <poin bukti 1> [CTX n]\n"
                 "- <poin bukti 2> [CTX n]\n"
@@ -191,9 +251,9 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "Ketentuan Bukti:\n"
                 "- Maksimal 3 poin.\n"
                 "- Tiap poin berisi fakta spesifik (mis. nama metode/alat uji/tahapan).\n"
-                "- Jika tidak ditemukan, tulis:\n"
+                "- Jika tidak ada dukungan konteks, tulis persis:\n"
                 "Jawaban: Tidak ditemukan pada dokumen.\n"
-                "Bukti: -",
+                "Bukti: -\n",
             ),
         ]
     )
@@ -201,7 +261,51 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     chain = prompt | llm | StrOutputParser()
     out = chain.invoke({"question": question.strip(), "context": ctx_block}).strip()
 
-    # Guardrail: jika model tidak memberi sitasi padahal ada konteks, paksa fallback yang aman
+    out = _normalize_citations(out).strip()
+    out = _enforce_qa_format(out)
+
+    # Kalau jawabannya tidak "Tidak ditemukan", tapi sitasi tidak terdeteksi,
+    # lakukan 1x repair attempt (lebih baik daripada langsung fallback).
+    if (
+        used_ctx > 0
+        and out
+        and "Tidak ditemukan pada dokumen" not in out
+        and not _has_citation(out)
+    ):
+        repair_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Kamu bertugas memperbaiki format jawaban agar sesuai aturan sitasi.\n"
+                    "Aturan:\n"
+                    "1) Jangan mengubah makna jawaban.\n"
+                    "2) Tambahkan sitasi [CTX n] pada setiap klaim faktual, terutama di bagian Bukti.\n"
+                    "3) Output harus mengikuti format:\n"
+                    "   Jawaban: ...\n"
+                    "   Bukti:\n"
+                    "   - ... [CTX n]\n"
+                    "4) Jika memang tidak ada dukungan dari konteks, tulis persis:\n"
+                    "   Jawaban: Tidak ditemukan pada dokumen.\n"
+                    "   Bukti: -",
+                ),
+                (
+                    "human",
+                    "Pertanyaan:\n{question}\n\n"
+                    "Konteks:\n{context}\n\n"
+                    "Jawaban sebelumnya (perlu diperbaiki sitasinya):\n{answer}\n\n"
+                    "Perbaiki sekarang:",
+                ),
+            ]
+        )
+        fixed = (repair_prompt | llm | StrOutputParser()).invoke(
+            {"question": question.strip(), "context": ctx_block, "answer": out}
+        )
+        fixed = _normalize_citations((fixed or "").strip())
+
+        if fixed:
+            out = fixed
+
+    # Guardrail terakhir: jika model tidak memberi sitasi padahal ada konteks, paksa fallback yang aman
     if (
         used_ctx > 0
         and out
@@ -212,3 +316,89 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
         return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
 
     return out
+
+
+def _format_history_pairs(history_pairs: Sequence[Dict[str, Any]], max_chars: int = 1200) -> str:
+    """
+    history_pairs: list item seperti {"turn_id":..., "query":..., "answer_preview":...}
+    saya ringkas agar prompt rewrite tidak meledak.
+    """
+    lines: list[str] = []
+    for it in history_pairs:
+        q = str(it.get("query", "")).strip()
+        a = str(it.get("answer_preview", "")).strip()
+        if not q:
+            continue
+        if len(a) > 240:
+            a = a[:240] + "..."
+        lines.append(f"User: {q}\nAssistant: {a}")
+    text = "\n\n".join(lines).strip()
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text or "(no history)"
+
+
+def contextualize_question(
+    cfg: Dict[str, Any],
+    question: str,
+    history_pairs: Sequence[Dict[str, Any]],
+    *,
+    use_llm: bool = True,
+) -> str:
+    """
+    Rewrite pertanyaan menjadi pertanyaan mandiri (standalone) berdasarkan riwayat percakapan.
+    Dipakai sebelum retrieval ke Chroma.
+
+    - Jika use_llm=True: coba pakai LLM (lebih akurat).
+    - Jika gagal / use_llm=False: fallback heuristic sederhana.
+    """
+    q = (question or "").strip()
+    if not q:
+        return ""
+
+    if not history_pairs:
+        return q
+
+    # fallback heuristic (tanpa LLM)
+    def _heuristic() -> str:
+        last_q = str(history_pairs[-1].get("query", "")).strip()
+        if not last_q:
+            return q
+        # gabungkan ringkas agar embedding tetap relevan
+        return f"{q}\n\n(Konteks sebelumnya: {last_q})"
+
+    if not use_llm:
+        return _heuristic()
+
+    try:
+        llm = _build_llm(cfg)
+    except Exception:
+        return _heuristic()
+
+    history_txt = _format_history_pairs(history_pairs)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Kamu adalah asisten rewriting query untuk retrieval dokumen.\n"
+                "Tugas: ubah pertanyaan terbaru menjadi pertanyaan mandiri (standalone) "
+                "dengan memasukkan konteks penting dari riwayat.\n"
+                "Aturan:\n"
+                "1) Output HANYA 1 kalimat pertanyaan (tanpa penjelasan).\n"
+                "2) Bahasa Indonesia.\n"
+                "3) Jangan menambah fakta baru.\n",
+            ),
+            (
+                "human",
+                "RIWAYAT:\n{history}\n\n"
+                "PERTANYAAN TERBARU:\n{question}\n\n"
+                "Tuliskan versi pertanyaan mandiri (standalone):",
+            ),
+        ]
+    )
+
+    out = (prompt | llm | StrOutputParser()).invoke({"history": history_txt, "question": q})
+    out = (out or "").strip().strip('"').strip("'")
+
+    return out if out else _heuristic()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import re
 from datetime import datetime
@@ -20,7 +21,7 @@ from src.core.ui_utils import (
     resolve_pdf_path,
     scroll_to_anchor,
 )
-from src.rag.generate import generate_answer
+from src.rag.generate import contextualize_question, generate_answer
 from src.rag.retrieve_dense import retrieve_dense
 
 
@@ -29,10 +30,14 @@ def dist_to_sim(dist: float) -> float:
     return 1.0 / (1.0 + max(dist, 0.0))
 
 
+# =========================
+# Session / Run lifecycle
+# =========================
 def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     """
-    1 session Streamlit = 1 run_id.
+    1 session Streamlit = 1 run_id (folder runs/<run_id>/).
     Jika config path berubah, buat run baru.
+    _new_run() juga reset state penting agar UI & log tidak tercampur antar sesi.
     """
     runs_dir = Path(cfg["paths"]["runs_dir"])
     rm = RunManager(runs_dir=runs_dir, config=cfg).start()
@@ -51,6 +56,8 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["hl_terms"] = ""
     st.session_state["last_submitted_query"] = ""
     st.session_state["last_turn_id"] = 0
+    st.session_state["last_user_query"] = ""
+    st.session_state["last_retrieval_query"] = ""
     return rm, logger
 
 
@@ -66,45 +73,54 @@ def get_or_create_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager
 
 def parse_answer(answer_text: str) -> Tuple[str, List[str]]:
     """
-    Parse output dari generator:
-    Jawaban: ...
-    Bukti:
-    - ... [CTX n]
-    Return: (jawaban, list_bukti)
+    Parse output generator yang idealnya:
+      Jawaban: ...
+      Bukti:
+      - ... [CTX n]
+    Tapi tetap toleran jika "Jawaban:" hilang, asalkan ada "Bukti:".
     """
     text = (answer_text or "").strip()
+    if not text:
+        return "", []
 
-    # fallback kalau format tidak sesuai
-    if "Jawaban:" not in text:
-        return text, []
+    # cari "Bukti:" (case-insensitive)
+    m_bukti = re.search(r"\bBukti\s*:\s*", text, flags=re.IGNORECASE)
+    if m_bukti:
+        head = text[: m_bukti.start()].strip()
+        tail = text[m_bukti.end() :].strip()
 
-    # ambil bagian Jawaban:
-    m = re.search(r"Jawaban:\s*(.*)", text)
-    jawaban = ""
-    if m:
-        # ambil sampai sebelum "Bukti:" jika ada
-        jawaban_line = m.group(1).strip()
-        jawaban = jawaban_line
+        # head bisa: "Jawaban: xxx" atau langsung "xxx"
+        head2 = re.sub(r"^\s*Jawaban\s*:\s*", "", head, flags=re.IGNORECASE).strip()
+        jawaban = head2
 
-    bukti: List[str] = []
-    if "Bukti:" in text:
-        # ambil semua baris setelah Bukti:
-        after = text.split("Bukti:", 1)[1].strip()
-        lines = [ln.strip() for ln in after.splitlines() if ln.strip()]
-        # filter bullet
+        # handle "Bukti: -" atau kosong
+        if not tail or tail == "-":
+            return jawaban, []
+
+        lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+        bukti: List[str] = []
         for ln in lines:
             if ln == "-":
                 continue
             if ln.startswith("-"):
                 bukti.append(ln[1:].strip())
             else:
-                # kalau tidak pakai "-", tetap masukkan
                 bukti.append(ln)
-        # kalau "Bukti: -" maka bukti kosong
+
+        # kalau hasilnya tetap "-" doang
         if len(bukti) == 1 and bukti[0] == "-":
             bukti = []
 
-    return jawaban, bukti
+        return jawaban, bukti
+
+    # kalau tidak ada "Bukti:", coba ambil "Jawaban:" kalau ada
+    m_j = re.search(r"^\s*Jawaban\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if m_j:
+        jawaban = m_j.group(1).strip()
+        return jawaban, []
+
+    # fallback total: semua dianggap jawaban
+    return text, []
 
 
 def build_retrieval_only_answer(nodes: List[Any], max_points: int = 3) -> str:
@@ -215,6 +231,60 @@ def extract_terms_from_text(text: str, max_terms: int = 6) -> List[str]:
     return out
 
 
+def render_processing_box(user_q: str, retrieval_q: str) -> None:
+    """Box ringkas untuk menampilkan user query vs retrieval query (V1.5)."""
+    user_q = (user_q or "").strip()
+    retrieval_q = (retrieval_q or "").strip()
+
+    if not user_q and not retrieval_q:
+        return
+
+    # escape biar aman kalau ada karakter aneh
+    user_q_esc = html.escape(user_q)
+    retrieval_q_esc = html.escape(retrieval_q)
+
+    # Badge kecil: apakah query direwrite?
+    contextualized = bool(retrieval_q) and (retrieval_q != user_q)
+
+    badge = (
+        '<span style="background:#3b82f6; color:#fff; padding:2px 8px; '
+        'border-radius:999px; font-size:12px; margin-left:8px;">contextualized</span>'
+        if contextualized
+        else '<span style="background:#16a34a; color:#fff; padding:2px 8px; '
+        'border-radius:999px; font-size:12px; margin-left:8px;">direct</span>'
+    )
+
+    lines = []
+    if user_q:
+        lines.append(f"<div style='margin-top:6px;'><b>User Query:</b><br/>{user_q_esc}</div>")
+    if retrieval_q and retrieval_q != user_q:
+        lines.append(
+            f"<div style='margin-top:10px;'><b>Retrieval Query (Contextualized):</b><br/>{retrieval_q_esc}</div>"
+        )
+
+    body = "\n".join(lines)
+
+    st.markdown(
+        f"""
+<div style="
+  background:#23262d;
+  border:1px solid #3a3f47;
+  padding:0.85rem 1rem;
+  border-radius:0.75rem;
+  margin:0.5rem 0 1rem 0;
+">
+  <div style="display:flex; align-items:center; justify-content:space-between;">
+    <div style="font-weight:800;">Processing ⚙️ {badge}</div>
+  </div>
+  <div style="color:#e5e7eb; line-height:1.45;">
+    {body}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", layout="wide")
     st.title("RAG ThesisDoc System (V1: Dense Retrieval)")
@@ -229,7 +299,7 @@ def main() -> None:
 
     # ===== Sidebar: Controls =====
     st.sidebar.header("Controls")
-    config_path = st.sidebar.text_input("Config path", value="configs/v1.yaml")
+    config_path = st.sidebar.text_input("Config path", value="configs/v1_5.yaml")
     cfg = load_config(config_path)
     data_raw_dir = Path(cfg.get("paths", {}).get("data_raw_dir", "data_raw"))
 
@@ -262,6 +332,36 @@ def main() -> None:
     # Toggle generator
     use_llm = st.sidebar.checkbox("Use LLM (Generator)", value=True)
 
+    # =========================
+    # V1.5 Controls: memory + contextualization (Mode demo vs eval)
+    # =========================
+    # demo: memory/contextualization boleh ON untuk pengalaman chat lebih natural
+    # eval: dipaksa OFF agar hasil retrieval stabil & mudah dibandingkan antar run
+    run_mode = st.sidebar.selectbox(
+        "Mode",
+        options=["demo", "eval"],
+        help="eval = matikan memory/contextualization agar hasil konsisten untuk evaluasi.",
+    )
+
+    mem_cfg = cfg.get("memory", {})
+    mem_default = bool(mem_cfg.get("enabled", False))
+    mem_window_default = int(mem_cfg.get("window", 4))
+
+    use_memory = st.sidebar.checkbox("Use Memory (V1.5)", value=mem_default)
+    mem_window = st.sidebar.slider("Memory Window (Turns)", 0, 10, value=mem_window_default)
+
+    contextualize_on = st.sidebar.checkbox(
+        "Contextualize Query (Rewrite Sebelum Retrieval)",
+        value=True,
+        disabled=(not use_memory),
+    )
+
+    # Eval mode: paksa off
+    if run_mode == "eval":
+        use_memory = False
+        contextualize_on = False
+        mem_window = 0
+
     # ===== Override controls (UI-level) untuk eksperimen cepat =====
     top_k_ui = st.sidebar.slider(
         "top_k (override)", min_value=3, max_value=15, value=int(cfg["retrieval"]["top_k"])
@@ -278,6 +378,10 @@ def main() -> None:
         "max_chars_per_ctx": int(max_chars_ctx_ui),
         "use_llm": bool(use_llm),
         "provider": provider,
+        "run_mode": run_mode,
+        "use_memory": bool(use_memory),
+        "mem_window": int(mem_window),
+        "contextualize_on": bool(contextualize_on),
     }
 
     # snapshot terakhir yang BENAR-BENAR sudah dipakai untuk menghasilkan hasil terakhir
@@ -341,8 +445,36 @@ def main() -> None:
         cfg_runtime["llm"] = dict(cfg.get("llm", {}))
         cfg_runtime["llm"]["max_chars_per_ctx"] = int(max_chars_ctx_ui)
 
-        # retrieval
-        nodes = retrieve_dense(cfg_runtime, query)
+        # ===== Memory window (ambil history terakhir) =====
+        # Ambil window percakapan terakhir (history) untuk membantu rewrite query.
+        history_pairs = st.session_state.get("history", [])
+        history_window = []
+        if use_memory and mem_window > 0 and history_pairs:
+            history_window = history_pairs[-int(mem_window) :]
+        # Ringkasan memory yang dipakai untuk turn ini (untuk audit log)
+        history_used = len(history_window) if (use_memory and mem_window > 0) else 0
+        history_turn_ids = [h.get("turn_id") for h in history_window] if history_window else []
+
+        # ===== Contextualize / rewrite query =====
+        # Contextualization akan menulis ulang pertanyaan user agar eksplisit (mis. coreference "itu", "tahapannya").
+        retrieval_query = query
+        if use_memory and contextualize_on and history_window:
+            retrieval_query = contextualize_question(
+                cfg_runtime,
+                question=query,
+                history_pairs=history_window,
+                use_llm=use_llm,  # pakai LLM hanya jika generator ON (aman & hemat)
+            )
+
+        # =========================
+        # Retrieval
+        # =========================
+        # Pakai retrieval_query (hasil rewrite) agar embedding search lebih tepat.
+        # nodes -> dipakai untuk:
+        # 1) konteks generator (contexts)
+        # 2) CTX mapping + sources UI
+        # 3) logging (retrieval.jsonl)
+        nodes = retrieve_dense(cfg_runtime, retrieval_query)
         # contexts untuk LLM (kalau nanti key valid)
         contexts = [n.text for n in nodes]
 
@@ -354,11 +486,18 @@ def main() -> None:
             "run_id": rm.run_id,
             "turn_id": turn_id,
             "timestamp": ts,
-            "query": query,
             "retrieval_mode": cfg_runtime["retrieval"]["mode"],
             "llm_provider": provider,
             "use_llm": use_llm,
             "top_k": int(top_k_ui),
+            "user_query": query,
+            "retrieval_query": retrieval_query,
+            "run_mode": run_mode,
+            "use_memory": use_memory,
+            "mem_window": int(mem_window),
+            "history_used": history_used,
+            "history_turn_ids": history_turn_ids,
+            "contextualized": (retrieval_query != query),
             "retrieved_nodes": [
                 {
                     "doc_id": n.doc_id,
@@ -374,10 +513,14 @@ def main() -> None:
         }
         rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
 
-        # Generate (controlled by toggle; kalau gagal, fallback placeholder)
+        # =========================
+        # Generation
+        # =========================
+        # Kalau generator ON: jawab berdasarkan contexts top-k.
+        # Kalau OFF: mode retrieval-only (extractive) agar UI tetap konsisten (Jawaban + Bukti).
         if use_llm:
             try:
-                answer_raw = generate_answer(cfg_runtime, query, contexts)
+                answer_raw = generate_answer(cfg_runtime, retrieval_query, contexts)
             except Exception as ex:
                 logger.exception("LLM call failed")
                 st.warning(f"LLM error: {type(ex).__name__}: {ex}")
@@ -394,12 +537,19 @@ def main() -> None:
             "run_id": rm.run_id,
             "turn_id": turn_id,
             "timestamp": ts,
-            "query": query,
-            "answer": answer_raw,
             "llm_provider": provider,
             "use_llm": use_llm,
             "top_k": int(top_k_ui),
+            "user_query": query,
+            "retrieval_query": retrieval_query,
+            "run_mode": run_mode,
+            "use_memory": use_memory,
+            "mem_window": int(mem_window),
+            "history_used": history_used,
+            "history_turn_ids": history_turn_ids,
+            "contextualized": (retrieval_query != query),
             "used_context_chunk_ids": [n.chunk_id for n in nodes],
+            "answer": answer_raw,
         }
         rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
@@ -418,6 +568,8 @@ def main() -> None:
         st.session_state["last_turn_id"] = turn_id
         st.session_state["last_nodes"] = nodes  # menyimpan last nodes untuk rendering
         st.session_state["_scroll_answer"] = True
+        st.session_state["last_user_query"] = query
+        st.session_state["last_retrieval_query"] = retrieval_query
 
         # tandai bahwa konfigurasi UI saat ini sudah dipakai untuk hasil terakhir
         st.session_state["last_applied_ui_cfg"] = current_ui_cfg.copy()
@@ -496,6 +648,10 @@ def main() -> None:
 
         # Anchor target
         st.markdown('<div id="answer-anchor"></div>', unsafe_allow_html=True)
+
+        uq = st.session_state.get("last_user_query", "")
+        rq = st.session_state.get("last_retrieval_query", "")
+        render_processing_box(uq, rq)
 
         # Answer section
         h1, h2 = st.columns([0.86, 0.14])
@@ -593,7 +749,7 @@ def main() -> None:
                     metadata=n.metadata,
                 )
 
-                cols = st.columns([0.18, 0.18, 0.54])
+                cols = st.columns([0.20, 0.20, 0.60], gap="small")
                 with cols[0]:
                     if pdf_path and st.button(
                         f"View PDF (p.{page})", key=f"viewpdf_{rm.run_id}_{turn_id}_{i}"
