@@ -524,6 +524,71 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     return out
 
 
+def build_generation_meta(
+    *,
+    question: str,
+    contexts: List[str],
+    answer_text: str,
+    used_ctx: int,
+) -> Dict[str, Any]:
+    """
+    Metadata ringan untuk logging/audit.
+
+    Tidak mengubah jawaban, hanya menganalisis:
+    - format output (Jawaban/Bukti)
+    - keberadaan sitasi dan range CTX
+    - status akhir (ok / not_found / invalid_format / invalid_citation / error / empty)
+    - sinyal relevansi (heuristik overlap keyword)
+    """
+    t = (answer_text or "").strip()
+    supported = _looks_supported(question, contexts) if used_ctx > 0 else False
+
+    # default meta
+    meta: Dict[str, Any] = {
+        "used_ctx": int(used_ctx),
+        "supported_heuristic": bool(supported),
+        "format_ok": False,
+        "bukti_ok": False,
+        "citations_present": False,
+        "citations_in_range": False,
+        "ctx_nums": [],
+        "status": "empty" if not t else "ok",
+    }
+
+    if not t:
+        return meta
+
+    # status not_found
+    if "tidak ditemukan pada dokumen" in t.lower():
+        meta["status"] = "not_found"
+        # tetap isi validasi agar bisa dianalisis
+        meta["format_ok"] = _is_valid_answer_format(t)
+        meta["bukti_ok"] = _bukti_has_bullets_or_dash(t)
+        meta["citations_present"] = _has_citation(t)
+        meta["ctx_nums"] = _extract_ctx_nums(t)
+        meta["citations_in_range"] = _citations_in_range(t, used_ctx)
+        return meta
+
+    # validasi normal
+    meta["format_ok"] = _is_valid_answer_format(t)
+    meta["bukti_ok"] = _bukti_has_bullets_or_dash(t)
+    meta["citations_present"] = _has_citation(t)
+    meta["ctx_nums"] = _extract_ctx_nums(t)
+    meta["citations_in_range"] = _citations_in_range(t, used_ctx)
+
+    # turunkan status jika ada masalah
+    if not meta["format_ok"] or not meta["bukti_ok"]:
+        meta["status"] = "invalid_format"
+    elif used_ctx > 0 and (not meta["citations_present"]):
+        meta["status"] = "missing_citation"
+    elif used_ctx > 0 and (not meta["citations_in_range"]):
+        meta["status"] = "invalid_citation_range"
+    else:
+        meta["status"] = "ok"
+
+    return meta
+
+
 def _format_history_pairs(history_pairs: Sequence[Dict[str, Any]], max_chars: int = 1200) -> str:
     """
     history_pairs: list item seperti {"turn_id":..., "query":..., "answer_preview":...}

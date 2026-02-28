@@ -21,13 +21,39 @@ from src.core.ui_utils import (
     resolve_pdf_path,
     scroll_to_anchor,
 )
-from src.rag.generate import contextualize_question, generate_answer
+from src.rag.generate import build_generation_meta, contextualize_question, generate_answer
 from src.rag.retrieve_dense import retrieve_dense
 
 
 def dist_to_sim(dist: float) -> float:
     # distance -> similarity (0..1), lebih aman dari (1 - dist)
     return 1.0 / (1.0 + max(dist, 0.0))
+
+
+def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
+    if not nodes:
+        return {
+            "n_nodes": 0,
+            "sim_top1": None,
+            "sim_avg": None,
+            "sim_gap12": None,
+            "dist_top1": None,
+        }
+
+    sims = [dist_to_sim(float(n.score)) for n in nodes]
+    sim_top1 = sims[0]
+    dist_top1 = float(nodes[0].score)
+    sim_avg = sum(sims) / max(len(sims), 1)
+    sim_gap12 = (sims[0] - sims[1]) if len(sims) > 1 else None
+
+    # dibulatkan supaya log enak dibaca
+    return {
+        "n_nodes": int(len(nodes)),
+        "sim_top1": round(float(sim_top1), 6),
+        "sim_avg": round(float(sim_avg), 6),
+        "sim_gap12": round(float(sim_gap12), 6) if sim_gap12 is not None else None,
+        "dist_top1": round(float(dist_top1), 6),
+    }
 
 
 # =========================
@@ -478,6 +504,12 @@ def main() -> None:
         # contexts untuk LLM (kalau nanti key valid)
         contexts = [n.text for n in nodes]
 
+        retrieval_stats = compute_retrieval_stats(nodes)
+
+        strategy = cfg_runtime["retrieval"]["mode"]  # contoh: "dense"
+        if retrieval_query != query:
+            strategy = f"{strategy}+rewrite"
+
         # timestamp per turn
         ts = datetime.now().isoformat(timespec="seconds")
 
@@ -498,6 +530,9 @@ def main() -> None:
             "history_used": history_used,
             "history_turn_ids": history_turn_ids,
             "contextualized": (retrieval_query != query),
+            "strategy": strategy,
+            "retrieval_stats": retrieval_stats,
+            "retrieval_confidence": retrieval_stats.get("sim_top1"),
             "retrieved_nodes": [
                 {
                     "doc_id": n.doc_id,
@@ -521,19 +556,29 @@ def main() -> None:
         # Retrieval memakai retrieval_query (hasil rewrite) -> untuk mendapatkan konteks yang tepat.
         # Tetapi LLM harus menjawab pertanyaan USER (query asli) agar tidak mismatch.
         user_query = query  # selalu menjawab berdasarkan user_query
+        used_ctx = min(len(contexts), min(int(top_k_ui), 8))  # generate.py memakai hard cap 8
+        generator_error = None
 
         if use_llm:
             try:
                 answer_raw = generate_answer(cfg_runtime, user_query, contexts)
             except Exception as ex:
                 logger.exception("LLM call failed")
+                generator_error = {"type": type(ex).__name__, "message": str(ex)}
                 st.warning(f"LLM error: {type(ex).__name__}: {ex}")
-                answer_raw = (
-                    "(LLM gagal / API key belum valid) Berikut adalah hasil retrieval top-k."
-                )
+                answer_raw = "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
         else:
             answer_raw = build_retrieval_only_answer(nodes, max_points=3)
 
+        # meta generator (dibuat setelah answer_raw final)
+        generator_meta = build_generation_meta(
+            question=user_query,
+            contexts=contexts,
+            answer_text=answer_raw,
+            used_ctx=used_ctx,
+        )
+
+        generator_status = generator_meta.get("status", "unknown")
         jawaban, bukti = parse_answer(answer_raw)
 
         # log answers via RunManager
@@ -554,6 +599,13 @@ def main() -> None:
             "contextualized": (retrieval_query != query),
             "used_context_chunk_ids": [n.chunk_id for n in nodes],
             "answer": answer_raw,
+            "strategy": strategy,
+            "retrieval_stats": retrieval_stats,
+            "retrieval_confidence": retrieval_stats.get("sim_top1"),
+            "generator_strategy": "llm" if use_llm else "retrieval_only",
+            "generator_status": generator_status,
+            "generator_meta": generator_meta,
+            "error": generator_error,
         }
         rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
