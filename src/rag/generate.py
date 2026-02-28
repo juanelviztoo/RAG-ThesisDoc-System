@@ -153,6 +153,42 @@ def _has_citation(text: str) -> bool:
     return bool(_CITATION_RE.search(text or ""))
 
 
+_CTX_NUM_RE = re.compile(r"\[CTX\s*(\d+)\]", re.IGNORECASE)
+
+
+def _extract_ctx_nums(text: str) -> List[int]:
+    return [int(m.group(1)) for m in _CTX_NUM_RE.finditer(text or "")]
+
+
+def _is_valid_answer_format(out: str) -> bool:
+    t = (out or "").strip()
+    if not t:
+        return False
+    has_j = re.search(r"^\s*Jawaban\s*:", t, flags=re.IGNORECASE | re.MULTILINE) is not None
+    has_b = re.search(r"^\s*Bukti\s*:", t, flags=re.IGNORECASE | re.MULTILINE) is not None
+    return has_j and has_b
+
+
+def _citations_in_range(out: str, used_ctx: int) -> bool:
+    nums = _extract_ctx_nums(out)
+    if used_ctx <= 0:
+        # kalau tidak ada konteks, seharusnya tidak ada sitasi
+        return len(nums) == 0
+    return all(1 <= n <= used_ctx for n in nums)
+
+
+def _bukti_has_bullets_or_dash(out: str) -> bool:
+    t = (out or "").strip()
+    if "Bukti:" not in t:
+        return False
+    _, tail = t.split("Bukti:", 1)
+    tail = tail.strip()
+    if tail == "-":
+        return True
+    # minimal ada satu bullet
+    return any(ln.strip().startswith("-") for ln in tail.splitlines() if ln.strip())
+
+
 _BUKTI_SPLIT_RE = re.compile(r"\bBukti\s*:\s*", re.IGNORECASE)
 
 
@@ -198,6 +234,108 @@ def _enforce_qa_format(out: str) -> str:
         return t.rstrip() + "\n\nBukti: -"
 
     return t
+
+
+def _ensure_bukti_bullets(out: str) -> str:
+    """
+    Memastikan setelah 'Bukti:' isinya berupa daftar bullet.
+    Kalau LLM mengisi bukti sebagai teks biasa, saya ubah jadi minimal 1 bullet.
+    """
+    t = (out or "").strip()
+    if not t or "Bukti:" not in t:
+        return t
+
+    head, tail = t.split("Bukti:", 1)
+    head = head.strip()
+    tail = tail.strip()
+
+    # kalau Bukti: - sudah benar
+    if tail == "-" or tail.startswith("-"):
+        return f"{head}\nBukti:\n{tail}" if not tail.startswith("-") else f"{head}\nBukti:\n{tail}"
+
+    # kalau bukti berupa beberapa baris tapi tanpa dash
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    if not lines:
+        return f"{head}\nBukti: -"
+
+    # ubah setiap baris menjadi bullet
+    bullets = "\n".join([f"- {ln.lstrip('-').strip()}" for ln in lines])
+    return f"{head}\nBukti:\n{bullets}"
+
+
+_STOP_QA = {
+    "apa",
+    "yang",
+    "dan",
+    "atau",
+    "dengan",
+    "dalam",
+    "pada",
+    "untuk",
+    "dari",
+    "ke",
+    "ini",
+    "itu",
+    "adalah",
+    "menurut",
+    "jelaskan",
+    "sebutkan",
+    "minimal",
+    "jika",
+    "ada",
+    "metode",
+    "sistem",
+    "dokumen",
+    "tahap",
+    "tahapan",
+    "langkah",
+    "prosedur",
+}
+
+
+def _keywords_for_support(text: str, max_terms: int = 8) -> list[str]:
+    toks = re.findall(r"[a-zA-Z]{4,}", (text or "").lower())
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in toks:
+        if t in _STOP_QA or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _looks_supported(question: str, contexts: list[str]) -> bool:
+    """
+    Heuristik ringan: kalau ada overlap keyword penting query di konteks,
+    tidak mudah bilang 'Tidak ditemukan'.
+    """
+    qs = _keywords_for_support(question)
+    if not qs or not contexts:
+        return False
+    hay = (" ".join(contexts)).lower()
+    return any(t in hay for t in qs)
+
+
+def _extractive_fallback_from_contexts(contexts: list[str], used_ctx: int) -> str:
+    """
+    Fallback aman: tidak membuat fakta baru, hanya menampilkan bukti ringkas dengan sitasi.
+    """
+    if used_ctx <= 0 or not contexts:
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    bullets: list[str] = []
+    for i, c in enumerate(contexts[: min(3, used_ctx)], start=1):
+        sn = " ".join((c or "").split())
+        sn = sn[:240] + ("..." if len(sn) > 240 else "")
+        bullets.append(f"- {sn} [CTX {i}]")
+
+    return (
+        "Jawaban: Informasi relevan ditemukan pada potongan dokumen berikut.\n"
+        "Bukti:\n" + "\n".join(bullets)
+    )
 
 
 def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> str:
@@ -261,30 +399,75 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     chain = prompt | llm | StrOutputParser()
     out = chain.invoke({"question": question.strip(), "context": ctx_block}).strip()
 
+    # 1) Normalisasi sitasi + paksa format + paksa bukti jadi bullet
     out = _normalize_citations(out).strip()
     out = _enforce_qa_format(out)
+    out = _ensure_bukti_bullets(out)
 
-    # Kalau jawabannya tidak "Tidak ditemukan", tapi sitasi tidak terdeteksi,
-    # lakukan 1x repair attempt (lebih baik daripada langsung fallback).
+    # Anti false-negative: kalau model bilang "Tidak ditemukan" padahal konteks terlihat relevan,
+    # coba 1x "force answer" (tetap hanya dari konteks).
     if (
         used_ctx > 0
-        and out
-        and "Tidak ditemukan pada dokumen" not in out
-        and not _has_citation(out)
+        and ("Tidak ditemukan pada dokumen" in out)
+        and _looks_supported(question, contexts)
     ):
+        force_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Konteks yang diberikan mengandung informasi relevan.\n"
+                    "Tugasmu: jawab menggunakan konteks tersebut.\n"
+                    "Aturan:\n"
+                    "1) Output WAJIB format:\n"
+                    "   Jawaban: ...\n"
+                    "   Bukti:\n"
+                    "   - ... [CTX n]\n"
+                    "2) Maksimal 3 bullet.\n"
+                    f"3) CTX valid hanya 1..{used_ctx}.\n"
+                    "4) Jangan menambah fakta baru.\n"
+                    "5) Jangan menjawab 'Tidak ditemukan' jika ada bukti di konteks.\n",
+                ),
+                (
+                    "human",
+                    "Pertanyaan:\n{question}\n\n" "Konteks:\n{context}\n\n" "Jawab sekarang:",
+                ),
+            ]
+        )
+        forced = (force_prompt | llm | StrOutputParser()).invoke(
+            {"question": question.strip(), "context": ctx_block}
+        )
+        forced = _normalize_citations((forced or "").strip())
+        forced = _enforce_qa_format(forced)
+        forced = _ensure_bukti_bullets(forced)
+        if forced:
+            out = forced
+
+    # 2) Validasi format dasar
+    need_repair_format = not _is_valid_answer_format(out) or (not _bukti_has_bullets_or_dash(out))
+
+    # 3) Validasi range sitasi (kalau jawaban bukan "Tidak ditemukan")
+    need_repair_range = False
+    if used_ctx > 0 and ("Tidak ditemukan pada dokumen" not in out):
+        if not _citations_in_range(out, used_ctx):
+            need_repair_range = True
+
+    # 4) Jika format atau sitasi range bermasalah → 1x repair attempt
+    if need_repair_format or need_repair_range:
         repair_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    "Kamu bertugas memperbaiki format jawaban agar sesuai aturan sitasi.\n"
-                    "Aturan:\n"
-                    "1) Jangan mengubah makna jawaban.\n"
-                    "2) Tambahkan sitasi [CTX n] pada setiap klaim faktual, terutama di bagian Bukti.\n"
-                    "3) Output harus mengikuti format:\n"
-                    "   Jawaban: ...\n"
+                    "Perbaiki jawaban agar sesuai format & aturan sitasi.\n"
+                    "Aturan WAJIB:\n"
+                    "1) Output harus mengikuti format:\n"
+                    "   Jawaban: <1 paragraf>\n"
                     "   Bukti:\n"
                     "   - ... [CTX n]\n"
-                    "4) Jika memang tidak ada dukungan dari konteks, tulis persis:\n"
+                    "   - ... [CTX n]\n"
+                    "2) Maksimal 3 bullet di Bukti.\n"
+                    f"3) CTX yang tersedia hanya 1 sampai {used_ctx}.\n"
+                    "4) Jangan menambah fakta baru. Jangan mengubah makna.\n"
+                    "5) Jika tidak ada dukungan konteks, tulis persis:\n"
                     "   Jawaban: Tidak ditemukan pada dokumen.\n"
                     "   Bukti: -",
                 ),
@@ -292,7 +475,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                     "human",
                     "Pertanyaan:\n{question}\n\n"
                     "Konteks:\n{context}\n\n"
-                    "Jawaban sebelumnya (perlu diperbaiki sitasinya):\n{answer}\n\n"
+                    "Jawaban sebelumnya (perlu diperbaiki):\n{answer}\n\n"
                     "Perbaiki sekarang:",
                 ),
             ]
@@ -301,18 +484,41 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
             {"question": question.strip(), "context": ctx_block, "answer": out}
         )
         fixed = _normalize_citations((fixed or "").strip())
+        fixed = _enforce_qa_format(fixed)
+        fixed = _ensure_bukti_bullets(fixed)
 
         if fixed:
             out = fixed
 
-    # Guardrail terakhir: jika model tidak memberi sitasi padahal ada konteks, paksa fallback yang aman
+    # 5) Guardrail: kalau jawab bukan "Tidak ditemukan" tapi tidak ada sitasi → fallback aman
     if (
         used_ctx > 0
         and out
-        and "Tidak ditemukan pada dokumen" not in out
-        and not _has_citation(out)
+        and ("Tidak ditemukan pada dokumen" not in out)
+        and (not _has_citation(out))
     ):
-        # fallback aman agar tidak halu tanpa sitasi
+        # kalau sebenarnya ada sinyal relevan di konteks, jangan kosongkan jawaban total
+        if _looks_supported(question, contexts):
+            return _extractive_fallback_from_contexts(contexts, used_ctx)
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    # 6) Guardrail: kalau sitasi keluar dari range → fallback aman
+    if (
+        used_ctx > 0
+        and out
+        and ("Tidak ditemukan pada dokumen" not in out)
+        and (not _citations_in_range(out, used_ctx))
+    ):
+        # kalau sebenarnya ada sinyal relevan di konteks, jangan kosongkan jawaban total
+        if _looks_supported(question, contexts):
+            return _extractive_fallback_from_contexts(contexts, used_ctx)
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    # 7) Guardrail: format tidak valid → fallback aman
+    if not _is_valid_answer_format(out) or (not _bukti_has_bullets_or_dash(out)):
+        # kalau sebenarnya ada sinyal relevan di konteks, jangan kosongkan jawaban total
+        if _looks_supported(question, contexts):
+            return _extractive_fallback_from_contexts(contexts, used_ctx)
         return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
 
     return out

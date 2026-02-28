@@ -518,9 +518,13 @@ def main() -> None:
         # =========================
         # Kalau generator ON: jawab berdasarkan contexts top-k.
         # Kalau OFF: mode retrieval-only (extractive) agar UI tetap konsisten (Jawaban + Bukti).
+        # Retrieval memakai retrieval_query (hasil rewrite) -> untuk mendapatkan konteks yang tepat.
+        # Tetapi LLM harus menjawab pertanyaan USER (query asli) agar tidak mismatch.
+        user_query = query  # selalu menjawab berdasarkan user_query
+
         if use_llm:
             try:
-                answer_raw = generate_answer(cfg_runtime, retrieval_query, contexts)
+                answer_raw = generate_answer(cfg_runtime, user_query, contexts)
             except Exception as ex:
                 logger.exception("LLM call failed")
                 st.warning(f"LLM error: {type(ex).__name__}: {ex}")
