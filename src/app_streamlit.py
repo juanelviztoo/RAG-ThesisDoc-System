@@ -3,11 +3,12 @@ from __future__ import annotations
 import html
 import os
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-import streamlit as st  # nanti dipasang di requirements
+import streamlit as st
 from dotenv import load_dotenv
 
 from src.core.config import load_config
@@ -34,6 +35,8 @@ def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
     if not nodes:
         return {
             "n_nodes": 0,
+            "n_docs": 0,
+            "doc_counts_top": {},
             "sim_top1": None,
             "sim_avg": None,
             "sim_gap12": None,
@@ -46,9 +49,23 @@ def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
     sim_avg = sum(sims) / max(len(sims), 1)
     sim_gap12 = (sims[0] - sims[1]) if len(sims) > 1 else None
 
+    doc_ids = [
+        str(
+            getattr(n, "doc_id", "")
+            or (n.metadata.get("doc_id") if getattr(n, "metadata", None) else "")
+            or "unknown"
+        )
+        for n in nodes
+    ]
+    c = Counter(doc_ids)
+    # simpan ringkas biar log tidak terlalu besar
+    doc_counts_top = dict(c.most_common(5))
+
     # dibulatkan supaya log enak dibaca
     return {
         "n_nodes": int(len(nodes)),
+        "n_docs": int(len(c)),
+        "doc_counts_top": doc_counts_top,
         "sim_top1": round(float(sim_top1), 6),
         "sim_avg": round(float(sim_avg), 6),
         "sim_gap12": round(float(sim_gap12), 6) if sim_gap12 is not None else None,
@@ -100,14 +117,23 @@ def get_or_create_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager
 def parse_answer(answer_text: str) -> Tuple[str, List[str]]:
     """
     Parse output generator yang idealnya:
-      Jawaban: ...
-      Bukti:
-      - ... [CTX n]
-    Tapi tetap toleran jika "Jawaban:" hilang, asalkan ada "Bukti:".
+        Jawaban: ...
+        Bukti:
+        - ... [CTX n]
+
+    Robust parse:
+    - Jika ada blok "Pertanyaan:" sebelum "Jawaban:", buang semuanya sebelum "Jawaban:"
+    - Ambil isi setelah "Jawaban:" sampai sebelum "Bukti:"
+    - Bukti diambil dari bullet '-' setelah 'Bukti:
     """
     text = (answer_text or "").strip()
     if not text:
         return "", []
+
+    # Jika ada preamble "Pertanyaan:" sebelum "Jawaban:", buang semuanya sebelum "Jawaban:"
+    m_jstart = re.search(r"(?im)^\s*Jawaban\s*:\s*", text)
+    if m_jstart and m_jstart.start() > 0:
+        text = text[m_jstart.start() :].strip()
 
     # cari "Bukti:" (case-insensitive)
     m_bukti = re.search(r"\bBukti\s*:\s*", text, flags=re.IGNORECASE)
@@ -115,9 +141,13 @@ def parse_answer(answer_text: str) -> Tuple[str, List[str]]:
         head = text[: m_bukti.start()].strip()
         tail = text[m_bukti.end() :].strip()
 
-        # head bisa: "Jawaban: xxx" atau langsung "xxx"
-        head2 = re.sub(r"^\s*Jawaban\s*:\s*", "", head, flags=re.IGNORECASE).strip()
-        jawaban = head2
+        # ambil isi jawaban = setelah "Jawaban:"
+        m_j = re.search(r"\bJawaban\s*:\s*", head, flags=re.IGNORECASE)
+        if m_j:
+            jawaban = head[m_j.end() :].strip()
+        else:
+            # fallback: buang baris "Pertanyaan:" bila masih ada
+            jawaban = re.sub(r"(?im)^\s*Pertanyaan\s*:\s*.*$", "", head).strip()
 
         # handle "Bukti: -" atau kosong
         if not tail or tail == "-":
@@ -182,6 +212,29 @@ def node_matches_filter(n: Any, q: str) -> bool:
     sf = (n.metadata.get("source_file", "") or "").lower()
     txt = (getattr(n, "text", "") or "").lower()
     return (ql in doc_id) or (ql in sf) or (ql in txt)
+
+
+def is_multi_doc_question(q: str) -> bool:
+    t = (q or "").lower()
+    # frasa eksplisit
+    key_phrases = [
+        "beberapa dokumen",
+        "dokumen lain",
+        "dokumen lainnya",
+        "berbagai dokumen",
+        "lebih dari satu dokumen",
+        "lintas dokumen",
+        "multi dokumen",
+        "beberapa sumber",
+        "sumber lain",
+        "di dokumen berbeda",
+    ]
+    if any(p in t for p in key_phrases):
+        return True
+    # pola umum: ada kata "beberapa/berbagai" dan "dokumen/sumber"
+    if re.search(r"\b(beberapa|berbagai|multi)\b.*\b(dokumen|sumber)\b", t):
+        return True
+    return False
 
 
 def extract_terms_from_query(q: str) -> List[str]:
@@ -324,8 +377,14 @@ def main() -> None:
     # DATA_RAW_DIR = Path("data_raw")
 
     # ===== Sidebar: Controls =====
-    st.sidebar.header("Controls")
-    config_path = st.sidebar.text_input("Config path", value="configs/v1_5.yaml")
+    st.sidebar.header("Controls & Information")
+
+    # Config path
+    config_path = st.sidebar.text_input(
+        "Config Path",
+        value="configs/v1_5.yaml",
+        help="Path YAML config yang dipakai untuk run ini (index, retrieval, llm, memory).",
+    )
     cfg = load_config(config_path)
     data_raw_dir = Path(cfg.get("paths", {}).get("data_raw_dir", "data_raw"))
 
@@ -343,8 +402,11 @@ def main() -> None:
         rm, logger = _new_run(cfg, config_path)
         st.rerun()
 
-    # info sidebar tambahan
+    # =========================
+    # Run Information
+    # =========================
     st.sidebar.divider()
+    st.sidebar.subheader("Run Information")
     st.sidebar.write("Run ID:", rm.run_id)
     st.sidebar.write("Collection:", cfg["index"]["collection_name"])
     st.sidebar.write("Mode:", cfg["retrieval"]["mode"])
@@ -355,49 +417,110 @@ def main() -> None:
     elif provider == "openai":
         st.sidebar.write("Model:", openai_model)
 
+    # ===================================================
+    # Settings / Config
+    # Override controls (UI-level) untuk eksperimen cepat
+    # ===================================================
+    st.sidebar.divider()
+    st.sidebar.subheader("Settings (Configuration)")
     # Toggle generator
-    use_llm = st.sidebar.checkbox("Use LLM (Generator)", value=True)
-
-    # =========================
-    # V1.5 Controls: memory + contextualization (Mode demo vs eval)
-    # =========================
-    # demo: memory/contextualization boleh ON untuk pengalaman chat lebih natural
-    # eval: dipaksa OFF agar hasil retrieval stabil & mudah dibandingkan antar run
-    run_mode = st.sidebar.selectbox(
-        "Mode",
-        options=["demo", "eval"],
-        help="eval = matikan memory/contextualization agar hasil konsisten untuk evaluasi.",
-    )
-
-    mem_cfg = cfg.get("memory", {})
-    mem_default = bool(mem_cfg.get("enabled", False))
-    mem_window_default = int(mem_cfg.get("window", 4))
-
-    use_memory = st.sidebar.checkbox("Use Memory (V1.5)", value=mem_default)
-    mem_window = st.sidebar.slider("Memory Window (Turns)", 0, 10, value=mem_window_default)
-
-    contextualize_on = st.sidebar.checkbox(
-        "Contextualize Query (Rewrite Sebelum Retrieval)",
+    use_llm = st.sidebar.checkbox(
+        "Use LLM (Generator)",
         value=True,
-        disabled=(not use_memory),
+        help="Jika OFF, sistem hanya menampilkan jawaban retrieval-only (extractive) tanpa LLM.",
     )
 
-    # Eval mode: paksa off
-    if run_mode == "eval":
-        use_memory = False
-        contextualize_on = False
-        mem_window = 0
-
-    # ===== Override controls (UI-level) untuk eksperimen cepat =====
+    # Basic retrieval + prompt sizing
     top_k_ui = st.sidebar.slider(
-        "top_k (override)", min_value=3, max_value=15, value=int(cfg["retrieval"]["top_k"])
+        "top_k (override)",
+        min_value=3,
+        max_value=15,
+        value=int(cfg["retrieval"]["top_k"]),
+        help="Jumlah chunk (sumber) yang diambil dari vector DB untuk konteks jawaban.",
     )
     max_chars_ctx_ui = st.sidebar.slider(
         "max_chars_per_ctx (override)",
         min_value=600,
         max_value=3000,
         value=int(cfg.get("llm", {}).get("max_chars_per_ctx", 1800)),
+        help="Batas karakter per-chunk konteks yang dikirim ke LLM (mencegah prompt terlalu panjang).",
     )
+
+    # =========================
+    # V1.5 Controls: Memory + Contextualization (Mode demo vs eval)
+    # =========================
+    # demo: memory/contextualization boleh ON untuk pengalaman chat lebih natural
+    # eval: dipaksa OFF agar hasil retrieval stabil & mudah dibandingkan antar run
+    mem_cfg = cfg.get("memory", {})
+    mem_default = bool(mem_cfg.get("enabled", False))
+    mem_window_default = int(mem_cfg.get("window", 4))
+
+    with st.sidebar.expander("Memory & Context (V1.5)", expanded=True):
+        run_mode = st.selectbox(
+            "Mode",
+            options=["demo", "eval"],
+            help="eval = matikan memory/contextualization agar hasil konsisten untuk evaluasi.",
+        )
+        eval_mode = run_mode == "eval"
+        # Toggle Use Memory + Window + Contextualize (untuk V1.5)
+        use_memory = st.checkbox(
+            "Use Memory (V1.5)",
+            value=mem_default,
+            help="Jika ON, pertanyaan lanjutan bisa memanfaatkan riwayat chat (untuk rewrite query).",
+        )
+        mem_window = st.slider(
+            "Memory Window (Turns)",
+            min_value=0,
+            max_value=10,
+            value=mem_window_default,
+            help="Berapa turn terakhir yang dipakai untuk contextualization.",
+        )
+        contextualize_on = st.checkbox(
+            "Contextualize Query (Rewrite Sebelum Retrieval)",
+            value=True,
+            disabled=(not use_memory),
+            help="Jika ON, sistem rewrite pertanyaan lanjutan (mis. 'tahapannya?') menjadi standalone sebelum retrieval.",
+        )
+
+        # Eval mode: paksa OFF agar konsisten
+        if eval_mode:
+            use_memory = False
+            contextualize_on = False
+            mem_window = 0
+
+    # =========================
+    # Advanced Retrieval (Diversity)
+    # =========================
+    with st.sidebar.expander("Advanced Retrieval (Diversity)", expanded=False):
+        # NOTE: eval_mode sudah terdefinisi dari expander Memory
+        diverse_mode = st.selectbox(
+            "Diversity Retrieval (Multi-Doc)",
+            options=["Auto", "Off", "On"],
+            index=0,
+            disabled=eval_mode,
+            help="Auto: Aktif jika pertanyaan mengandung 'beberapa dokumen/sumber'.",
+        )
+        max_per_doc = st.slider(
+            "Max Chunks per-Dokumen",
+            min_value=1,
+            max_value=int(top_k_ui),
+            value=min(2, int(top_k_ui)),
+            disabled=eval_mode,
+            help="Batasi jumlah chunk dari dokumen yang sama agar sources lebih beragam.",
+        )
+        pool_mult = st.slider(
+            "Candidate Pool Multiplier",
+            min_value=2,
+            max_value=12,
+            value=6,
+            disabled=eval_mode,
+            help="Jumlah kandidat awal = top_k * multiplier (lebih besar = lebih beragam tapi akan lebih lambat).",
+        )
+
+        if eval_mode:
+            # paksa OFF saat eval agar konsisten
+            diverse_mode = "Off"
+
     # indikator config berubah (render memakai placeholder dan update langsung setelah submit)
     current_ui_cfg = {
         "top_k": int(top_k_ui),
@@ -408,6 +531,9 @@ def main() -> None:
         "use_memory": bool(use_memory),
         "mem_window": int(mem_window),
         "contextualize_on": bool(contextualize_on),
+        "diverse_mode": str(diverse_mode),
+        "max_per_doc": int(max_per_doc),
+        "pool_mult": int(pool_mult),
     }
 
     # snapshot terakhir yang BENAR-BENAR sudah dipakai untuk menghasilkan hasil terakhir
@@ -418,15 +544,16 @@ def main() -> None:
 
     # Key status (tanpa menampilkan key)
     st.sidebar.divider()
+    st.sidebar.subheader("Diagnostics")
     st.sidebar.write("GROQ key set?:", bool(os.getenv("GROQ_API_KEY")))
     st.sidebar.write("OPENAI key set?:", bool(os.getenv("OPENAI_API_KEY")))
 
-    st.sidebar.divider()
     # apakah mau config snapshot per baris?
     include_cfg = st.sidebar.checkbox(
-        "Log config snapshot per row", value=(os.getenv("LOG_INCLUDE_CONFIG_PER_ROW", "0") == "1")
+        "Log Config Snapshot per-Row",
+        value=(os.getenv("LOG_INCLUDE_CONFIG_PER_ROW", "0") == "1"),
+        help="Jika ON, setiap baris JSONL menyimpan snapshot config untuk audit (file log jadi lebih besar, namun audit lebih solid).",
     )
-    st.sidebar.caption("Jika ON, file log lebih besar tapi audit lebih kuat.")
 
     # ===== Main Info =====
     st.info(
@@ -500,7 +627,23 @@ def main() -> None:
         # 1) konteks generator (contexts)
         # 2) CTX mapping + sources UI
         # 3) logging (retrieval.jsonl)
-        nodes = retrieve_dense(cfg_runtime, retrieval_query)
+        # decide diversify
+        if diverse_mode == "On":
+            diversify = True
+        elif diverse_mode == "Off":
+            diversify = False
+        else:
+            diversify = is_multi_doc_question(query)  # pakai user query (lebih natural)
+
+        candidate_k = int(top_k_ui) * int(pool_mult) if diversify else None
+
+        nodes = retrieve_dense(
+            cfg_runtime,
+            retrieval_query,
+            diversify=diversify,
+            max_per_doc=int(max_per_doc),
+            candidate_k=candidate_k,
+        )
         # contexts untuk LLM (kalau nanti key valid)
         contexts = [n.text for n in nodes]
 
@@ -509,6 +652,8 @@ def main() -> None:
         strategy = cfg_runtime["retrieval"]["mode"]  # contoh: "dense"
         if retrieval_query != query:
             strategy = f"{strategy}+rewrite"
+        if diversify:
+            strategy = f"{strategy}+diverse"
 
         # timestamp per turn
         ts = datetime.now().isoformat(timespec="seconds")
@@ -531,6 +676,13 @@ def main() -> None:
             "history_turn_ids": history_turn_ids,
             "contextualized": (retrieval_query != query),
             "strategy": strategy,
+            "diversity": {
+                "mode": diverse_mode,
+                "enabled": bool(diversify),
+                "max_per_doc": int(max_per_doc),
+                "pool_mult": int(pool_mult),
+                "candidate_k": int(candidate_k) if candidate_k is not None else None,
+            },
             "retrieval_stats": retrieval_stats,
             "retrieval_confidence": retrieval_stats.get("sim_top1"),
             "retrieved_nodes": [
@@ -600,6 +752,13 @@ def main() -> None:
             "used_context_chunk_ids": [n.chunk_id for n in nodes],
             "answer": answer_raw,
             "strategy": strategy,
+            "diversity": {
+                "mode": diverse_mode,
+                "enabled": bool(diversify),
+                "max_per_doc": int(max_per_doc),
+                "pool_mult": int(pool_mult),
+                "candidate_k": int(candidate_k) if candidate_k is not None else None,
+            },
             "retrieval_stats": retrieval_stats,
             "retrieval_confidence": retrieval_stats.get("sim_top1"),
             "generator_strategy": "llm" if use_llm else "retrieval_only",

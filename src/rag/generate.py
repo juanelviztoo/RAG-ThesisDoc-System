@@ -124,8 +124,8 @@ def _build_context_block(
 ) -> Tuple[str, int]:
     """
     Return:
-      - ctx_block: string berisi [CTX i] ... yang sudah di-trim
-      - used_ctx: jumlah CTX yang dipakai
+        - ctx_block: string berisi [CTX i] ... yang sudah di-trim
+        - used_ctx: jumlah CTX yang dipakai
     """
     ctxs = contexts[:max_ctx]
     parts: List[str] = []
@@ -189,17 +189,46 @@ def _bukti_has_bullets_or_dash(out: str) -> bool:
     return any(ln.strip().startswith("-") for ln in tail.splitlines() if ln.strip())
 
 
+# ========= Output cleaning (anti echo "Pertanyaan:") =========
+_JAWABAN_START_RE = re.compile(r"(?im)^\s*Jawaban\s*:\s*")
+_PERTANYAAN_LINE_RE = re.compile(r"(?im)^\s*Pertanyaan\s*:\s*.*(?:\n|$)")
+
+
+def _strip_question_preamble(text: str) -> str:
+    """
+    Jika LLM menulis:
+        Pertanyaan: ...
+        Jawaban: ...
+        Bukti: ...
+    maka buang bagian 'Pertanyaan:' agar output selalu mulai dari 'Jawaban:'.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+
+    # Kalau ada "Jawaban:" di tengah, potong semua sebelum itu.
+    m = _JAWABAN_START_RE.search(t)
+    if m and m.start() > 0:
+        t = t[m.start() :].lstrip()
+
+    # Jaga-jaga: hapus baris "Pertanyaan:" yang masih tersisa
+    t = _PERTANYAAN_LINE_RE.sub("", t).strip()
+    return t
+
+
 _BUKTI_SPLIT_RE = re.compile(r"\bBukti\s*:\s*", re.IGNORECASE)
 
 
 def _enforce_qa_format(out: str) -> str:
     """
     Pastikan output selalu punya:
-      Jawaban: ...
-      Bukti: ...
+        Jawaban: ...
+        Bukti: ...
     Agar parse_answer() dan UI stabil walau LLM kadang bandel.
     """
-    t = (out or "").strip()
+    # penting: bersihkan preamble "Pertanyaan:" dulu
+    t = _strip_question_preamble(out)
+
     if not t:
         return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
 
@@ -261,6 +290,171 @@ def _ensure_bukti_bullets(out: str) -> str:
     # ubah setiap baris menjadi bullet
     bullets = "\n".join([f"- {ln.lstrip('-').strip()}" for ln in lines])
     return f"{head}\nBukti:\n{bullets}"
+
+
+# ========= Bukti post-processing: dedupe + cap + grounding check =========
+
+_CTX_INLINE_RE = re.compile(r"\[CTX\s*(\d+)\]", re.IGNORECASE)
+
+
+def _extract_bukti_lines(out: str) -> List[str]:
+    """
+    Ambil list bullet dari bagian Bukti.
+    Output: list string TANPA leading '- '.
+    """
+    t = (out or "").strip()
+    if not t or "Bukti:" not in t:
+        return []
+
+    _, tail = t.split("Bukti:", 1)
+    tail = (tail or "").strip()
+    if not tail or tail == "-":
+        return []
+
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    bullets: List[str] = []
+    for ln in lines:
+        if ln == "-":
+            continue
+        if ln.startswith("-"):
+            bullets.append(ln[1:].strip())
+        else:
+            # toleransi kalau ada yang tidak diawali '-'
+            bullets.append(ln.strip())
+    return bullets
+
+
+def _rebuild_with_bukti(out_head: str, bullets: List[str]) -> str:
+    """
+    Bangun ulang output dengan Bukti yang rapi.
+    """
+    head = (out_head or "").strip()
+    if not bullets:
+        return f"{head}\nBukti: -"
+
+    blk = "\n".join([f"- {b.strip()}" for b in bullets if b.strip()])
+    if not blk.strip():
+        return f"{head}\nBukti: -"
+    return f"{head}\nBukti:\n{blk}"
+
+
+def _cap_and_dedupe_bukti(out: str, max_points: int = 3) -> str:
+    """
+    HARD ENFORCE:
+    - dedupe bullet (berdasarkan teks tanpa [CTX n])
+    - cap maksimal max_points
+    """
+    t = (out or "").strip()
+    if not t or "Bukti:" not in t:
+        return t
+
+    head, _ = t.split("Bukti:", 1)
+    head = head.strip()
+
+    bullets = _extract_bukti_lines(t)
+    if not bullets:
+        return f"{head}\nBukti: -"
+
+    def _sig(x: str) -> str:
+        # signature untuk dedupe: hapus sitasi, lowercase, rapikan spasi
+        x2 = re.sub(r"\[CTX\s*\d+\]", "", x, flags=re.IGNORECASE)
+        x2 = " ".join(x2.split()).strip().lower()
+        return x2
+
+    seen = set()
+    uniq: List[str] = []
+    for b in bullets:
+        s = _sig(b)
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(b)
+
+    capped = uniq[:max_points]
+    return _rebuild_with_bukti(head, capped)
+
+
+def _keywords_for_grounding(text: str, max_terms: int = 10) -> List[str]:
+    """
+    Keyword untuk cek grounding.
+    - Ambil token >= 3 huruf agar RAD/UAT/UX kebaca
+    - Buang stopword + kata generik
+    """
+    s = re.sub(r"\[CTX\s*\d+\]", "", (text or ""), flags=re.IGNORECASE)
+    toks = re.findall(r"[a-zA-Z]{3,}", s.lower())
+
+    stop = set(_STOP_QA) | {
+        "jawaban",
+        "bukti",
+        "pertanyaan",
+        "konteks",
+        "digunakan",
+        "dipakai",
+        "menggunakan",
+        "penelitian",
+        "dokumen",
+        "beberapa",
+        "lainnya",
+        "lain",
+        "metode",
+        "model",
+        "sistem",
+    }
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for t in toks:
+        if t in stop or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _bullet_grounded(bullet: str, contexts: List[str], used_ctx: int) -> bool:
+    """
+    Bullet dianggap grounded jika:
+    - memiliki >=1 sitasi CTX valid
+    - dan minimal 1 keyword penting pada bullet muncul di salah satu CTX yang dirujuk
+    """
+    if not bullet or used_ctx <= 0 or not contexts:
+        return False
+
+    ctx_nums = [int(x) for x in _CTX_INLINE_RE.findall(bullet or "")]
+    ctx_nums = [n for n in ctx_nums if 1 <= n <= used_ctx]
+    if not ctx_nums:
+        return False
+
+    kws = _keywords_for_grounding(bullet)
+    if not kws:
+        # kalau bullet terlalu generik tanpa keyword, anggap tidak aman
+        return False
+
+    for n in ctx_nums:
+        hay = (contexts[n - 1] or "").lower()
+        if any(k in hay for k in kws):
+            return True
+
+    return False
+
+
+def _bukti_grounding_ok(out: str, contexts: List[str], used_ctx: int) -> bool:
+    """
+    Semua bullet Bukti harus grounded.
+    """
+    bullets = _extract_bukti_lines(out)
+    if not bullets:
+        # kalau tidak ada bukti (Bukti: -), dianggap tidak perlu grounding
+        return True
+
+    for b in bullets:
+        if not _bullet_grounded(b, contexts, used_ctx):
+            return False
+    return True
 
 
 _STOP_QA = {
@@ -344,6 +538,8 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     - Gunakan hanya informasi di konteks
     - Jika tidak cukup: jawab "Tidak ditemukan pada dokumen."
     - Wajib menyertakan sitasi [CTX n] untuk klaim faktual
+    - HARD ENFORCE: Bukti maksimal 3 poin (cap + dedupe)
+    - Anti klaim tidak presisi: validasi grounding bullet Bukti terhadap CTX
     Untuk V1-V2, contexts masih berupa list teks chunk.
     """
     llm = _build_llm(cfg)
@@ -371,11 +567,13 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "   Bukti: -\n"
                 "4) Setiap klaim faktual WAJIB disertai sitasi [CTX n].\n"
                 "5) Jangan menyebut hal di luar konteks (mis. nama penulis, tahun, atau metode lain) jika tidak ada di CTX.\n"
-                "6) Jangan menyebut [CTX] yang tidak ada (hanya 1..N sesuai konteks).",
+                "6) Jangan menyebut [CTX] yang tidak ada (hanya 1..N sesuai konteks)."
+                "7) Jangan menuliskan ulang label 'Pertanyaan:' pada output. Output harus dimulai dari 'Jawaban:'."
+                "8) Bagian Bukti maksimal 3 bullet.",
             ),
             (
                 "human",
-                "Pertanyaan:\n{question}\n\n"
+                "Input user (jangan ditulis ulang sebagai 'Pertanyaan:' di output):\n{question}\n\n"
                 "Konteks:\n{context}\n\n"
                 "Tugas:\n"
                 "- Jawab pertanyaan secara langsung.\n"
@@ -388,7 +586,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "- <poin bukti 3> [CTX n]\n\n"
                 "Ketentuan Bukti:\n"
                 "- Maksimal 3 poin.\n"
-                "- Tiap poin berisi fakta spesifik (mis. nama metode/alat uji/tahapan).\n"
+                "- Tiap poin berisi fakta spesifik dan benar-benar didukung CTX (mis. nama metode/alat uji/tahapan).\n"
                 "- Jika tidak ada dukungan konteks, tulis persis:\n"
                 "Jawaban: Tidak ditemukan pada dokumen.\n"
                 "Bukti: -\n",
@@ -399,10 +597,15 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     chain = prompt | llm | StrOutputParser()
     out = chain.invoke({"question": question.strip(), "context": ctx_block}).strip()
 
-    # 1) Normalisasi sitasi + paksa format + paksa bukti jadi bullet
+    # ======= Normalisasi awal =======
+    # 0) bersihkan kemungkinan preamble "Pertanyaan:"
+    out = _strip_question_preamble(out)
+
+    # 1) Normalisasi sitasi + paksa format + paksa bukti jadi bullet (max. 3)
     out = _normalize_citations(out).strip()
     out = _enforce_qa_format(out)
     out = _ensure_bukti_bullets(out)
+    out = _cap_and_dedupe_bukti(out, max_points=3)
 
     # Anti false-negative: kalau model bilang "Tidak ditemukan" padahal konteks terlihat relevan,
     # coba 1x "force answer" (tetap hanya dari konteks).
@@ -425,7 +628,8 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                     "2) Maksimal 3 bullet.\n"
                     f"3) CTX valid hanya 1..{used_ctx}.\n"
                     "4) Jangan menambah fakta baru.\n"
-                    "5) Jangan menjawab 'Tidak ditemukan' jika ada bukti di konteks.\n",
+                    "5) Jangan menjawab 'Tidak ditemukan' jika ada bukti di konteks.\n"
+                    "6) Jangan menulis ulang 'Pertanyaan:' pada output.\n",
                 ),
                 (
                     "human",
@@ -436,12 +640,15 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
         forced = (force_prompt | llm | StrOutputParser()).invoke(
             {"question": question.strip(), "context": ctx_block}
         )
-        forced = _normalize_citations((forced or "").strip())
+        forced = _strip_question_preamble((forced or "").strip())
+        forced = _normalize_citations(forced)
         forced = _enforce_qa_format(forced)
         forced = _ensure_bukti_bullets(forced)
+        forced = _cap_and_dedupe_bukti(forced, max_points=3)
         if forced:
             out = forced
 
+    # ======= Repair format / citation-range =======
     # 2) Validasi format dasar
     need_repair_format = not _is_valid_answer_format(out) or (not _bukti_has_bullets_or_dash(out))
 
@@ -467,7 +674,8 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                     "2) Maksimal 3 bullet di Bukti.\n"
                     f"3) CTX yang tersedia hanya 1 sampai {used_ctx}.\n"
                     "4) Jangan menambah fakta baru. Jangan mengubah makna.\n"
-                    "5) Jika tidak ada dukungan konteks, tulis persis:\n"
+                    "5) Jangan menulis ulang 'Pertanyaan:' di output.\n"
+                    "6) Jika tidak ada dukungan konteks, tulis persis:\n"
                     "   Jawaban: Tidak ditemukan pada dokumen.\n"
                     "   Bukti: -",
                 ),
@@ -483,12 +691,59 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
         fixed = (repair_prompt | llm | StrOutputParser()).invoke(
             {"question": question.strip(), "context": ctx_block, "answer": out}
         )
-        fixed = _normalize_citations((fixed or "").strip())
+        fixed = _strip_question_preamble((fixed or "").strip())
+        fixed = _normalize_citations(fixed)
         fixed = _enforce_qa_format(fixed)
         fixed = _ensure_bukti_bullets(fixed)
-
+        fixed = _cap_and_dedupe_bukti(fixed, max_points=3)
         if fixed:
             out = fixed
+
+    # ======= Grounding check untuk anti klaim tidak presisi =======
+    # Hanya berlaku jika bukan "Tidak ditemukan"
+    if used_ctx > 0 and ("Tidak ditemukan pada dokumen" not in out):
+        grounding_ok = _bukti_grounding_ok(out, contexts, used_ctx)
+
+        if not grounding_ok:
+            # 1x grounding repair attempt: paksa bukti benar-benar "mengutip/meringkas langsung" CTX
+            grounding_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "Perbaiki jawaban agar setiap poin Bukti benar-benar DIDUKUNG oleh CTX yang dirujuk.\n"
+                        "Aturan:\n"
+                        "1) Output WAJIB mulai dari 'Jawaban:' (tanpa 'Pertanyaan:').\n"
+                        "2) Bukti maksimal 3 bullet.\n"
+                        "3) Setiap bullet harus merangkum atau mengutip singkat isi CTX yang sama (bukan asumsi).\n"
+                        "4) Jangan menyebut metode/hal lain jika tidak ada di CTX yang dirujuk.\n"
+                        f"5) CTX valid hanya 1..{used_ctx}.\n",
+                    ),
+                    (
+                        "human",
+                        "Pertanyaan:\n{question}\n\n"
+                        "Konteks:\n{context}\n\n"
+                        "Jawaban sebelumnya (ada indikasi bukti kurang grounded):\n{answer}\n\n"
+                        "Perbaiki sekarang:",
+                    ),
+                ]
+            )
+            grounded = (grounding_prompt | llm | StrOutputParser()).invoke(
+                {"question": question.strip(), "context": ctx_block, "answer": out}
+            )
+            grounded = _strip_question_preamble((grounded or "").strip())
+            grounded = _normalize_citations(grounded)
+            grounded = _enforce_qa_format(grounded)
+            grounded = _ensure_bukti_bullets(grounded)
+            grounded = _cap_and_dedupe_bukti(grounded, max_points=3)
+
+            if grounded and _bukti_grounding_ok(grounded, contexts, used_ctx):
+                out = grounded
+            else:
+                # fallback aman: bukti ekstraktif (snippet CTX)
+                return _extractive_fallback_from_contexts(contexts, used_ctx)
+
+    # ======= Guardrails terakhir =======
+    out = _cap_and_dedupe_bukti(out, max_points=3)
 
     # 5) Guardrail: kalau jawab bukan "Tidak ditemukan" tapi tidak ada sitasi → fallback aman
     if (
@@ -533,15 +788,21 @@ def build_generation_meta(
 ) -> Dict[str, Any]:
     """
     Metadata ringan untuk logging/audit.
-
     Tidak mengubah jawaban, hanya menganalisis:
     - format output (Jawaban/Bukti)
     - keberadaan sitasi dan range CTX
     - status akhir (ok / not_found / invalid_format / invalid_citation / error / empty)
     - sinyal relevansi (heuristik overlap keyword)
+
+    Tambahan:
+    - bukti_count: jumlah bullet Bukti yang terbaca
+    - grounding_ok: semua bullet Bukti grounded ke CTX yang dirujuk
     """
     t = (answer_text or "").strip()
     supported = _looks_supported(question, contexts) if used_ctx > 0 else False
+
+    bullets = _extract_bukti_lines(t)
+    bukti_count = len(bullets) if bullets else 0
 
     # default meta
     meta: Dict[str, Any] = {
@@ -549,8 +810,10 @@ def build_generation_meta(
         "supported_heuristic": bool(supported),
         "format_ok": False,
         "bukti_ok": False,
+        "bukti_count": int(bukti_count),
         "citations_present": False,
         "citations_in_range": False,
+        "grounding_ok": True,  # default True jika tidak ada bukti / Bukti: -
         "ctx_nums": [],
         "status": "empty" if not t else "ok",
     }
@@ -567,6 +830,7 @@ def build_generation_meta(
         meta["citations_present"] = _has_citation(t)
         meta["ctx_nums"] = _extract_ctx_nums(t)
         meta["citations_in_range"] = _citations_in_range(t, used_ctx)
+        meta["grounding_ok"] = True
         return meta
 
     # validasi normal
@@ -576,6 +840,12 @@ def build_generation_meta(
     meta["ctx_nums"] = _extract_ctx_nums(t)
     meta["citations_in_range"] = _citations_in_range(t, used_ctx)
 
+    # grounding check (hanya kalau ada bullet & ada konteks)
+    if used_ctx > 0 and bullets:
+        meta["grounding_ok"] = _bukti_grounding_ok(t, contexts, used_ctx)
+    else:
+        meta["grounding_ok"] = True
+
     # turunkan status jika ada masalah
     if not meta["format_ok"] or not meta["bukti_ok"]:
         meta["status"] = "invalid_format"
@@ -583,6 +853,8 @@ def build_generation_meta(
         meta["status"] = "missing_citation"
     elif used_ctx > 0 and (not meta["citations_in_range"]):
         meta["status"] = "invalid_citation_range"
+    elif used_ctx > 0 and (not meta["grounding_ok"]):
+        meta["status"] = "weak_grounding"
     else:
         meta["status"] = "ok"
 
@@ -622,6 +894,7 @@ def contextualize_question(
 
     - Jika use_llm=True: coba pakai LLM (lebih akurat).
     - Jika gagal / use_llm=False: fallback heuristic sederhana.
+    - Tambahan V1.5+: quality gate, kalo rewrite terlalu umum -> fallback heuristic
     """
     q = (question or "").strip()
     if not q:
@@ -632,11 +905,19 @@ def contextualize_question(
 
     # fallback heuristic (tanpa LLM)
     def _heuristic() -> str:
-        last_q = str(history_pairs[-1].get("query", "")).strip()
-        if not last_q:
+        last = history_pairs[-1] if history_pairs else {}
+        last_q = str(last.get("query", "")).strip()
+        last_a = str(last.get("answer_preview", "")).strip()
+
+        focus = (last_a or last_q).strip()
+        if len(focus) > 260:
+            focus = focus[:260] + "..."
+
+        if not focus:
             return q
+
         # gabungkan ringkas agar embedding tetap relevan
-        return f"{q}\n\n(Konteks sebelumnya: {last_q})"
+        return f"{q}\n\n(Konteks sebelumnya: {focus})"
 
     if not use_llm:
         return _heuristic()
@@ -658,7 +939,8 @@ def contextualize_question(
                 "Aturan:\n"
                 "1) Output HANYA 1 kalimat pertanyaan (tanpa penjelasan).\n"
                 "2) Bahasa Indonesia.\n"
-                "3) Jangan menambah fakta baru.\n",
+                "3) Jangan menambah fakta baru.\n"
+                "4) Jangan menghasilkan pertanyaan yang terlalu umum (mis. hanya 'Apa tahapannya?').\n",
             ),
             (
                 "human",
@@ -672,4 +954,46 @@ def contextualize_question(
     out = (prompt | llm | StrOutputParser()).invoke({"history": history_txt, "question": q})
     out = (out or "").strip().strip('"').strip("'")
 
-    return out if out else _heuristic()
+    # ===== Quality gate: kalau rewrite terlalu lemah/umum, fallback heuristic =====
+    def _focus_terms(txt: str, max_terms: int = 8) -> list[str]:
+        toks = re.findall(r"[a-zA-Z]{3,}", (txt or "").lower())
+        stop = set(_STOP_QA) | {"jawaban", "bukti", "pertanyaan", "konteks", "sebelumnya"}
+        out_terms: list[str] = []
+        seen: set[str] = set()
+        for t in toks:
+            if t in stop or t in seen:
+                continue
+            seen.add(t)
+            out_terms.append(t)
+            if len(out_terms) >= max_terms:
+                break
+        return out_terms
+
+    def _is_weak_rewrite(rewrite: str) -> bool:
+        r = (rewrite or "").strip()
+        if not r:
+            return True
+
+        # terlalu pendek / terlalu generik
+        if len(r.split()) < 4:
+            return True
+
+        # masih mengandung kata ganti yang biasanya butuh referen
+        if re.search(r"\b(itu|tersebut|ini|nya)\b", r.lower()):
+            return True
+
+        # harus membawa minimal 1 kata fokus dari turn sebelumnya (query/answer_preview)
+        last = history_pairs[-1] if history_pairs else {}
+        last_q = str(last.get("query", "")).strip()
+        last_a = str(last.get("answer_preview", "")).strip()
+        focus = _focus_terms(f"{last_q} {last_a}")
+
+        if focus and (not any(t in r.lower() for t in focus)):
+            return True
+
+        return False
+
+    if _is_weak_rewrite(out):
+        return _heuristic()
+
+    return out

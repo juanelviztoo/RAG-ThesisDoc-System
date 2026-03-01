@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -76,15 +77,111 @@ def clear_retrieval_cache() -> None:
     _VS_CACHE.clear()
 
 
-def retrieve_dense(cfg: Dict[str, Any], query: str) -> List[RetrievedNode]:
+def _doc_key(n: RetrievedNode) -> str:
+    """Kunci dokumen untuk diversifikasi (doc_id -> fallback source_file)."""
+    d = (n.doc_id or "").strip()
+    if d:
+        return d
+    sf = (n.metadata or {}).get("source_file")
+    return str(sf or "unknown").strip() or "unknown"
+
+
+def _diversify_by_doc(
+    nodes: List[RetrievedNode],
+    *,
+    top_k: int,
+    max_per_doc: int,
+) -> List[RetrievedNode]:
+    """
+    Pilih top_k nodes yang lebih beragam antar dokumen.
+
+    Strategi:
+    - Pass 1: ambil 1 per doc (sebar dulu)
+    - Pass 2: tambah hingga max_per_doc per doc
+    - Pass 3: kalau masih kurang, isi sisa (relax cap) agar tetap dapat top_k
+    """
+    if not nodes:
+        return []
+
+    top_k = max(1, int(top_k))
+    max_per_doc = max(1, int(max_per_doc))
+
+    picked: List[RetrievedNode] = []
+    picked_ids: set[str] = set()
+    per_doc: Counter[str] = Counter()
+
+    # Pass 1: 1 per doc
+    for n in nodes:
+        if len(picked) >= top_k:
+            break
+        cid = str(n.chunk_id)
+        dk = _doc_key(n)
+        if dk in per_doc:
+            continue
+        if cid in picked_ids:
+            continue
+        picked.append(n)
+        picked_ids.add(cid)
+        per_doc[dk] += 1
+
+    # Pass 2: hingga max_per_doc per doc
+    for n in nodes:
+        if len(picked) >= top_k:
+            break
+        cid = str(n.chunk_id)
+        dk = _doc_key(n)
+        if cid in picked_ids:
+            continue
+        if per_doc[dk] >= max_per_doc:
+            continue
+        picked.append(n)
+        picked_ids.add(cid)
+        per_doc[dk] += 1
+
+    # Pass 3: relax cap bila belum cukup
+    if len(picked) < top_k:
+        for n in nodes:
+            if len(picked) >= top_k:
+                break
+            cid = str(n.chunk_id)
+            if cid in picked_ids:
+                continue
+            picked.append(n)
+            picked_ids.add(cid)
+
+    return picked[:top_k]
+
+
+def retrieve_dense(
+    cfg: Dict[str, Any],
+    query: str,
+    *,
+    diversify: bool = False,
+    max_per_doc: int = 2,
+    candidate_k: Optional[int] = None,
+) -> List[RetrievedNode]:
     """
     Dense retrieval dari Chroma: similarity_search_with_score().
     Return list RetrievedNode (untuk logging & UI sources).
+
+    diversify=True:
+        - ambil kandidat lebih banyak (candidate_k)
+        - pilih top_k yang lebih beragam antar dokumen (max_per_doc per dokumen)
     """
     top_k = int(cfg["retrieval"]["top_k"])
     vs = _get_vectorstore(cfg)
 
-    results: List[Tuple[Any, float]] = vs.similarity_search_with_score(query, k=top_k)
+    if diversify:
+        if candidate_k is None:
+            # default: pool lebih besar supaya punya “bahan” untuk sebar antar dokumen
+            candidate_k = min(max(top_k * 6, top_k), 200)
+        else:
+            candidate_k = max(int(candidate_k), top_k)
+            candidate_k = min(candidate_k, 400)
+
+        results: List[Tuple[Any, float]] = vs.similarity_search_with_score(query, k=candidate_k)
+    else:
+        results = vs.similarity_search_with_score(query, k=top_k)
 
     nodes: List[RetrievedNode] = []
     for doc, score in results:
@@ -98,4 +195,8 @@ def retrieve_dense(cfg: Dict[str, Any], query: str) -> List[RetrievedNode]:
                 metadata=md,
             )
         )
-    return nodes
+
+    if not diversify:
+        return nodes[:top_k]
+
+    return _diversify_by_doc(nodes, top_k=top_k, max_per_doc=max_per_doc)
