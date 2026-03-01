@@ -457,6 +457,52 @@ def _bukti_grounding_ok(out: str, contexts: List[str], used_ctx: int) -> bool:
     return True
 
 
+def _extract_jawaban_text(out: str) -> str:
+    """
+    Ambil teks jawaban (tanpa label) dari output yang sudah terformat:
+    Jawaban: ...
+    Bukti: ...
+    """
+    t = (out or "").strip()
+    if not t:
+        return ""
+
+    # potong sebelum Bukti:
+    if "Bukti:" in t:
+        head = t.split("Bukti:", 1)[0].strip()
+    else:
+        head = t.strip()
+
+    # buang label Jawaban:
+    head = re.sub(r"(?im)^\s*Jawaban\s*:\s*", "", head).strip()
+    return head
+
+
+def _jawaban_grounding_ok(out: str, contexts: List[str]) -> bool:
+    """
+    Cek grounding untuk isi Jawaban (bukan Bukti).
+    Konservatif: minta minimal 1-2 keyword penting dari jawaban muncul di konteks gabungan.
+    Hal ini membantu mengurangi hallucination seperti 'workshop desain RAD' bila tidak ada di CTX.
+    """
+    jaw = _extract_jawaban_text(out)
+    if not jaw:
+        return True
+
+    kws = _keywords_for_grounding(jaw, max_terms=12)
+    if not kws:
+        # jawaban terlalu generik, biarkan lewat
+        return True
+
+    hay = (" ".join(contexts or [])).lower()
+    hits = sum(1 for k in kws if k in hay)
+
+    # threshold konservatif:
+    # - jika keyword sedikit, minimal 1
+    # - jika keyword banyak, minimal 2
+    need = 1 if len(kws) <= 4 else 2
+    return hits >= need
+
+
 _STOP_QA = {
     "apa",
     "yang",
@@ -532,7 +578,13 @@ def _extractive_fallback_from_contexts(contexts: list[str], used_ctx: int) -> st
     )
 
 
-def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> str:
+def generate_answer(
+    cfg: Dict[str, Any],
+    question: str,
+    contexts: List[str],
+    *,
+    max_bullets: int = 3,
+) -> str:
     """
     Generate jawaban berbasis konteks (RAG) dengan aturan:
     - Gunakan hanya informasi di konteks
@@ -540,6 +592,10 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     - Wajib menyertakan sitasi [CTX n] untuk klaim faktual
     - HARD ENFORCE: Bukti maksimal 3 poin (cap + dedupe)
     - Anti klaim tidak presisi: validasi grounding bullet Bukti terhadap CTX
+    - Konteks bisa berisi metadata lintas dokumen (mis. "DOC: ... | file p.X")
+            -> dorong jawaban menjadi eksplisit lintas dokumen (hindari "penelitian ini" generik)
+    - Bukti default maksimal 3 poin, bisa naik (mis. 5) untuk multi-target tertentu
+            -> enforced via cap+dedupe, dan prompt mengikuti max_bullets.
     Untuk V1-V2, contexts masih berupa list teks chunk.
     """
     llm = _build_llm(cfg)
@@ -552,6 +608,18 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     ctx_block, used_ctx = _build_context_block(
         contexts, max_ctx=max_ctx, max_chars_per_ctx=max_chars_per_ctx
     )
+
+    # intent hint agar LLM tidak menganggap "tahapan" sebagai "metode"
+    ql = (question or "").lower()
+    if re.search(r"\b(tahap|tahapan|langkah|alur|prosedur)\b", ql):
+        q_intent = "TAHAP"
+    elif re.search(r"\b(metode|model)\b", ql):
+        q_intent = "METODE"
+    else:
+        q_intent = "UMUM"
+
+    # max bullets safety
+    max_bullets = int(max(1, min(max_bullets, 5)))
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -568,25 +636,32 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 "4) Setiap klaim faktual WAJIB disertai sitasi [CTX n].\n"
                 "5) Jangan menyebut hal di luar konteks (mis. nama penulis, tahun, atau metode lain) jika tidak ada di CTX.\n"
                 "6) Jangan menyebut [CTX] yang tidak ada (hanya 1..N sesuai konteks)."
-                "7) Jangan menuliskan ulang label 'Pertanyaan:' pada output. Output harus dimulai dari 'Jawaban:'."
-                "8) Bagian Bukti maksimal 3 bullet.",
+                "7) Jangan menuliskan ulang label 'Pertanyaan:' pada output. Output harus DIMULAI dari 'Jawaban:'."
+                f"8) Bagian Bukti maksimal {max_bullets} bullet.\n\n"
+                "Pedoman kualitas:\n"
+                "- Jika konteks berasal dari beberapa dokumen (ada penanda DOC/file/page), hindari frasa "
+                "'penelitian ini' yang ambigu. Gunakan frasa seperti 'Dalam dokumen-dokumen yang relevan...'.\n"
+                "- Jika pertanyaan meminta TAHAPAN/LANGKAH dan konteks memuat lebih dari satu metode, "
+                "jawab secara TERPISAH per metode (contoh: 'RAD: ...; Prototyping: ...').\n"
+                "- Jika pertanyaan bertanya METODE, jangan mengubah daftar tahapan menjadi 'metode'.\n",
             ),
             (
                 "human",
+                "Jenis pertanyaan: {intent}\n\n"
                 "Input user (jangan ditulis ulang sebagai 'Pertanyaan:' di output):\n{question}\n\n"
                 "Konteks:\n{context}\n\n"
                 "Tugas:\n"
                 "- Jawab pertanyaan secara langsung.\n"
                 "- Ambil bukti hanya dari konteks.\n\n"
                 "Format jawaban WAJIB (ikuti persis):\n"
-                "Jawaban: <jawaban satu paragraf ringkas namun informatif secara keseluruhan>\n"
+                "Jawaban: <jawaban satu paragraf ringkas namun informatif secara keseluruhan, boleh pakai format 'METODE_A: ...; METODE_B: ...' jika perlu>\n"
                 "Bukti:\n"
                 "- <poin bukti 1> [CTX n]\n"
                 "- <poin bukti 2> [CTX n]\n"
                 "- <poin bukti 3> [CTX n]\n\n"
                 "Ketentuan Bukti:\n"
-                "- Maksimal 3 poin.\n"
-                "- Tiap poin berisi fakta spesifik dan benar-benar didukung CTX (mis. nama metode/alat uji/tahapan).\n"
+                "- Maksimal {max_bullets} poin.\n"
+                "- Tiap poin berisi fakta spesifik dan benar-benar didukung CTX yang sama (mis. nama metode/alat uji/tahapan).\n"
                 "- Jika tidak ada dukungan konteks, tulis persis:\n"
                 "Jawaban: Tidak ditemukan pada dokumen.\n"
                 "Bukti: -\n",
@@ -595,7 +670,14 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     )
 
     chain = prompt | llm | StrOutputParser()
-    out = chain.invoke({"question": question.strip(), "context": ctx_block}).strip()
+    out = chain.invoke(
+        {
+            "intent": q_intent,
+            "question": question.strip(),
+            "context": ctx_block,
+            "max_bullets": max_bullets,
+        }
+    ).strip()
 
     # ======= Normalisasi awal =======
     # 0) bersihkan kemungkinan preamble "Pertanyaan:"
@@ -605,7 +687,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     out = _normalize_citations(out).strip()
     out = _enforce_qa_format(out)
     out = _ensure_bukti_bullets(out)
-    out = _cap_and_dedupe_bukti(out, max_points=3)
+    out = _cap_and_dedupe_bukti(out, max_points=max_bullets)
 
     # Anti false-negative: kalau model bilang "Tidak ditemukan" padahal konteks terlihat relevan,
     # coba 1x "force answer" (tetap hanya dari konteks).
@@ -625,7 +707,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                     "   Jawaban: ...\n"
                     "   Bukti:\n"
                     "   - ... [CTX n]\n"
-                    "2) Maksimal 3 bullet.\n"
+                    "2) Maksimal {max_bullets} bullet.\n"
                     f"3) CTX valid hanya 1..{used_ctx}.\n"
                     "4) Jangan menambah fakta baru.\n"
                     "5) Jangan menjawab 'Tidak ditemukan' jika ada bukti di konteks.\n"
@@ -633,18 +715,26 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 ),
                 (
                     "human",
-                    "Pertanyaan:\n{question}\n\n" "Konteks:\n{context}\n\n" "Jawab sekarang:",
+                    "Jenis pertanyaan: {intent}\n\n"
+                    "Pertanyaan:\n{question}\n\n"
+                    "Konteks:\n{context}\n\n"
+                    "Jawab sekarang:",
                 ),
             ]
         )
         forced = (force_prompt | llm | StrOutputParser()).invoke(
-            {"question": question.strip(), "context": ctx_block}
+            {
+                "intent": q_intent,
+                "question": question.strip(),
+                "context": ctx_block,
+                "max_bullets": max_bullets,
+            }
         )
         forced = _strip_question_preamble((forced or "").strip())
         forced = _normalize_citations(forced)
         forced = _enforce_qa_format(forced)
         forced = _ensure_bukti_bullets(forced)
-        forced = _cap_and_dedupe_bukti(forced, max_points=3)
+        forced = _cap_and_dedupe_bukti(forced, max_points=max_bullets)
         if forced:
             out = forced
 
@@ -671,7 +761,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                     "   Bukti:\n"
                     "   - ... [CTX n]\n"
                     "   - ... [CTX n]\n"
-                    "2) Maksimal 3 bullet di Bukti.\n"
+                    "2) Maksimal {max_bullets} bullet di Bukti.\n"
                     f"3) CTX yang tersedia hanya 1 sampai {used_ctx}.\n"
                     "4) Jangan menambah fakta baru. Jangan mengubah makna.\n"
                     "5) Jangan menulis ulang 'Pertanyaan:' di output.\n"
@@ -681,6 +771,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 ),
                 (
                     "human",
+                    "Jenis pertanyaan: {intent}\n\n"
                     "Pertanyaan:\n{question}\n\n"
                     "Konteks:\n{context}\n\n"
                     "Jawaban sebelumnya (perlu diperbaiki):\n{answer}\n\n"
@@ -689,13 +780,19 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
             ]
         )
         fixed = (repair_prompt | llm | StrOutputParser()).invoke(
-            {"question": question.strip(), "context": ctx_block, "answer": out}
+            {
+                "intent": q_intent,
+                "question": question.strip(),
+                "context": ctx_block,
+                "answer": out,
+                "max_bullets": max_bullets,
+            }
         )
         fixed = _strip_question_preamble((fixed or "").strip())
         fixed = _normalize_citations(fixed)
         fixed = _enforce_qa_format(fixed)
         fixed = _ensure_bukti_bullets(fixed)
-        fixed = _cap_and_dedupe_bukti(fixed, max_points=3)
+        fixed = _cap_and_dedupe_bukti(fixed, max_points=max_bullets)
         if fixed:
             out = fixed
 
@@ -703,23 +800,25 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
     # Hanya berlaku jika bukan "Tidak ditemukan"
     if used_ctx > 0 and ("Tidak ditemukan pada dokumen" not in out):
         grounding_ok = _bukti_grounding_ok(out, contexts, used_ctx)
+        answer_ok = _jawaban_grounding_ok(out, contexts)
 
-        if not grounding_ok:
+        if (not grounding_ok) or (not answer_ok):
             # 1x grounding repair attempt: paksa bukti benar-benar "mengutip/meringkas langsung" CTX
             grounding_prompt = ChatPromptTemplate.from_messages(
                 [
                     (
                         "system",
-                        "Perbaiki jawaban agar setiap poin Bukti benar-benar DIDUKUNG oleh CTX yang dirujuk.\n"
+                        "Perbaiki jawaban agar SELURUH isi Jawaban dan setiap poin Bukti benar-benar DIDUKUNG oleh CTX yang dirujuk.\n"
                         "Aturan:\n"
                         "1) Output WAJIB mulai dari 'Jawaban:' (tanpa 'Pertanyaan:').\n"
-                        "2) Bukti maksimal 3 bullet.\n"
+                        "2) Bukti maksimal {max_bullets} bullet.\n"
                         "3) Setiap bullet harus merangkum atau mengutip singkat isi CTX yang sama (bukan asumsi).\n"
                         "4) Jangan menyebut metode/hal lain jika tidak ada di CTX yang dirujuk.\n"
                         f"5) CTX valid hanya 1..{used_ctx}.\n",
                     ),
                     (
                         "human",
+                        "Jenis pertanyaan: {intent}\n\n"
                         "Pertanyaan:\n{question}\n\n"
                         "Konteks:\n{context}\n\n"
                         "Jawaban sebelumnya (ada indikasi bukti kurang grounded):\n{answer}\n\n"
@@ -728,13 +827,19 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 ]
             )
             grounded = (grounding_prompt | llm | StrOutputParser()).invoke(
-                {"question": question.strip(), "context": ctx_block, "answer": out}
+                {
+                    "intent": q_intent,
+                    "question": question.strip(),
+                    "context": ctx_block,
+                    "answer": out,
+                    "max_bullets": max_bullets,
+                }
             )
             grounded = _strip_question_preamble((grounded or "").strip())
             grounded = _normalize_citations(grounded)
             grounded = _enforce_qa_format(grounded)
             grounded = _ensure_bukti_bullets(grounded)
-            grounded = _cap_and_dedupe_bukti(grounded, max_points=3)
+            grounded = _cap_and_dedupe_bukti(grounded, max_points=max_bullets)
 
             if grounded and _bukti_grounding_ok(grounded, contexts, used_ctx):
                 out = grounded
@@ -743,7 +848,7 @@ def generate_answer(cfg: Dict[str, Any], question: str, contexts: List[str]) -> 
                 return _extractive_fallback_from_contexts(contexts, used_ctx)
 
     # ======= Guardrails terakhir =======
-    out = _cap_and_dedupe_bukti(out, max_points=3)
+    out = _cap_and_dedupe_bukti(out, max_points=max_bullets)
 
     # 5) Guardrail: kalau jawab bukan "Tidak ditemukan" tapi tidak ada sitasi → fallback aman
     if (
@@ -785,6 +890,7 @@ def build_generation_meta(
     contexts: List[str],
     answer_text: str,
     used_ctx: int,
+    max_bullets: int = 3,
 ) -> Dict[str, Any]:
     """
     Metadata ringan untuk logging/audit.
@@ -795,25 +901,32 @@ def build_generation_meta(
     - sinyal relevansi (heuristik overlap keyword)
 
     Tambahan:
+    - max_bullets: batas bullet saat turn ini
     - bukti_count: jumlah bullet Bukti yang terbaca
+    - bukti_overflow: apakah bullet melewati max_bullets (harusnya false karena saya cap)
     - grounding_ok: semua bullet Bukti grounded ke CTX yang dirujuk
+    - answer_grounding_ok: isi Jawaban grounded ke konteks gabungan (konservatif)
     """
     t = (answer_text or "").strip()
     supported = _looks_supported(question, contexts) if used_ctx > 0 else False
 
     bullets = _extract_bukti_lines(t)
     bukti_count = len(bullets) if bullets else 0
+    max_bullets = int(max(1, min(max_bullets, 5)))
 
     # default meta
     meta: Dict[str, Any] = {
         "used_ctx": int(used_ctx),
+        "max_bullets": int(max_bullets),
         "supported_heuristic": bool(supported),
         "format_ok": False,
         "bukti_ok": False,
         "bukti_count": int(bukti_count),
+        "bukti_overflow": bool(bukti_count > max_bullets),
         "citations_present": False,
         "citations_in_range": False,
         "grounding_ok": True,  # default True jika tidak ada bukti / Bukti: -
+        "answer_grounding_ok": True,
         "ctx_nums": [],
         "status": "empty" if not t else "ok",
     }
@@ -831,6 +944,8 @@ def build_generation_meta(
         meta["ctx_nums"] = _extract_ctx_nums(t)
         meta["citations_in_range"] = _citations_in_range(t, used_ctx)
         meta["grounding_ok"] = True
+        meta["answer_grounding_ok"] = True
+        meta["bukti_overflow"] = False
         return meta
 
     # validasi normal
@@ -846,6 +961,8 @@ def build_generation_meta(
     else:
         meta["grounding_ok"] = True
 
+    meta["answer_grounding_ok"] = _jawaban_grounding_ok(t, contexts) if used_ctx > 0 else True
+
     # turunkan status jika ada masalah
     if not meta["format_ok"] or not meta["bukti_ok"]:
         meta["status"] = "invalid_format"
@@ -854,7 +971,11 @@ def build_generation_meta(
     elif used_ctx > 0 and (not meta["citations_in_range"]):
         meta["status"] = "invalid_citation_range"
     elif used_ctx > 0 and (not meta["grounding_ok"]):
-        meta["status"] = "weak_grounding"
+        meta["status"] = "weak_grounding_bukti"
+    elif used_ctx > 0 and (not meta["answer_grounding_ok"]):
+        meta["status"] = "weak_grounding_jawaban"
+    elif meta["bukti_overflow"]:
+        meta["status"] = "bukti_overflow"
     else:
         meta["status"] = "ok"
 

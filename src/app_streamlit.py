@@ -237,6 +237,156 @@ def is_multi_doc_question(q: str) -> bool:
     return False
 
 
+def is_anaphora_question(q: str) -> bool:
+    """
+    Deteksi pertanyaan lanjutan yang biasanya butuh konteks sebelumnya.
+    """
+    t = (q or "").lower()
+    return bool(
+        re.search(
+            r"\b(itu|tersebut|ini|nya|tahapannya|langkahnya|alur\s*nya|metodenya)\b",
+            t,
+        )
+    )
+
+
+def is_multi_target_question(q: str) -> bool:
+    """
+    Deteksi pertanyaan yang meminta jawaban mencakup beberapa target/metode.
+    Contoh: 'semua metode', 'masing-masing metode', 'RAD dan prototyping', dll.
+    """
+    t = (q or "").lower()
+
+    # frasa eksplisit
+    key_phrases = [
+        "semua metode",
+        "masing-masing",
+        "setiap metode",
+        "beberapa metode",
+        "dua metode",
+        "kedua metode",
+        "metode rad dan",
+        "rad dan prototyping",
+        "prototyping dan rad",
+        "rad & prototyping",
+        "metode apa saja",
+        "metode-metode",
+        "masing masing",
+    ]
+    if any(p in t for p in key_phrases):
+        return True
+
+    # pola regex: (semua/masing-masing/setiap) + (metode/model)
+    if re.search(r"\b(semua|masing-masing|masing|setiap|beberapa)\b.*\b(metode|model)\b", t):
+        return True
+
+    # ada beberapa metode disambung "dan"
+    if re.search(r"\b(rad|rapid application development)\b.*\b(dan|&)\b.*\b(proto|prototyp)", t):
+        return True
+
+    return False
+
+
+_METHOD_PATTERNS = {
+    "RAD": [r"\brad\b", r"rapid application development"],
+    "PROTOTYPING": [r"\bprototyp\w*\b", r"\bprototype\b"],
+    "RUP": [r"\brup\b", r"rational unified process"],
+    "EXTREME_PROGRAMMING": [r"extreme programming", r"\bxp\b"],
+    "WATERFALL": [r"\bwaterfall\b"],
+    "AGILE": [r"\bagile\b", r"\bscrum\b"],
+}
+
+
+def detect_methods_in_text(text: str) -> List[str]:
+    """
+    Ambil daftar metode yang terdeteksi dari sebuah teks (case-insensitive).
+    """
+    t = (text or "").lower()
+    found: List[str] = []
+    for name, pats in _METHOD_PATTERNS.items():
+        for p in pats:
+            if re.search(p, t, flags=re.IGNORECASE):
+                found.append(name)
+                break
+    # unik + urut stabil
+    out: List[str] = []
+    seen = set()
+    for x in found:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def detect_methods_in_contexts(contexts: List[str]) -> List[str]:
+    """
+    Deteksi metode dari gabungan contexts.
+    """
+    joined = "\n".join(contexts or [])
+    return detect_methods_in_text(joined)
+
+
+def build_contexts_with_meta(nodes: List[Any]) -> List[str]:
+    """
+    Perkaya konteks dengan metadata dokumen agar LLM bisa eksplisit lintas dokumen.
+    Format: DOC: <doc_id> | <source_file> p.<page>
+    """
+    out: List[str] = []
+    for n in nodes:
+        source_file = str((getattr(n, "metadata", {}) or {}).get("source_file", "") or "")
+        page = (getattr(n, "metadata", {}) or {}).get("page", "?")
+        try:
+            page_str = str(int(page))
+        except Exception:
+            page_str = str(page) if page is not None else "?"
+
+        doc_id = str(getattr(n, "doc_id", "") or "unknown")
+        header = f"DOC: {doc_id} | {source_file} p.{page_str}".strip()
+        body = str(getattr(n, "text", "") or "").strip()
+        if header:
+            out.append(f"{header}\n{body}".strip())
+        else:
+            out.append(body)
+    return out
+
+
+def decide_max_bullets(
+    *,
+    user_query: str,
+    contexts: List[str],
+    default_max: int = 3,
+    expanded_max: int = 5,
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Default 3, naik ke 5 hanya untuk kondisi tertentu.
+    Return: (max_bullets, meta_debug)
+    """
+    q = (user_query or "").strip()
+    methods = detect_methods_in_contexts(contexts)
+    multi_methods = len(methods) >= 2
+
+    multi_target = is_multi_target_question(q)
+    anaphora = is_anaphora_question(q)
+
+    # naik jika:
+    # - pertanyaan multi-target
+    # - atau pertanyaan anafora DAN konteks memuat >= 2 metode
+    if multi_target or (anaphora and multi_methods):
+        max_b = int(expanded_max)
+    else:
+        max_b = int(default_max)
+
+    meta = {
+        "multi_target": bool(multi_target),
+        "anaphora": bool(anaphora),
+        "methods_detected": methods,
+        "multi_methods": bool(multi_methods),
+        "max_bullets": int(max_b),
+    }
+    return max_b, meta
+
+
 def extract_terms_from_query(q: str) -> List[str]:
     """Ambil keyword sederhana dari query untuk highlight default."""
     ql = (q or "").lower()
@@ -644,8 +794,16 @@ def main() -> None:
             max_per_doc=int(max_per_doc),
             candidate_k=candidate_k,
         )
-        # contexts untuk LLM (kalau nanti key valid)
-        contexts = [n.text for n in nodes]
+        # contexts untuk LLM (kalau nanti key valid) dan perkaya dengan metadata dokumen
+        contexts = build_contexts_with_meta(nodes)
+
+        # Tentukan max bullet Bukti dinamis (3 default, bisa naik jadi 5)
+        max_bullets, bullets_meta = decide_max_bullets(
+            user_query=query,  # pakai user query asli
+            contexts=contexts,
+            default_max=3,
+            expanded_max=5,
+        )
 
         retrieval_stats = compute_retrieval_stats(nodes)
 
@@ -713,7 +871,9 @@ def main() -> None:
 
         if use_llm:
             try:
-                answer_raw = generate_answer(cfg_runtime, user_query, contexts)
+                answer_raw = generate_answer(
+                    cfg_runtime, user_query, contexts, max_bullets=max_bullets
+                )
             except Exception as ex:
                 logger.exception("LLM call failed")
                 generator_error = {"type": type(ex).__name__, "message": str(ex)}
@@ -728,6 +888,7 @@ def main() -> None:
             contexts=contexts,
             answer_text=answer_raw,
             used_ctx=used_ctx,
+            max_bullets=max_bullets,
         )
 
         generator_status = generator_meta.get("status", "unknown")
@@ -764,6 +925,8 @@ def main() -> None:
             "generator_strategy": "llm" if use_llm else "retrieval_only",
             "generator_status": generator_status,
             "generator_meta": generator_meta,
+            "max_bullets": int(max_bullets),
+            "bullet_policy": bullets_meta,  # berisi methods_detected, anaphora, multi_target, dll
             "error": generator_error,
         }
         rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
