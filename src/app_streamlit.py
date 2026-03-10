@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import os
 import re
 from collections import Counter
@@ -11,6 +10,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 
+from src.app_ui_render import (
+    _prepare_jawaban_markdown,
+    build_contexts_with_meta,
+    build_retrieval_only_answer,
+    compute_retrieval_stats,
+    dist_to_sim,
+    extract_terms_from_query,
+    extract_terms_from_text,
+    is_global_not_found_answer,
+    node_matches_filter,
+    parse_answer,
+    render_processing_box,
+)
 from src.core.config import ConfigPaths, load_config
 from src.core.logger import setup_logger
 from src.core.run_manager import RunManager
@@ -24,60 +36,29 @@ from src.core.ui_utils import (
 )
 from src.rag.generate import build_generation_meta, contextualize_question, generate_answer
 from src.rag.metadata_router import maybe_route_metadata_query
+from src.rag.method_detection import (
+    METHOD_PATTERNS as _METHOD_PATTERNS,
+)
+from src.rag.method_detection import (
+    detect_methods_in_contexts,
+    detect_methods_in_text,
+    has_steps_signal,
+    is_anaphora_question,
+    is_method_question,
+    is_multi_doc_question,
+    is_multi_target_question,
+    is_steps_question,
+    node_supports_method_for_coverage,
+    pretty_method_name,
+)
+from src.rag.method_detection import (
+    docid_hit_for_method as _docid_hit_for_method,
+)
 from src.rag.retrieve_dense import retrieve_dense
-
-
-def dist_to_sim(dist: float) -> float:
-    # distance -> similarity (0..1), lebih aman dari (1 - dist)
-    return 1.0 / (1.0 + max(dist, 0.0))
-
-
-def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
-    if not nodes:
-        return {
-            "n_nodes": 0,
-            "n_docs": 0,
-            "doc_counts_top": {},
-            "sim_top1": None,
-            "sim_avg": None,
-            "sim_gap12": None,
-            "dist_top1": None,
-        }
-
-    sims = [dist_to_sim(float(n.score)) for n in nodes]
-    sim_top1 = sims[0]
-    dist_top1 = float(nodes[0].score)
-    sim_avg = sum(sims) / max(len(sims), 1)
-    sim_gap12 = (sims[0] - sims[1]) if len(sims) > 1 else None
-
-    doc_ids = [
-        str(
-            getattr(n, "doc_id", "")
-            or (n.metadata.get("doc_id") if getattr(n, "metadata", None) else "")
-            or "unknown"
-        )
-        for n in nodes
-    ]
-    c = Counter(doc_ids)
-    # simpan ringkas biar log tidak terlalu besar
-    doc_counts_top = dict(c.most_common(5))
-
-    # dibulatkan supaya log enak dibaca
-    return {
-        "n_nodes": int(len(nodes)),
-        "n_docs": int(len(c)),
-        "doc_counts_top": doc_counts_top,
-        "sim_top1": round(float(sim_top1), 6),
-        "sim_avg": round(float(sim_avg), 6),
-        "sim_gap12": round(float(sim_gap12), 6) if sim_gap12 is not None else None,
-        "dist_top1": round(float(dist_top1), 6),
-    }
-
 
 # =========================
 # Doc-focus lock helpers
 # =========================
-
 
 def _node_doc_id(n: Any) -> str:
     return str(
@@ -307,120 +288,6 @@ def build_history_window_v2(
     return window, meta
 
 
-def parse_answer(answer_text: str) -> Tuple[str, List[str]]:
-    """
-    Parse output generator yang idealnya:
-        Jawaban: ...
-        Bukti:
-        - ... [CTX n]
-
-    Robust parse:
-    - Jika ada blok "Pertanyaan:" sebelum "Jawaban:", buang semuanya sebelum "Jawaban:"
-    - Ambil isi setelah "Jawaban:" sampai sebelum "Bukti:"
-    - Bukti diambil dari bullet '-' setelah 'Bukti:
-    """
-    text = (answer_text or "").strip()
-    if not text:
-        return "", []
-
-    # Jika ada preamble "Pertanyaan:" sebelum "Jawaban:", buang semuanya sebelum "Jawaban:"
-    m_jstart = re.search(r"(?im)^\s*Jawaban\s*:\s*", text)
-    if m_jstart and m_jstart.start() > 0:
-        text = text[m_jstart.start() :].strip()
-
-    # cari "Bukti:" (case-insensitive)
-    m_bukti = re.search(r"\bBukti\s*:\s*", text, flags=re.IGNORECASE)
-    if m_bukti:
-        head = text[: m_bukti.start()].strip()
-        tail = text[m_bukti.end() :].strip()
-
-        # ambil isi jawaban = setelah "Jawaban:"
-        m_j = re.search(r"\bJawaban\s*:\s*", head, flags=re.IGNORECASE)
-        if m_j:
-            jawaban = head[m_j.end() :].strip()
-        else:
-            # fallback: buang baris "Pertanyaan:" bila masih ada
-            jawaban = re.sub(r"(?im)^\s*Pertanyaan\s*:\s*.*$", "", head).strip()
-
-        # handle "Bukti: -" atau kosong
-        if not tail or tail == "-":
-            return jawaban, []
-
-        lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
-        bukti: List[str] = []
-        for ln in lines:
-            if ln == "-":
-                continue
-            if ln.startswith("-"):
-                bukti.append(ln[1:].strip())
-            else:
-                bukti.append(ln)
-
-        # kalau hasilnya tetap "-" doang
-        if len(bukti) == 1 and bukti[0] == "-":
-            bukti = []
-
-        return jawaban, bukti
-
-    # kalau tidak ada "Bukti:", coba ambil "Jawaban:" kalau ada
-    m_j = re.search(r"^\s*Jawaban\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.MULTILINE)
-    if m_j:
-        jawaban = m_j.group(1).strip()
-        return jawaban, []
-
-    # fallback total: semua dianggap jawaban
-    return text, []
-
-
-_NOT_FOUND_GLOBAL_UI_RE = re.compile(
-    r"(?is)^\s*Jawaban\s*:\s*Tidak\s+ditemukan\s+pada\s+dokumen\.\s*Bukti\s*:\s*-\s*$"
-)
-
-
-def is_global_not_found_answer(answer_text: str) -> bool:
-    t = (answer_text or "").strip()
-    if not t:
-        return True
-    # normalisasi ringan: pastikan "Bukti:\n-" dianggap sama dengan "Bukti: -"
-    t = re.sub(r"(?im)^\s*Bukti\s*:\s*\n\s*-\s*$", "Bukti: -", t).strip()
-    return bool(_NOT_FOUND_GLOBAL_UI_RE.match(t))
-
-
-def build_retrieval_only_answer(nodes: List[Any], max_points: int = 3) -> str:
-    """
-    Membuat jawaban "extractive" saat LLM dimatikan.
-    Output mengikuti format generator agar UI tetap konsisten.
-    """
-    if not nodes:
-        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
-
-    bullets: List[str] = []
-    for i, n in enumerate(nodes[:max_points], start=1):
-        source_file = n.metadata.get("source_file", "")
-        page = n.metadata.get("page", "?")
-
-        snippet = (n.text or "").strip().replace("\n", " ")
-        snippet = " ".join(snippet.split())  # rapikan whitespace
-        snippet = snippet[:240] + ("..." if len(snippet) > 240 else "")
-
-        bullets.append(f"- ({source_file} p.{page}) {snippet} [CTX {i}]")
-
-    return (
-        "Jawaban: (Mode retrieval-only) Berikut bukti paling relevan dari dokumen untuk pertanyaan ini.\n"
-        "Bukti:\n" + "\n".join(bullets)
-    )
-
-
-def node_matches_filter(n: Any, q: str) -> bool:
-    if not q:
-        return True
-    ql = q.lower().strip()
-    doc_id = (getattr(n, "doc_id", "") or "").lower()
-    sf = (n.metadata.get("source_file", "") or "").lower()
-    txt = (getattr(n, "text", "") or "").lower()
-    return (ql in doc_id) or (ql in sf) or (ql in txt)
-
-
 def extract_doc_focus_from_query(q: str) -> List[str]:
     """
     Ambil sinyal doc-focus dari query user, misalnya:
@@ -450,88 +317,6 @@ def extract_doc_focus_from_query(q: str) -> List[str]:
     # dedupe + rapikan
     found = [x.strip() for x in found if x.strip()]
     return list(dict.fromkeys(found))
-
-
-def is_multi_doc_question(q: str) -> bool:
-    t = (q or "").lower()
-    # frasa eksplisit
-    key_phrases = [
-        "beberapa dokumen",
-        "dokumen lain",
-        "dokumen lainnya",
-        "berbagai dokumen",
-        "lebih dari satu dokumen",
-        "lintas dokumen",
-        "multi dokumen",
-        "beberapa sumber",
-        "sumber lain",
-        "di dokumen berbeda",
-    ]
-    if any(p in t for p in key_phrases):
-        return True
-    # pola umum: ada kata "beberapa/berbagai" dan "dokumen/sumber"
-    if re.search(r"\b(beberapa|berbagai|multi)\b.*\b(dokumen|sumber)\b", t):
-        return True
-    return False
-
-
-def is_anaphora_question(q: str) -> bool:
-    """
-    Deteksi pertanyaan lanjutan yang biasanya butuh konteks sebelumnya.
-    """
-    t = (q or "").lower()
-    return bool(
-        re.search(
-            r"\b(itu|tersebut|ini|nya|tahapannya|langkahnya|alur\s*nya|metodenya)\b",
-            t,
-        )
-    )
-
-
-def is_multi_target_question(q: str) -> bool:
-    """
-    Deteksi pertanyaan yang meminta jawaban mencakup beberapa target/metode.
-    Contoh: 'semua metode', 'masing-masing metode', 'RAD dan prototyping', dll.
-    """
-    t = (q or "").lower()
-
-    # frasa eksplisit
-    key_phrases = [
-        "semua metode",
-        "masing-masing",
-        "setiap metode",
-        "beberapa metode",
-        "dua metode",
-        "kedua metode",
-        "metode rad dan",
-        "rad dan prototyping",
-        "prototyping dan rad",
-        "rad & prototyping",
-        "metode apa saja",
-        "metode-metode",
-        "masing masing",
-    ]
-    if any(p in t for p in key_phrases):
-        return True
-
-    # pola regex: (semua/masing-masing/setiap) + (metode/model)
-    if re.search(r"\b(semua|masing-masing|masing|setiap|beberapa)\b.*\b(metode|model)\b", t):
-        return True
-
-    # ada beberapa metode disambung "dan"
-    if re.search(r"\b(rad|rapid application development)\b.*\b(dan|&)\b.*\b(proto|prototyp)", t):
-        return True
-
-    return False
-
-
-def pretty_method_name(m: str) -> str:
-    return _METHOD_PRETTY.get(m, m)
-
-
-def is_method_question(q: str) -> bool:
-    t = (q or "").lower()
-    return bool(re.search(r"\b(metode|model)\b", t))
 
 
 def build_steps_standalone_query(methods: List[str]) -> str:
@@ -586,67 +371,6 @@ def infer_target_methods(user_query: str, history_window: List[Dict[str, Any]]) 
 def build_method_biased_query(base_query: str, method: str) -> str:
     q = (base_query or "").strip()
     return f"{q} metode {method}".strip()
-
-
-def is_steps_question(q: str) -> bool:
-    t = (q or "").lower()
-    return bool(re.search(r"\b(tahap|tahapan)\w*\b|\b(langkah|alur|prosedur)\w*\b", t))
-
-
-def has_steps_signal(text: str) -> bool:
-    """
-    Sinyal bahwa sebuah chunk/ctx benar-benar berisi info tahapan/langkah.
-
-    (saya atur lebih ketat) fix:
-    - Jangan menganggap kata generik seperti "proses/iterasi/feedback" sebagai tahapan.
-    - Fokus pada sinyal eksplisit: tahap/langkah/fase/prosedur, enumerasi, atau pola "meliputi/terdiri/yaitu".
-    - Tahapan implisit (planning/design/implementation/dst) hanya dianggap jika muncul sebagai daftar/komponen tahapan (>=2 stage terms)
-        DAN ada connector seperti "meliputi/terdiri/yaitu".
-    """
-    t = (text or "").lower()
-
-    # buang header "DOC: ..." agar tidak mengganggu sinyal
-    t = re.sub(r"(?im)^doc:\s.*\n", "", t).strip()
-
-    # 1) sinyal kuat: kata "tahap/tahapan/langkah/prosedur/fase"
-    if re.search(r"\b(tahap|tahapan|langkah|prosedur|fase)\w*\b", t):
-        return True
-
-    # 2) sinyal kuat: enumerasi ringan - "1.", "2.", "a)", "b)"
-    #    contoh: "1.", "2)", "a)", "b.", "- " (untuk daftar yang jelas)
-    if re.search(r"(?m)^\s*(\d+[\.\)]|[a-c][\.\)]|[-•])\s+", t):
-        return True
-
-    # 3) sinyal kuat: connector yang biasanya memperkenalkan daftar tahapan
-    has_connector = bool(re.search(r"\b(meliputi|terdiri(\s+dari)?|yaitu|antara\s+lain)\b", t))
-
-    # 4) stage terms: hanya dihitung jika ada connector + minimal 2 stage terms
-    stage_terms = [
-        "planning",
-        "perencanaan",
-        "design",
-        "perancangan",
-        "implementation",
-        "implementasi",
-        "coding",
-        "pengkodean",
-        "testing",
-        "pengujian",
-        "evaluasi",
-        "deployment",
-        "pemeliharaan",
-        "analisis",
-        "desain",
-        "perancangan",
-        "implementasi",
-    ]
-    stage_hits = sum(1 for s in stage_terms if re.search(rf"\b{re.escape(s)}\b", t))
-
-    if has_connector and stage_hits >= 2:
-        return True
-
-    # kalau tidak ada sinyal eksplisit di atas, anggap tidak memuat tahapan
-    return False
 
 
 def method_steps_query(base_query: str, method: str) -> str:
@@ -857,180 +581,6 @@ def detect_topic_shift(
     }
 
 
-_METHOD_PRETTY = {
-    "RAD": "RAD",
-    "PROTOTYPING": "Prototyping",
-    "RUP": "RUP",
-    "EXTREME_PROGRAMMING": "Extreme Programming",
-    "WATERFALL": "Waterfall",
-    "AGILE": "Agile",
-}
-
-_METHOD_PATTERNS = {
-    "RAD": [
-        r"\brad\b",
-        r"rapid application development",
-        r"rapidapplicationdevelopment",
-    ],
-    "PROTOTYPING": [
-        r"\bprototyp\w*\b",
-        r"\bprototype\b",
-        r"\bmodel\s+prototyp\w*\b",
-        r"\bmetode\s+prototyp\w*\b",
-    ],
-    "RUP": [
-        r"\brup\b",
-        r"rational unified process",
-        r"rationalunifiedprocess",
-    ],
-    "EXTREME_PROGRAMMING": [
-        r"extreme\s*programming",
-        r"extreme[_\-\s]*programming",
-        r"extremeprogramming",  # <-- penting untuk doc_id "ExtremeProgramming"
-        r"\bxp\b",
-    ],
-    "WATERFALL": [r"\bwaterfall\b"],
-    "AGILE": [r"\bagile\b", r"\bscrum\b"],
-}
-
-
-# =========================
-# Strict coverage match (biar PROTOTYPING tidak false-positive)
-# =========================
-
-_COVERAGE_DOCID_HINTS = {
-    # doc_id dataset biasanya mengandung kata kunci ini
-    "PROTOTYPING": ["prototyp"],  # menangkap "Prototyping"
-    "RAD": ["_rad", "rad"],
-    "EXTREME_PROGRAMMING": ["extremeprogramming", "extreme_programming", "xp"],
-    "RUP": ["_rup", "rup"],
-    "WATERFALL": ["waterfall"],
-    "AGILE": ["agile", "scrum"],
-}
-
-_COVERAGE_STRICT_TEXT_PATTERNS = {
-    # PROTOTYPING: tidak memakai fallback "prototype" generik → harus jelas prototyping
-    "PROTOTYPING": [
-        r"\bprototyping\b",
-        r"\bmetode\s+prototyp",
-        r"\bmodel\s+prototyp",
-        r"\bpendekatan\s+prototyp",
-    ],
-    # RAD masih boleh agak longgar, tapi tetap ada pola yang jelas
-    "RAD": [
-        r"\brad\b",
-        r"rapid application development",
-        r"\bmetode\s+rad\b",
-    ],
-}
-
-
-def _docid_hit_for_method(doc_id: str, method: str) -> bool:
-    did = (doc_id or "").lower()
-    for h in _COVERAGE_DOCID_HINTS.get(method, []):
-        if h and h in did:
-            return True
-    return False
-
-
-def node_supports_method_for_coverage(n: Any, method: str) -> bool:
-    """
-    True jika node benar-benar mendukung 'method' untuk kebutuhan coverage.
-
-    Khusus PROTOTYPING: HARUS doc_id match atau pola teks yang jelas prototyping.
-    Tidak boleh fallback ke match 'prototype' generik.
-    """
-    doc_id = getattr(n, "doc_id", "") or ""
-    text = (getattr(n, "text", "") or "").lower()
-
-    # 1) doc_id hint (paling stabil untuk dataset uji ini)
-    if _docid_hit_for_method(doc_id, method):
-        return True
-
-    # 2) strict text patterns
-    for p in _COVERAGE_STRICT_TEXT_PATTERNS.get(method, []):
-        if p and re.search(p, text, flags=re.IGNORECASE):
-            return True
-
-    # 3) fallback (HANYA untuk metode selain PROTOTYPING)
-    if method == "PROTOTYPING":
-        return False
-
-    return method in set(detect_methods_in_text(text))
-
-
-def _normalize_for_method_detection(text: str) -> str:
-    """
-    Normalisasi agar deteksi metode robust untuk:
-    - doc_id dengan underscore: ITERA_..._Prototyping
-    - CamelCase: ExtremeProgramming
-    """
-    s = text or ""
-    # pecah CamelCase: ExtremeProgramming -> Extreme Programming
-    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
-    # underscore/hyphen sebagai separator
-    s = re.sub(r"[_\-]+", " ", s)
-    # rapikan spasi & lowercase
-    s = " ".join(s.split()).lower()
-    return s
-
-
-def detect_methods_in_text(text: str) -> List[str]:
-    """
-    Ambil daftar metode yang terdeteksi dari sebuah teks (case-insensitive).
-    dengan normalisasi underscore & CamelCase
-    """
-    t = _normalize_for_method_detection(text)
-    found: List[str] = []
-    for name, pats in _METHOD_PATTERNS.items():
-        for p in pats:
-            if re.search(p, t, flags=re.IGNORECASE):
-                found.append(name)
-                break
-
-    # unik + urut stabil
-    out: List[str] = []
-    seen = set()
-    for x in found:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-def detect_methods_in_contexts(contexts: List[str]) -> List[str]:
-    """
-    Deteksi metode dari gabungan contexts.
-    """
-    joined = "\n".join(contexts or [])
-    return detect_methods_in_text(joined)
-
-
-def build_contexts_with_meta(nodes: List[Any]) -> List[str]:
-    """
-    Perkaya konteks dengan metadata dokumen agar LLM bisa eksplisit lintas dokumen.
-    Format: DOC: <doc_id> | <source_file> p.<page>
-    """
-    out: List[str] = []
-    for n in nodes:
-        source_file = str((getattr(n, "metadata", {}) or {}).get("source_file", "") or "")
-        page = (getattr(n, "metadata", {}) or {}).get("page", "?")
-        try:
-            page_str = str(int(page))
-        except Exception:
-            page_str = str(page) if page is not None else "?"
-
-        doc_id = str(getattr(n, "doc_id", "") or "unknown")
-        header = f"DOC: {doc_id} | {source_file} p.{page_str}".strip()
-        body = str(getattr(n, "text", "") or "").strip()
-        if header:
-            out.append(f"{header}\n{body}".strip())
-        else:
-            out.append(body)
-    return out
-
-
 def decide_max_bullets(
     *,
     user_query: str,
@@ -1065,270 +615,6 @@ def decide_max_bullets(
         "max_bullets": int(max_b),
     }
     return max_b, meta
-
-
-def extract_terms_from_query(q: str) -> List[str]:
-    """Ambil keyword sederhana dari query untuk highlight default."""
-    ql = (q or "").lower()
-    tokens = re.findall(r"[a-z0-9]+", ql)
-
-    stop = {
-        "apa",
-        "yang",
-        "dan",
-        "atau",
-        "dengan",
-        "dalam",
-        "pada",
-        "untuk",
-        "dari",
-        "ke",
-        "ini",
-        "itu",
-        "adalah",
-        "menurut",
-        "jelaskan",
-        "sebutkan",
-        "minimal",
-        "jika",
-        "ada",
-        "metode",
-        "evaluasi",
-        "sistem",
-        "dokumen",
-    }
-    terms = [t for t in tokens if len(t) >= 4 and t not in stop]
-    # ambil beberapa saja biar ringan
-    return terms[:5]
-
-
-def extract_terms_from_text(text: str, max_terms: int = 6) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z]{4,}", (text or "").lower())
-    stop = {
-        "yang",
-        "dengan",
-        "dalam",
-        "pada",
-        "untuk",
-        "dari",
-        "atau",
-        "dan",
-        "adalah",
-        "ini",
-        "itu",
-        "sebagai",
-        "dapat",
-        "akan",
-        "oleh",
-        "menggunakan",
-        "metode",
-        "sistem",
-        "penelitian",
-        "hasil",
-        "bab",
-        "tabel",
-        "gambar",
-    }
-    out, seen = [], set()
-    for t in tokens:
-        if t in stop or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-        if len(out) >= max_terms:
-            break
-    return out
-
-
-def _prepare_jawaban_markdown(jawaban: str) -> str:
-    """
-    Format teks jawaban multi-metode menjadi Markdown yang rapi di Streamlit.
-    Strategi section-aware (bukan line-by-line):
-    1. Split teks menjadi section per metode
-    2. Tiap header metode di-bold: **RAD:**
-    3. Tiap section diberi double newline sebagai pemisah
-    4. Numbered list di tiap section dipaksa mulai dari 1 (bukan lanjut)
-        dengan menyisipkan blank line di antara deskripsi dan list item pertama
-    """
-    t = (jawaban or "").strip()
-    if not t:
-        return t
-
-    # --- Regex pattern untuk mengenali header metode ---
-    _METHOD_NAMES = [
-        "RAD", "Prototyping", "RUP",
-        "Extreme Programming", "Waterfall", "Agile",
-        "SDLC", "Scrum",
-    ]
-    _HDR_PAT = r"^(" + "|".join(re.escape(m) for m in _METHOD_NAMES) + r")\s*:\s*(.*)$"
-    _HDR_RE  = re.compile(_HDR_PAT, re.IGNORECASE)
-    _NUM_RE  = re.compile(r"^\s*(\d+)[\.\)]\s+(.+)$")
-
-    # --- Langkah 1: Pastikan tiap header metode di baris sendiri ---
-    for name in _METHOD_NAMES:
-        escaped = re.escape(name)
-        t = re.sub(
-            rf"(?m)(?<=[^\n])(\s*)({escaped}\s*:)",
-            r"\n\2",
-            t,
-            flags=re.IGNORECASE,
-        )
-
-    lines = t.splitlines()
-
-    # --- Langkah 2: Parse menjadi section ---
-    # Setiap section = {"header": str|None, "lines": [str]}
-    sections: List[Dict[str, Any]] = []
-    current: Dict[str, Any] = {"header": None, "rest": "", "lines": []}
-
-    for ln in lines:
-        stripped = ln.strip()
-        m_hdr = _HDR_RE.match(stripped)
-        if m_hdr:
-            sections.append(current)
-            label    = m_hdr.group(1).strip()
-            rest_txt = (m_hdr.group(2) or "").strip()
-            current  = {"header": label, "rest": rest_txt, "lines": []}
-        else:
-            current["lines"].append(ln)
-
-    sections.append(current)
-
-    # --- Langkah 3: Render tiap section ---
-    output_parts: List[str] = []
-
-    for sec in sections:
-        hdr   = sec.get("header")
-        rest  = sec.get("rest", "").strip()
-        lines_sec = sec.get("lines", [])
-
-        # Kumpulkan teks non-list dan list-item secara terpisah
-        prose_lines: List[str] = []
-        list_items:  List[str] = []
-
-        # Pre-split: pecah baris yang mengandung "N. item" inline di akhir prosa
-        # Contoh: "...dari sistem. 1. Perancangan alur data"
-        #      → ["...dari sistem.", "1. Perancangan alur data"]
-        _INLINE_NUM_RE = re.compile(r"\s+(\d+[\.\)]\s+\S)")
-        expanded_lines: List[str] = []
-        for ln in lines_sec:
-            stripped = ln.strip()
-            if not stripped:
-                continue
-            # Cek apakah ada "N. teks" yang muncul di tengah/akhir baris (bukan di awal)
-            if not _NUM_RE.match(stripped):
-                m_inline = _INLINE_NUM_RE.search(stripped)
-                if m_inline:
-                    # Pisahkan: bagian sebelum "N." jadi prosa, sisanya menjadi baris sendiri
-                    split_pos = m_inline.start()
-                    before = stripped[:split_pos].strip()
-                    after  = stripped[split_pos:].strip()
-                    if before:
-                        expanded_lines.append(before)
-                    # "after" bisa mengandung lebih dari satu item inline ("1. A 2. B")
-                    # Pecah lebih lanjut
-                    sub_parts = re.split(r"(?=\d+[\.\)]\s+\S)", after)
-                    for part in sub_parts:
-                        p = part.strip()
-                        if p:
-                            expanded_lines.append(p)
-                else:
-                    expanded_lines.append(stripped)
-            else:
-                expanded_lines.append(stripped)
-
-        for ln in expanded_lines:
-            if not ln.strip():
-                continue
-            m_num = _NUM_RE.match(ln.strip())
-            if m_num:
-                list_items.append(m_num.group(2).strip())
-            else:
-                prose_lines.append(ln.strip())
-
-        # Bangun blok untuk section ini
-        block_parts: List[str] = []
-
-        # Header (bold jika ada)
-        if hdr:
-            block_parts.append(f"**{hdr}:**")
-
-        # "rest" = teks setelah header di baris yang sama (mis. "Potongan konteks...")
-        if rest:
-            block_parts.append(rest)
-
-        # Teks prosa lainnya
-        if prose_lines:
-            block_parts.append("\n".join(prose_lines))
-
-        # Numbered list — selalu mulai dari 1, tiap item di baris baru
-        # Blank line sebelum list (wajib agar Markdown render sebagai <ol>)
-        if list_items:
-            list_block = "\n".join(
-                f"{i+1}. {item}" for i, item in enumerate(list_items)
-            )
-            block_parts.append("")          # blank line sebelum list
-            block_parts.append(list_block)
-
-        if block_parts:
-            output_parts.append("\n".join(block_parts))
-
-    # --- Langkah 4: Gabung section dengan double newline ---
-    return "\n\n".join(p for p in output_parts if p.strip())
-
-
-def render_processing_box(user_q: str, retrieval_q: str) -> None:
-    """Box ringkas untuk menampilkan user query vs retrieval query (V1.5)."""
-    user_q = (user_q or "").strip()
-    retrieval_q = (retrieval_q or "").strip()
-
-    if not user_q and not retrieval_q:
-        return
-
-    # escape biar aman kalau ada karakter aneh
-    user_q_esc = html.escape(user_q)
-    retrieval_q_esc = html.escape(retrieval_q)
-
-    # Badge kecil: apakah query direwrite?
-    contextualized = bool(retrieval_q) and (retrieval_q != user_q)
-
-    badge = (
-        '<span style="background:#3b82f6; color:#fff; padding:2px 8px; '
-        'border-radius:999px; font-size:12px; margin-left:8px;">contextualized</span>'
-        if contextualized
-        else '<span style="background:#16a34a; color:#fff; padding:2px 8px; '
-        'border-radius:999px; font-size:12px; margin-left:8px;">direct</span>'
-    )
-
-    lines = []
-    if user_q:
-        lines.append(f"<div style='margin-top:6px;'><b>User Query:</b><br/>{user_q_esc}</div>")
-    if retrieval_q and retrieval_q != user_q:
-        lines.append(
-            f"<div style='margin-top:10px;'><b>Retrieval Query (Contextualized):</b><br/>{retrieval_q_esc}</div>"
-        )
-
-    body = "\n".join(lines)
-
-    st.markdown(
-        f"""
-<div style="
-  background:#23262d;
-  border:1px solid #3a3f47;
-  padding:0.85rem 1rem;
-  border-radius:0.75rem;
-  margin:0.5rem 0 1rem 0;
-">
-  <div style="display:flex; align-items:center; justify-content:space-between;">
-    <div style="font-weight:800;">Processing ⚙️ {badge}</div>
-  </div>
-  <div style="color:#e5e7eb; line-height:1.45;">
-    {body}
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
 
 
 def main() -> None:
