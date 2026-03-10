@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Dict, List
 
 import chromadb
+import fitz  # PyMuPDF
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -27,6 +29,14 @@ def _cfg_get(cfg: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
 
 def _list_pdfs(data_raw_dir: Path, pattern: str = "*.pdf") -> List[Path]:
     return sorted([p for p in data_raw_dir.glob(pattern) if p.is_file()])
+
+
+def _get_page_count(pdf_path: Path) -> int:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            return int(doc.page_count)
+    except Exception:
+        return 0
 
 
 def _load_pdf_pages(pdf_path: Path) -> List:
@@ -92,6 +102,23 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
         logger.info("Resetting collection (delete_collection)...")
         _reset_collection(persist_dir, collection_name)
 
+    # ===== Build doc_catalog (page_count) =====
+    doc_catalog: Dict[str, Any] = {}
+    logger.info("Building doc catalog (page_count)...")
+    for p in pdfs:
+        doc_id = p.stem
+        doc_catalog[doc_id] = {
+            "doc_id": doc_id,
+            "source_file": p.name,
+            "relative_path": p.name,  # cukup nama file (sesuai resolve_pdf_path)
+            "page_count": _get_page_count(p),
+        }
+
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = persist_dir / "doc_catalog.json"
+    catalog_path.write_text(json.dumps(doc_catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"doc_catalog saved: {catalog_path} | n_docs={len(doc_catalog)}")
+
     # Load docs
     all_docs = []
     logger.info(f"Loading PDFs: {len(pdfs)} file(s)")
@@ -148,12 +175,6 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
             "Jika ini karena duplicate IDs, jalankan ulang dengan --reset."
         )
         raise
-
-    # # Persist (beberapa versi langchain_chroma tidak perlu, tapi aman)
-    # try:
-    #     vectorstore.persist()
-    # except Exception:
-    #     pass
 
     # Count check via chromadb client (lebih pasti)
     client = chromadb.PersistentClient(path=str(persist_dir))
