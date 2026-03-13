@@ -335,7 +335,7 @@ def _ensure_bukti_bullets(out: str) -> str:
 
     # kalau Bukti: - sudah benar
     if tail == "-" or tail.startswith("-"):
-        return f"{head}\nBukti:\n{tail}" if not tail.startswith("-") else f"{head}\nBukti:\n{tail}"
+        return f"{head}\nBukti:\n{tail}"
 
     # kalau bukti berupa beberapa baris tapi tanpa dash
     lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
@@ -1978,7 +1978,7 @@ def _fill_empty_sections_as_not_found_for_steps(
     Jika suatu metode sudah ada header "<METODE>:" tetapi section-nya kosong (tidak ada konten sama sekali
     sampai header metode berikutnya), maka ubah menjadi:
         "<METODE>: Tidak ditemukan pada dokumen."
-    Ini mencegah output seperti:
+    Hal ini mencegah output seperti:
         Prototyping:
         Extreme Programming:
     """
@@ -2039,6 +2039,7 @@ def _fill_empty_sections_as_not_found_for_steps(
             j = start_i + 1
             while j < end_i and j < len(lines) and (not (lines[j] or "").strip()):
                 lines[j] = ""  # biarkan kosong; nanti join tetap rapi
+                j += 1 
 
     new_body = "\n".join(lines).strip()
     new_head = "Jawaban:\n" + new_body
@@ -2574,10 +2575,17 @@ def _extractive_fallback_from_contexts(
         # cap bukti total
         bukti_lines = bukti_lines[:max_total_bullets]
 
-        if not bukti_lines:
-            return "\n".join(jawaban_lines).strip() + "\nBukti: -"
+        def _fb_cleanup(s: str) -> str:
+            s = _fix_empty_numbered_lines(s)
+            s = _strip_ctx_from_jawaban(s)
+            return s
 
-        return "\n".join(jawaban_lines).strip() + "\nBukti:\n" + "\n".join(bukti_lines)
+        if not bukti_lines:
+            return _fb_cleanup("\n".join(jawaban_lines).strip() + "\nBukti: -")
+
+        return _fb_cleanup(
+            "\n".join(jawaban_lines).strip() + "\nBukti:\n" + "\n".join(bukti_lines)
+        )
 
     # ---------- DEFAULT FALLBACK (UMUM / single target) ----------
     bullets: list[str] = []
@@ -3021,6 +3029,8 @@ def generate_answer(
             missing_clean = _prune_missing_methods_against_answer(
                 out, targets, list(missing_clean or [])
             )
+
+            missing = list(missing_clean)   # sinkronkan ulang
 
         # FINAL deterministic enforce:
         # Kalau LLM masih saja keras kepala (mis. hanya isi RAD), saya paksa semua header harus ada,

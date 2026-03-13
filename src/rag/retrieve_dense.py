@@ -171,13 +171,16 @@ def retrieve_dense(
     top_k = int(cfg["retrieval"]["top_k"])
     vs = _get_vectorstore(cfg)
 
+    # Unifikasi cap ke satu konstanta
+    _MAX_CANDIDATE_K = 400 
+
     if diversify:
         if candidate_k is None:
             # default: pool lebih besar supaya punya “bahan” untuk sebar antar dokumen
-            candidate_k = min(max(top_k * 6, top_k), 200)
+            candidate_k = min(max(top_k * 6, top_k), _MAX_CANDIDATE_K)
         else:
             candidate_k = max(int(candidate_k), top_k)
-            candidate_k = min(candidate_k, 400)
+            candidate_k = min(candidate_k, _MAX_CANDIDATE_K)
 
         results: List[Tuple[Any, float]] = vs.similarity_search_with_score(query, k=candidate_k)
     else:

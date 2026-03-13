@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -101,18 +102,41 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
     if reset:
         logger.info("Resetting collection (delete_collection)...")
         _reset_collection(persist_dir, collection_name)
+        existing_catalog = {}
 
     # ===== Build doc_catalog (page_count) =====
-    doc_catalog: Dict[str, Any] = {}
     logger.info("Building doc catalog (page_count)...")
+
+    # Load existing catalog dulu (untuk merge inkremental)
+    existing_catalog: Dict[str, Any] = {}
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = persist_dir / "doc_catalog.json"
+    if catalog_path.exists():
+        try:
+            existing_catalog = json.loads(
+                catalog_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(existing_catalog, dict):
+                existing_catalog = {}
+        except Exception:
+            existing_catalog = {}
+
+    # Mulai dari existing, overwrite hanya yang diproses sekarang
+    doc_catalog: Dict[str, Any] = dict(existing_catalog)
     for p in pdfs:
         doc_id = p.stem
         doc_catalog[doc_id] = {
             "doc_id": doc_id,
             "source_file": p.name,
-            "relative_path": p.name,  # cukup nama file (sesuai resolve_pdf_path)
+            "relative_path": p.name,
             "page_count": _get_page_count(p),
         }
+
+    catalog_path.write_text(
+        json.dumps(doc_catalog, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    logger.info(f"doc_catalog saved: {catalog_path} | n_docs={len(doc_catalog)}")
 
     persist_dir.mkdir(parents=True, exist_ok=True)
     catalog_path = persist_dir / "doc_catalog.json"
@@ -143,14 +167,17 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
 
     chunks = splitter.split_documents(all_docs)
 
-    # Assign chunk_id (deterministik) untuk audit + sources
+    # Assign chunk_id (deterministik) untuk audit + sources (counter per doc_id)
     ids = []
-    for i, d in enumerate(chunks):
+    _chunk_counter: Dict[str, int] = defaultdict(int)
+    for d in chunks:
         doc_id = d.metadata.get("doc_id", "unknown")
         page = d.metadata.get("page", "na")
-        chunk_id = f"{doc_id}#p{page}#c{i:06d}"
+        idx = _chunk_counter[doc_id]
+        chunk_id = f"{doc_id}#p{page}#c{idx:06d}"
         d.metadata["chunk_id"] = chunk_id
         ids.append(chunk_id)
+        _chunk_counter[doc_id] += 1
 
     logger.info(f"Pages loaded: {len(all_docs)}")
     logger.info(f"Chunks created: {len(chunks)} | chunk_size={chunk_size} overlap={chunk_overlap}")

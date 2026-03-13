@@ -898,7 +898,7 @@ def main() -> None:
             cfg_runtime["llm"]["max_chars_per_ctx"] = int(max_chars_ctx_ui)
 
             # ===== Memory window =====
-            # ===== DETECT awal (berdasarkan query saja) =====
+            # ===== DETECT awal (anaphora / multi-target / topic-shift berdasarkan query saja) =====
             detect_anaphora = is_anaphora_question(query)
             detect_multi_target = is_multi_target_question(query)
 
@@ -924,9 +924,6 @@ def main() -> None:
             history_turn_ids = [h.get("turn_id") for h in history_window] if history_window else []
 
             st.write("💭 Mendeteksi konteks & riwayat percakapan...")
-            # ===== DETECT (anaphora / multi-target / topic-shift) =====
-            detect_anaphora = is_anaphora_question(query)
-            detect_multi_target = is_multi_target_question(query)
 
             ts_cfg = cfg_runtime.get("topic_shift", {}) or {}
             ts_enabled = bool(ts_cfg.get("enabled", True))
@@ -1073,6 +1070,7 @@ def main() -> None:
                         "retrieval_stats": retrieval_stats,
                         "retrieval_confidence": None,
                         "retrieved_nodes": [],
+                        "coverage": None,
                         "metadata_route": metadata_meta,
                     }
                     rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
@@ -1126,6 +1124,7 @@ def main() -> None:
                         "max_bullets": 1,
                         "bullet_policy": {},
                         "error": None,
+                        "coverage": None,
                         "metadata_route": metadata_meta,
                     }
                     rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
@@ -1486,6 +1485,7 @@ def main() -> None:
                     "coverage": coverage_meta,
                     "metadata_route": metadata_meta,
                     "contextualize_decision": contextualize_decision,
+                    "doc_focus": st.session_state.get("last_doc_focus_meta"),
                     "strategy": strategy,
                     "diversity": {
                         "mode": diverse_mode,
@@ -1736,6 +1736,7 @@ def main() -> None:
                     "coverage": coverage_meta,
                     "metadata_route": metadata_meta,
                     "contextualize_decision": contextualize_decision,
+                    "doc_focus": st.session_state.get("last_doc_focus_meta"),
                     "used_context_chunk_ids": [n.chunk_id for n in nodes],
                     "answer": answer_raw,
                     "strategy": strategy,
