@@ -10,7 +10,7 @@ from typing import Any, Dict
 
 
 def now_iso_jakarta() -> str:
-    # Timezone user Asia/Jakarta; sederhana dulu (tanpa pytz) -> offset manual
+    # Timezone user Asia/Jakarta; sederhana (tanpa pytz) -> offset manual
     # Nanti bisa diganti pakai zoneinfo saat requirements.
     return datetime.now().astimezone().isoformat()
 

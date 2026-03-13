@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
 import chromadb
+import fitz  # PyMuPDF
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -27,6 +30,14 @@ def _cfg_get(cfg: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
 
 def _list_pdfs(data_raw_dir: Path, pattern: str = "*.pdf") -> List[Path]:
     return sorted([p for p in data_raw_dir.glob(pattern) if p.is_file()])
+
+
+def _get_page_count(pdf_path: Path) -> int:
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            return int(doc.page_count)
+    except Exception:
+        return 0
 
 
 def _load_pdf_pages(pdf_path: Path) -> List:
@@ -91,6 +102,46 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
     if reset:
         logger.info("Resetting collection (delete_collection)...")
         _reset_collection(persist_dir, collection_name)
+        existing_catalog = {}
+
+    # ===== Build doc_catalog (page_count) =====
+    logger.info("Building doc catalog (page_count)...")
+
+    # Load existing catalog dulu (untuk merge inkremental)
+    existing_catalog: Dict[str, Any] = {}
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = persist_dir / "doc_catalog.json"
+    if catalog_path.exists():
+        try:
+            existing_catalog = json.loads(
+                catalog_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(existing_catalog, dict):
+                existing_catalog = {}
+        except Exception:
+            existing_catalog = {}
+
+    # Mulai dari existing, overwrite hanya yang diproses sekarang
+    doc_catalog: Dict[str, Any] = dict(existing_catalog)
+    for p in pdfs:
+        doc_id = p.stem
+        doc_catalog[doc_id] = {
+            "doc_id": doc_id,
+            "source_file": p.name,
+            "relative_path": p.name,
+            "page_count": _get_page_count(p),
+        }
+
+    catalog_path.write_text(
+        json.dumps(doc_catalog, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    logger.info(f"doc_catalog saved: {catalog_path} | n_docs={len(doc_catalog)}")
+
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = persist_dir / "doc_catalog.json"
+    catalog_path.write_text(json.dumps(doc_catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"doc_catalog saved: {catalog_path} | n_docs={len(doc_catalog)}")
 
     # Load docs
     all_docs = []
@@ -116,14 +167,17 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
 
     chunks = splitter.split_documents(all_docs)
 
-    # Assign chunk_id (deterministik) untuk audit + sources
+    # Assign chunk_id (deterministik) untuk audit + sources (counter per doc_id)
     ids = []
-    for i, d in enumerate(chunks):
+    _chunk_counter: Dict[str, int] = defaultdict(int)
+    for d in chunks:
         doc_id = d.metadata.get("doc_id", "unknown")
         page = d.metadata.get("page", "na")
-        chunk_id = f"{doc_id}#p{page}#c{i:06d}"
+        idx = _chunk_counter[doc_id]
+        chunk_id = f"{doc_id}#p{page}#c{idx:06d}"
         d.metadata["chunk_id"] = chunk_id
         ids.append(chunk_id)
+        _chunk_counter[doc_id] += 1
 
     logger.info(f"Pages loaded: {len(all_docs)}")
     logger.info(f"Chunks created: {len(chunks)} | chunk_size={chunk_size} overlap={chunk_overlap}")
@@ -148,12 +202,6 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
             "Jika ini karena duplicate IDs, jalankan ulang dengan --reset."
         )
         raise
-
-    # # Persist (beberapa versi langchain_chroma tidak perlu, tapi aman)
-    # try:
-    #     vectorstore.persist()
-    # except Exception:
-    #     pass
 
     # Count check via chromadb client (lebih pasti)
     client = chromadb.PersistentClient(path=str(persist_dir))

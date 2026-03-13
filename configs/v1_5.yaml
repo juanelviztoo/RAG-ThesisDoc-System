@@ -1,3 +1,29 @@
 memory:
   enabled: true
   window: 4
+
+topic_shift:
+  enabled: true
+  overlap_threshold: 0.15
+  min_terms: 3
+
+history:
+  segment_on_topic_shift: true
+  anaphora_skip_last_shift: true
+
+coverage:
+  enabled: true
+  per_method_k: 3
+  min_methods: 2
+
+metadata_routing:
+  enabled: true
+  allow_in_eval: false
+  doc_catalog_filename: doc_catalog.json
+
+generation:
+  per_method_bullets: 2
+  max_total_bullets: 6
+  force_per_method_for_steps: true
+  force_per_method_for_method_list: true
+  deterministic_steps_answer: false
