@@ -11,9 +11,13 @@ Diimpor oleh app_streamlit.py:
         node_matches_filter, extract_terms_from_query, extract_terms_from_text,
         _prepare_jawaban_markdown, render_processing_box,
         build_contexts_with_meta,
+        render_answer_card_header, render_bukti_section,
+        render_ctx_mapping_header, render_sources_header,
+        render_pdf_viewer_header, render_viewing_banner,
+        sim_color_badge, render_ctx_mapping_table, render_source_score_pills,
     )
 
-Tidak mengimpor dari app_streamlit.py (cegah circular import).
+Tidak mengimpor dari app_streamlit.py (mencegah circular import).
 """
 from __future__ import annotations
 
@@ -454,12 +458,315 @@ def render_processing_box(user_q: str, retrieval_q: str) -> None:
   margin:0.5rem 0 1rem 0;
 ">
   <div style="display:flex; align-items:center; justify-content:space-between;">
-    <div style="font-weight:800;">Processing ⚙️ {badge}</div>
+    <div style="font-weight:800;">Processed ⚙️ {badge}</div>
   </div>
   <div style="color:#e5e7eb; line-height:1.45;">
     {body}
   </div>
 </div>
 """,
+        unsafe_allow_html=True,
+    )
+
+# =========================
+# Styled section headers & answer cards
+# =========================
+
+def render_answer_card_header() -> None:
+    """
+    Render styled header bar untuk section Jawaban.
+    Wajib dipanggil di dalam st.columns() bersama copy_to_clipboard_button()
+    agar tombol copy tetap sejajar di kanan.
+    """
+    st.markdown(
+        '<div style="'
+        "border-left:4px solid #3b82f6;"
+        "background:linear-gradient(90deg,#1e3a5f33,transparent);"
+        "padding:0.45rem 0.85rem;"
+        "border-radius:0 0.4rem 0.4rem 0;"
+        "margin:0.5rem 0 0.15rem 0;"
+        '">'
+        '<span style="font-size:1.2rem;font-weight:800;color:#93c5fd;">'
+        "💌 Jawaban"
+        "</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_bukti_section(bukti: List[str]) -> None:
+    """
+    Render section Bukti lengkap: styled header + bullet items.
+    Menggantikan st.subheader("Bukti") + for-loop bullets di app_streamlit.py.
+    Konten bullet tetap memakai st.markdown() agar [CTX n] tampil benar (tidak di-escape).
+    """
+    # Styled header
+    st.markdown(
+        '<div style="'
+        "border-left:4px solid #f59e0b;"
+        "background:linear-gradient(90deg,#3f2a0033,transparent);"
+        "padding:0.45rem 0.85rem;"
+        "border-radius:0 0.4rem 0.4rem 0;"
+        "margin:1.1rem 0 0.4rem 0;"
+        '">'
+        '<span style="font-size:1.1rem;font-weight:800;color:#fcd34d;">'
+        "🗞️ Bukti"
+        "</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not bukti:
+        st.caption("— Tidak ada bukti sitasi.")
+        return
+
+    # Render semua bullet dalam 1 blok markdown (lebih efisien dari loop individual)
+    # Tetap memakai st.markdown() agar [CTX n] tidak di-escape sebagai HTML
+    with st.container(border=True):
+        bullet_md = "\n".join(f"- {b}" for b in bukti)
+        st.markdown(bullet_md)
+
+
+def render_ctx_mapping_header() -> None:
+    """
+    Render styled header untuk section CTX Mapping.
+    Menggantikan st.subheader("CTX Mapping") di app_streamlit.py.
+    """
+    st.markdown(
+        '<div style="'
+        "border-left:4px solid #8b5cf6;"
+        "background:linear-gradient(90deg,#2e1a5533,transparent);"
+        "padding:0.45rem 0.85rem;"
+        "border-radius:0 0.4rem 0.4rem 0;"
+        "margin:1.1rem 0 0.4rem 0;"
+        '">'
+        '<span style="font-size:1.1rem;font-weight:800;color:#c4b5fd;">'
+        "🗂️ CTX Mapping"
+        "</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_sources_header() -> None:
+    """
+    Render styled header untuk section Sources (Top-k).
+    Menggantikan st.subheader("Sources (Top-k)") di app_streamlit.py.
+    """
+    st.markdown(
+        '<div style="'
+        "border-left:4px solid #10b981;"
+        "background:linear-gradient(90deg,#05302033,transparent);"
+        "padding:0.45rem 0.85rem;"
+        "border-radius:0 0.4rem 0.4rem 0;"
+        "margin:1.1rem 0 0.4rem 0;"
+        '">'
+        '<span style="font-size:1.1rem;font-weight:800;color:#6ee7b7;">'
+        "🌐 Sources (Top-k)"
+        "</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_pdf_viewer_header(filename: str, page: int) -> None:
+    """
+    Render styled header untuk section PDF Viewer.
+    Menggantikan st.subheader("PDF Viewer") di app_streamlit.py.
+    """
+    caption_text = f"Menampilkan <b>{filename} — halaman {page}</b>"
+    st.markdown(
+        '<div style="'
+        "border-left:4px solid #ec4899;"
+        "background:linear-gradient(90deg,#3f054433,transparent);"
+        "padding:0.45rem 0.85rem;"
+        "border-radius:0 0.4rem 0.4rem 0;"
+        "margin:1.1rem 0 0.4rem 0;"
+        '">'
+        '<span style="font-size:1.1rem;font-weight:800;color:#f9a8d4;">'
+        "📄 PDF Viewer"
+        "</span>"
+        f'<span style="font-size:0.8rem;color:#9ca3af;margin-left:0.75rem;">'
+        f"{caption_text}"
+        "</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# =========================
+# CTX & Sources visual polish 
+# =========================
+
+# Threshold similarity (dipakai konsisten di semua fungsi)
+_SIM_HIGH = 0.70    # >= HIGH  → hijau
+_SIM_MED  = 0.55    # >= MED   → kuning / sedang
+                    # <  MED   → merah  / rendah
+
+
+def sim_color_badge(sim: float) -> str:
+    """
+    Return emoji badge berdasarkan nilai similarity.
+    Dipakai di title Sources expander agar ada visual cue relevansi tanpa buka expander.
+
+    Threshold:
+        >= 0.70 → 🟢 (tinggi)
+        >= 0.55 → 🟡 (sedang)
+        <  0.55 → 🔴 (rendah)
+    """
+    if sim >= _SIM_HIGH:
+        return "🟢"
+    elif sim >= _SIM_MED:
+        return "🟡"
+    return "🔴"
+
+
+def _sim_hex(sim: float) -> str:
+    """Return hex warna untuk nilai sim (dipakai di HTML render internal)."""
+    if sim >= _SIM_HIGH:
+        return "#4ade80"   # green-400
+    elif sim >= _SIM_MED:
+        return "#facc15"   # yellow-400
+    return "#f87171"       # red-400
+
+
+def _sim_label(sim: float) -> str:
+    """Return label teks untuk nilai sim."""
+    if sim >= _SIM_HIGH:
+        return "Tinggi"
+    elif sim >= _SIM_MED:
+        return "Sedang"
+    return "Rendah"
+
+
+def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
+    """
+    Render CTX Mapping sebagai st.dataframe() native dengan kolom `sim` color-coded
+    menggunakan pandas Styler.
+
+    Kolom:  CTX | doc_id | page | source_file | sim ↑ | dist ↓ | chunk_id
+
+    Threshold warna kolom `sim`:
+        >= 0.70 → #4ade80  (hijau  / tinggi)
+        >= 0.55 → #facc15  (kuning / sedang)
+        <  0.55 → #f87171  (merah  / rendah)
+    """
+    if not ctx_rows:
+        st.caption("— Tidak ada CTX untuk ditampilkan.")
+        return
+
+    try:
+        import pandas as pd
+    except ImportError:
+        # Fallback aman: tampilkan sebagai plain dataframe tanpa styling
+        st.dataframe(ctx_rows, use_container_width=True, hide_index=True)
+        return
+
+    df = pd.DataFrame(ctx_rows)
+
+    # Pastikan urutan kolom konsisten
+    col_order = ["CTX", "doc_id", "page", "source_file", "sim", "dist", "chunk_id"]
+    df = df[[c for c in col_order if c in df.columns]]
+
+    def _style_sim(val: float) -> str:
+        """CSS inline untuk sel kolom sim."""
+        if val >= _SIM_HIGH:
+            return "color: #4ade80; font-weight: bold"
+        elif val >= _SIM_MED:
+            return "color: #facc15; font-weight: bold"
+        return "color: #f87171; font-weight: bold"
+
+    # Pylance-safe: try/except menghindari false-positive "None cannot be called"
+    # type: ignore comments diperlukan karena Pylance salah infer tipe Scalar vs float
+    try:
+        styled = df.style.map(_style_sim, subset=["sim"])  # type: ignore[arg-type]
+    except AttributeError:
+        styled = df.style.applymap(_style_sim, subset=["sim"])  # type: ignore[attr-defined]
+
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    # Legend threshold (di bawah tabel, ukuran kecil muted)
+    st.markdown(
+        '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;flex-wrap:wrap;'
+        'font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
+        "<span>🟢 sim &ge; 0.70 &nbsp;(Tinggi)</span>"
+        "<span>🟡 sim &ge; 0.55 &nbsp;(Sedang)</span>"
+        "<span>🔴 sim &lt; 0.55 &nbsp;(Rendah)</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> None:
+    """
+    Render mini score pills (CTX label + sim + dist) di awal isi Sources expander.
+    Memberikan visual feedback relevansi tanpa perlu membaca angka di title expander.
+
+    Dipakai tepat sebelum st.caption("Preview: ...") di dalam st.expander() Sources.
+    """
+    sim_color = _sim_hex(sim)
+    sim_lbl   = _sim_label(sim)
+
+    # Pill CTX label
+    ctx_pill = ""
+    if ctx_label:
+        ctx_escaped = html.escape(ctx_label)
+        ctx_pill = (
+            f'<span style="background:#1e3a5f;color:#93c5fd;'
+            f'padding:2px 8px;border-radius:999px;font-size:0.75rem;'
+            f'font-family:monospace;font-weight:600;">{ctx_escaped}</span>'
+        )
+
+    # Pill sim (warna sesuai threshold)
+    sim_pill = (
+        f'<span style="background:#0d1f17;border:1px solid {sim_color}55;'
+        f'color:{sim_color};padding:2px 10px;border-radius:999px;'
+        f'font-size:0.78rem;font-weight:700;font-family:monospace;">'
+        f'sim&nbsp;{sim:.4f}'
+        f'<span style="font-size:0.7rem;opacity:0.7;margin-left:4px;">({sim_lbl})</span>'
+        f'</span>'
+    )
+
+    # Pill dist (abu-abu muted, tidak perlu threshold warna)
+    dist_pill = (
+        f'<span style="background:#1a1f2e;border:1px solid #33415555;'
+        f'color:#64748b;padding:2px 10px;border-radius:999px;'
+        f'font-size:0.78rem;font-family:monospace;">'
+        f'dist&nbsp;{dist:.4f}'
+        f'</span>'
+    )
+
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:0.45rem;'
+        f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
+        f"{ctx_pill}{sim_pill}{dist_pill}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_viewing_banner(turn_id: int) -> None:
+    """
+    Render banner informatif saat user sedang melihat turn historis (bukan turn terbaru).
+    Dipanggil di atas result area ketika viewing_turn_id != None.
+    """
+    st.markdown(
+        f'<div style="'
+        f"background:rgba(37,99,235,0.08);"
+        f"border:1px solid #2563eb;"
+        f"border-left:4px solid #3b82f6;"
+        f"padding:0.55rem 1rem;"
+        f"border-radius:0.6rem;"
+        f"margin:0.4rem 0 0.8rem 0;"
+        f"display:flex;align-items:center;gap:0.6rem;"
+        f'">'
+        f'<span style="font-size:1.05rem;">🔆</span>'
+        f'<span style="color:#60a5fa;font-weight:700;font-size:0.95rem;">'
+        f"Menampilkan Chat-Turn {turn_id}"
+        f"</span>"
+        f'<span style="color:#93c5fd;opacity:0.7;font-size:0.82rem;margin-left:0.25rem;">'
+        f"— <i>Hasil di bawah merupakan historis chat, bukan turn terbaru.</i>"
+        f"</span>"
+        f"</div>",
         unsafe_allow_html=True,
     )
