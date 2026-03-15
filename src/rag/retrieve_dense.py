@@ -194,6 +194,7 @@ def retrieve_dense(
                 doc_id=str(md.get("doc_id", md.get("source_file", "unknown"))),
                 chunk_id=str(md.get("chunk_id", "unknown")),
                 score=float(score),
+                score_dense=float(score),   # expose ke jalur hybrid & UI
                 text=str(doc.page_content),
                 metadata=md,
             )

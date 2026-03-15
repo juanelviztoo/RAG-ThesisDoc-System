@@ -25,8 +25,8 @@ python-dotenv
 pyyaml
 
 # Hybrid retrieval (V2)
-rank-bm25
-Sastrawi
+rank-bm25>=0.2.2
+PySastrawi>=1.2.0
 
 # LLM providers - LangChain integrations (gunakan salah satu sesuai provider)
 langchain-groq

@@ -24,7 +24,7 @@ from __future__ import annotations
 import html
 import re
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -38,7 +38,11 @@ def dist_to_sim(dist: float) -> float:
 
 
 def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
-    """Hitung statistik ringkas dari hasil retrieval untuk keperluan logging."""
+    """
+    Hitung statistik ringkas dari hasil retrieval untuk keperluan logging.
+    Mode-aware: untuk node hybrid, akan memakai score_dense (Chroma distance asli)
+    sebagai basis sim stats - lebih bermakna daripada RRF score.
+    """
     if not nodes:
         return {
             "n_nodes": 0,
@@ -50,9 +54,20 @@ def compute_retrieval_stats(nodes: List[Any]) -> Dict[str, Any]:
             "dist_top1": None,
         }
 
-    sims = [dist_to_sim(float(n.score)) for n in nodes]
+    def _effective_dist(n: Any) -> float:
+        """
+        Ambil distance yang efektif untuk perhitungan sim:
+        - Jika score_dense ada (node hybrid dari RRF): pakai score_dense (Chroma distance asli).
+        - Jika tidak (node dense biasa): pakai score (langsung dari Chroma).
+        """
+        sd = getattr(n, "score_dense", None)
+        if sd is not None:
+            return float(sd)
+        return float(n.score)
+
+    sims = [dist_to_sim(_effective_dist(n)) for n in nodes]
     sim_top1 = sims[0]
-    dist_top1 = float(nodes[0].score)
+    dist_top1 = _effective_dist(nodes[0])
     sim_avg = sum(sims) / max(len(sims), 1)
     sim_gap12 = (sims[0] - sims[1]) if len(sims) > 1 else None
 
@@ -641,10 +656,15 @@ def _sim_label(sim: float) -> str:
 
 def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
     """
-    Render CTX Mapping sebagai st.dataframe() native dengan kolom `sim` color-coded
-    menggunakan pandas Styler.
+    Render CTX Mapping sebagai st.dataframe() native dengan kolom `sim` color-coded.
+    Mode-aware: deteksi schema hybrid vs dense dari keys ctx_rows.
 
-    Kolom:  CTX | doc_id | page | source_file | sim ↑ | dist ↓ | chunk_id
+    Dense schema  — kolom: CTX | doc_id | page | source_file | sim ↑ | dist ↓ | chunk_id
+                    styling: warna pada kolom `sim`.
+
+    Hybrid schema — kolom: CTX | doc_id | page | source_file | score_rrf ↑ |
+                            score_dense ↓ | score_sparse ↑ | rank_dense | rank_sparse | chunk_id
+                    styling: warna pada kolom `score_rrf` (lebih tinggi = lebih relevan).
 
     Threshold warna kolom `sim`:
         >= 0.70 → #4ade80  (hijau  / tinggi)
@@ -664,37 +684,99 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
 
     df = pd.DataFrame(ctx_rows)
 
-    # Pastikan urutan kolom konsisten
-    col_order = ["CTX", "doc_id", "page", "source_file", "sim", "dist", "chunk_id"]
-    df = df[[c for c in col_order if c in df.columns]]
+    # ── Deteksi schema dari kolom yang tersedia ──
+    is_hybrid = "score_rrf" in df.columns
 
-    def _style_sim(val: float) -> str:
-        """CSS inline untuk sel kolom sim."""
-        if val >= _SIM_HIGH:
-            return "color: #4ade80; font-weight: bold"
-        elif val >= _SIM_MED:
-            return "color: #facc15; font-weight: bold"
-        return "color: #f87171; font-weight: bold"
+    if is_hybrid:
+        # ── Hybrid schema ──
+        col_order = [
+            "CTX", "doc_id", "page", "source_file",
+            "score_rrf", "score_dense", "score_sparse",
+            "rank_dense", "rank_sparse",
+            "chunk_id",
+        ]
+        df = df[[c for c in col_order if c in df.columns]]
 
-    # Pylance-safe: try/except menghindari false-positive "None cannot be called"
-    # type: ignore comments diperlukan karena Pylance salah infer tipe Scalar vs float
-    try:
-        styled = df.style.map(_style_sim, subset=["sim"])  # type: ignore[arg-type]
-    except AttributeError:
-        styled = df.style.applymap(_style_sim, subset=["sim"])  # type: ignore[attr-defined]
+        # ── cast rank ke nullable Int64 agar tampil 1/2/3 bukan 1.000000/None ──
+        for rank_col in ["rank_dense", "rank_sparse"]:
+            if rank_col in df.columns:
+                df[rank_col] = df[rank_col].astype(pd.Int64Dtype())
 
-    st.dataframe(styled, width="stretch", hide_index=True)
+        def _style_rrf(val: Any) -> str:
+            """Warna sel score_rrf: lebih tinggi = lebih relevan (RRF score ~ 1/(k+rank))."""
+            if val is None or (isinstance(val, float) and val != val):
+                return ""
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                return ""
+            # RRF score untuk rank 1 dengan k=60 ≈ 0.0164
+            # dual retriever max ≈ 0.0328 (muncul di keduanya rank 1)
+            # threshold relatif: >= 0.025 → tinggi, >= 0.015 → sedang
+            if v >= 0.025:
+                return "color: #4ade80; font-weight: bold" 
+            elif v >= 0.015:
+                return "color: #facc15; font-weight: bold" 
+            return "color: #f87171; font-weight: bold"
 
-    # Legend threshold (di bawah tabel, ukuran kecil muted)
-    st.markdown(
-        '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;flex-wrap:wrap;'
-        'font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
-        "<span>🟢 sim &ge; 0.70 &nbsp;(Tinggi)</span>"
-        "<span>🟡 sim &ge; 0.55 &nbsp;(Sedang)</span>"
-        "<span>🔴 sim &lt; 0.55 &nbsp;(Rendah)</span>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+        try:
+            styled = df.style.map(_style_rrf, subset=["score_rrf"])  # type: ignore[arg-type]
+        except AttributeError:
+            styled = df.style.applymap(_style_rrf, subset=["score_rrf"])  # type: ignore[attr-defined]
+
+        st.dataframe(styled, width="stretch", hide_index=True)
+
+        # Legend hybrid threshold (di bawah tabel, ukuran kecil muted)
+        st.markdown(
+            '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;'
+            'flex-wrap:wrap;font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
+            "<span>🟢 score_rrf &ge; 0.025 &nbsp;(Tinggi)</span>"
+            "<span>🟡 score_rrf &ge; 0.015 &nbsp;(Sedang)</span>"
+            "<span>🔴 score_rrf &lt; 0.015 &nbsp;(Rendah)</span>"
+            "<span style='margin-left:0.6rem;color:#475569;'>"
+            "score_dense = Chroma dist ↓&nbsp;|&nbsp;"
+            "score_sparse = BM25 ↑&nbsp;|&nbsp;"
+            "rank = posisi di masing-masing retriever"
+            "</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    else:
+        # ── Dense schema (tidak berubah dari V1.5) ──
+        col_order = ["CTX", "doc_id", "page", "source_file", "sim", "dist", "chunk_id"]
+        df = df[[c for c in col_order if c in df.columns]]
+
+        def _style_sim(val: float) -> str:
+            """CSS inline untuk sel kolom 'sim' dengan parameter 'val'."""
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                return ""
+            if v >= _SIM_HIGH:
+                return "color: #4ade80; font-weight: bold"
+            elif v >= _SIM_MED:
+                return "color: #facc15; font-weight: bold"
+            return "color: #f87171; font-weight: bold"
+
+        # Pylance-safe: try/except menghindari false-positive
+        try:
+            styled = df.style.map(_style_sim, subset=["sim"])  # type: ignore[arg-type]
+        except AttributeError:
+            styled = df.style.applymap(_style_sim, subset=["sim"])  # type: ignore[attr-defined]
+
+        st.dataframe(styled, width="stretch", hide_index=True)
+
+        # Legend dense threshold
+        st.markdown(
+            '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;flex-wrap:wrap;'
+            'font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
+            "<span>🟢 sim &ge; 0.70 &nbsp;(Tinggi)</span>"
+            "<span>🟡 sim &ge; 0.55 &nbsp;(Sedang)</span>"
+            "<span>🔴 sim &lt; 0.55 &nbsp;(Rendah)</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> None:
@@ -741,6 +823,147 @@ def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> N
         f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
         f"{ctx_pill}{sim_pill}{dist_pill}"
         f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_hybrid_source_score_pills(
+    rrf_score: float,
+    score_dense: Optional[float],
+    score_sparse: Optional[float],
+    rank_dense: Optional[int],
+    rank_sparse: Optional[int],
+    ctx_label: str = "",
+) -> None:
+    """
+    Render score pills untuk node hasil RRF Hybrid (V2.0).
+    menampilkan tiga komponen:
+    RRF score, Dense sim, dan Sparse BM25.
+
+    - RRF pill: warna dari RRF score (threshold 0.025 / 0.015)
+    - Dense pill: warna dari semantic similarity (threshold SIM_HIGH/SIM_MED)
+    - BM25 pill: label dari rank_sparse (rank 1-3=Tinggi, 4-6=Sedang, 7+=Rendah)
+    - Rank pills: posisi di masing-masing retriever (muted)
+
+    Dipanggil dari app_streamlit.py di Sources loop (mode hybrid),
+    menggantikan inline markdown lama.
+    """
+    # ── Hitung turunan ──
+    sim_dense: Optional[float] = dist_to_sim(score_dense) if score_dense is not None else None
+
+    # ── Warna & label RRF (threshold sama dengan tabel CTX) ──
+    if rrf_score >= 0.025:
+        rrf_color  = "#4ade80"
+        rrf_border = "#4ade8055"
+        rrf_bg     = "#0d1f17"
+        rrf_lbl    = "Tinggi"
+    elif rrf_score >= 0.015:
+        rrf_color  = "#facc15"
+        rrf_border = "#facc1555"
+        rrf_bg     = "#1a1700"
+        rrf_lbl    = "Sedang"
+    else:
+        rrf_color  = "#f87171"
+        rrf_border = "#f8717155"
+        rrf_bg     = "#1f0d0d"
+        rrf_lbl    = "Rendah"
+
+    # ── BM25 label dari rank_sparse ──
+    def _bm25_label(rs: Optional[int]) -> str:
+        if rs is None:
+            return ""
+        if rs <= 3:
+            return "Tinggi"
+        if rs <= 6:
+            return "Sedang"
+        return "Rendah"
+
+    bm25_lbl = _bm25_label(rank_sparse)
+
+    # ── CTX label pill ──
+    ctx_pill = ""
+    if ctx_label:
+        ctx_esc = html.escape(ctx_label)
+        ctx_pill = (
+            f'<span style="background:#1e3a5f;color:#93c5fd;'
+            f'padding:2px 9px;border-radius:999px;font-size:0.75rem;'
+            f'font-family:monospace;font-weight:600;white-space:nowrap;">'
+            f"{ctx_esc}</span>"
+        )
+
+    # ── RRF score pill ──
+    rrf_pill = (
+        f'<span style="background:{rrf_bg};border:1px solid {rrf_border};'
+        f"color:{rrf_color};padding:2px 10px;border-radius:999px;"
+        f'font-size:0.78rem;font-weight:700;font-family:monospace;white-space:nowrap;">'
+        f"🔀&nbsp;RRF =&nbsp;{rrf_score:.5f}"
+        f'<span style="font-size:0.7rem;opacity:0.7;margin-left:4px;">({rrf_lbl})</span>'
+        f"</span>"
+    )
+
+    # ── Dense sim pill (hanya jika score_dense ada) ──
+    dense_pill = ""
+    if sim_dense is not None and score_dense is not None:
+        d_color = _sim_hex(sim_dense)
+        d_lbl   = _sim_label(sim_dense)
+        dense_pill = (
+            f'<span style="background:#0d1117;border:1px solid {d_color}44;'
+            f"color:{d_color};padding:2px 10px;border-radius:999px;"
+            f'font-size:0.78rem;font-weight:600;font-family:monospace;white-space:nowrap;">'
+            f"🔵&nbsp;Dense&nbsp;sim = {sim_dense:.4f}"
+            f'<span style="font-size:0.7rem;opacity:0.65;margin-left:3px;">({d_lbl})</span>'
+            f'<span style="font-size:0.7rem;color:#475569;margin-left:4px;">'
+            f"dist={score_dense:.4f}</span>"
+            f"</span>"
+        )
+
+    # ── Sparse BM25 pill (hanya jika score_sparse ada, dengan label dari rank_sparse) ──
+    sparse_pill = ""
+    if score_sparse is not None:
+        # warna BM25 pill ikut label rank
+        if bm25_lbl == "Tinggi":
+            bm25_color, bm25_border, bm25_bg = "#4ade80", "#4ade8033", "#0d1f17"
+        elif bm25_lbl == "Sedang":
+            bm25_color, bm25_border, bm25_bg = "#facc15", "#facc1533", "#1a1500"
+        else:
+            bm25_color, bm25_border, bm25_bg = "#f87171", "#f8717133", "#1f0d0d"
+        lbl_html = (
+            f'<span style="font-size:0.7rem;opacity:0.7;margin-left:4px;">({bm25_lbl})</span>'
+            if bm25_lbl else ""
+        )
+        sparse_pill = (
+            f'<span style="background:{bm25_bg};border:1px solid {bm25_border};'
+            f"color:{bm25_color};padding:2px 10px;border-radius:999px;"
+            f'font-size:0.78rem;font-weight:600;font-family:monospace;white-space:nowrap;">'
+            f"🟠&nbsp;BM25 = {score_sparse:.4f}"
+            f"{lbl_html}"
+            f"</span>"
+        )
+
+    # ── Rank pills (compact, muted, hanya jika ada) ──
+    rank_parts: List[str] = []
+    if rank_dense is not None:
+        rank_parts.append(
+            f'<span style="background:#1e293b;color:#64748b;'
+            f'padding:2px 8px;border-radius:999px;'
+            f'font-size:0.72rem;font-family:monospace;white-space:nowrap;">'
+            f"rank_dense = #{rank_dense}</span>"
+        )
+    if rank_sparse is not None:
+        rank_parts.append(
+            f'<span style="background:#1e293b;color:#64748b;'
+            f'padding:2px 8px;border-radius:999px;'
+            f'font-size:0.72rem;font-family:monospace;white-space:nowrap;">'
+            f"rank_sparse = #{rank_sparse}</span>"
+        )
+    rank_html = "".join(rank_parts)
+
+    # ── Gabung semua pill dalam satu baris ──
+    pills = " ".join(p for p in [ctx_pill, rrf_pill, dense_pill, sparse_pill, rank_html] if p)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:0.4rem;'
+        f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
+        f"{pills}</div>",
         unsafe_allow_html=True,
     )
 
