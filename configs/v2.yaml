@@ -1,11 +1,13 @@
-index:
-  collection_name: "skripsi_naive"
+# configs/v2.yaml
+# Override dari base.yaml untuk V2.0 - Hybrid Retrieval
+# Deep-merged oleh config.py: field yang tidak ada di sini diambil dari base.yaml
 
 retrieval:
-  mode: "hybrid"
-  rrf_k: 60
+  mode: "hybrid"        # base: "dense" → override ke "hybrid"
 
 bm25:
-  use_sastrawi: true
-  k1: 1.5
-  b: 0.75
+  use_sastrawi: true    # base: false → aktifkan Sastrawi untuk jalur sparse
+
+memory:
+  enabled: true         # base: false → aktifkan memory untuk V2.0
+  window: 4             # sama dengan V1.5

@@ -26,6 +26,7 @@ from src.app_ui_render import (
     render_bukti_section,
     render_ctx_mapping_header,
     render_ctx_mapping_table,
+    render_hybrid_source_score_pills,
     render_pdf_viewer_header,
     render_processing_box,
     render_source_score_pills,
@@ -44,6 +45,7 @@ from src.core.ui_utils import (
     resolve_pdf_path,
     scroll_to_anchor,
 )
+from src.rag.fusion_rrf import rrf_fusion
 from src.rag.generate import build_generation_meta, contextualize_question, generate_answer
 from src.rag.metadata_router import maybe_route_metadata_query
 from src.rag.method_detection import (
@@ -65,6 +67,7 @@ from src.rag.method_detection import (
     docid_hit_for_method as _docid_hit_for_method,
 )
 from src.rag.retrieve_dense import retrieve_dense
+from src.rag.retrieve_sparse import sparse_retrieve_bm25
 
 # =========================
 # Doc-focus lock helpers
@@ -225,6 +228,7 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["last_contextualized"] = None
     st.session_state["turn_data"] = {}       # turn_id -> full render data per turn
     st.session_state["viewing_turn_id"] = None  # None = tampilkan turn terbaru
+    st.session_state["last_retrieval_mode"] = "dense" # default saat belum ada query
     return rm, logger
 
 
@@ -633,7 +637,7 @@ def decide_max_bullets(
 
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", page_icon="🔍", layout="wide")
-    st.title("🔍 RAG ThesisDoc System - V1.5")
+    st.title("🔍 RAG ThesisDoc System - V2.0")
 
     load_dotenv()  # baca .env (lokal)
 
@@ -649,7 +653,7 @@ def main() -> None:
     # Config path
     config_path = st.sidebar.text_input(
         "Config Path",
-        value="configs/v1_5.yaml",
+        value="configs/v2.yaml",
         help="Path YAML config yang dipakai untuk run ini (index, retrieval, llm, memory).",
     )
     cfg = load_config(config_path)
@@ -833,16 +837,20 @@ def main() -> None:
     )
 
     # ===== Main Info =====
+    _retrieval_mode_label = str(cfg.get("retrieval", {}).get("mode", "dense")).upper()
     st.success(
-        "Now Running on **V1.5** - Dense Retrieval + Memory & Contextualization", icon="🚥"
+        f"Now Running on **V2.0** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization",
+        icon="🚥",
     )
 
     _mem_icon = "🟢" if (use_memory and mem_window > 0) else "⚫"
     _ctx_icon = "🟢" if contextualize_on else "⚫"
     _llm_icon = "🟢" if use_llm else "⚫"
     _mode_badge = "🧪 eval" if eval_mode else "🎯 demo"
+    _retrieval_icon = "🔀" if _retrieval_mode_label == "HYBRID" else "🔵"
     _info_parts = [
         f"<b>Mode:</b> {_mode_badge}",
+        f"{_retrieval_icon} Retrieval: {_retrieval_mode_label}",
         f"{_llm_icon} Generator",
         f"{_mem_icon} Memory ({mem_window} turns)",
         f"{_ctx_icon} Contextualize",
@@ -1167,6 +1175,7 @@ def main() -> None:
                         "strategy": strategy,
                         "history_used": history_used,
                         "contextualized": False,
+                        "retrieval_mode": "metadata_router",
                     }
 
             if not metadata_routed:
@@ -1188,14 +1197,41 @@ def main() -> None:
 
                 candidate_k = int(top_k_ui) * int(pool_mult) if diversify else None
 
+                # mode-aware
+                retrieval_mode = str(cfg_runtime["retrieval"]["mode"])
+
                 st.write("🔍 Retrieval dokumen dari vector store...")
-                nodes = retrieve_dense(
-                    cfg_runtime,
-                    retrieval_query,
-                    diversify=diversify,
-                    max_per_doc=int(max_per_doc),
-                    candidate_k=candidate_k,
-                )
+                if retrieval_mode == "hybrid":
+                    # ── Jalur Hybrid: Dense + Sparse BM25 + RRF Fusion ──
+                    # Dense: ambil pool lebih besar (bahan RRF), diversify ditangani RRF
+                    _hybrid_candidate_k = max(int(top_k_ui) * 3, int(top_k_ui) + 5)
+                    dense_nodes_raw = retrieve_dense(
+                        cfg_runtime,
+                        retrieval_query,
+                        diversify=False,
+                        max_per_doc=int(max_per_doc),
+                        candidate_k=_hybrid_candidate_k,
+                    )
+                    # Sparse: BM25 + Sastrawi, ambil top_k standar dari config
+                    sparse_nodes_raw = sparse_retrieve_bm25(cfg_runtime, retrieval_query)
+                    # RRF Fusion — gabungkan ranking dense + sparse
+                    _rrf_k = int((cfg_runtime.get("retrieval") or {}).get("rrf_k", 60))
+                    nodes = rrf_fusion(
+                        dense_nodes_raw,
+                        sparse_nodes_raw,
+                        k=_rrf_k,
+                        top_k=int(top_k_ui),
+                    )
+                else:
+                    # ── Jalur Dense Murni (V1.0 / V1.5 behaviour — tidak berubah) ──
+                    retrieval_mode = "dense"  # normalisasi agar konsisten di log
+                    nodes = retrieve_dense(
+                        cfg_runtime,
+                        retrieval_query,
+                        diversify=diversify,
+                        max_per_doc=int(max_per_doc),
+                        candidate_k=candidate_k,
+                    )
 
                 # ===== Coverage per-metode (multi-query dense) =====
                 cov_cfg = cfg_runtime.get("coverage", {}) or {}
@@ -1453,10 +1489,11 @@ def main() -> None:
 
                 retrieval_stats = compute_retrieval_stats(nodes)
 
-                strategy = cfg_runtime["retrieval"]["mode"]  # contoh: "dense"
+                strategy = retrieval_mode  # "dense" atau "hybrid"
                 if retrieval_query != query:
                     strategy = f"{strategy}+rewrite"
-                if diversify:
+                # +diverse marker hanya relevan untuk jalur dense murni
+                if diversify and retrieval_mode != "hybrid":
                     strategy = f"{strategy}+diverse"
 
                 # timestamp per turn
@@ -1501,8 +1538,15 @@ def main() -> None:
                             "doc_id": n.doc_id,
                             "chunk_id": n.chunk_id,
                             # NOTE: score dari Chroma umumnya adalah distance (lebih kecil = lebih relevan)
-                            "distance": n.score,
-                            "similarity": dist_to_sim(n.score),
+                            # Dense: distance + similarity (None untuk jalur hybrid)
+                            "distance": n.score if retrieval_mode != "hybrid" else None,
+                            "similarity": dist_to_sim(n.score) if retrieval_mode != "hybrid" else None,
+                            # Hybrid: RRF score + komponen dense/sparse (None untuk jalur dense)
+                            "score_rrf":    float(n.score) if retrieval_mode == "hybrid" else None,
+                            "score_dense":  n.score_dense,
+                            "score_sparse": n.score_sparse,
+                            "rank_dense":   n.rank_dense,
+                            "rank_sparse":  n.rank_sparse,
                             "metadata": n.metadata,
                             "text": n.text,  # akan di-trim otomatis oleh RunManager.log_retrieval
                         }
@@ -1803,6 +1847,7 @@ def main() -> None:
                 st.session_state["last_turn_id"] = turn_id
                 st.session_state["last_nodes"] = nodes  # menyimpan last nodes untuk
                 st.session_state["last_strategy"] = strategy
+                st.session_state["last_retrieval_mode"] = retrieval_mode 
                 st.session_state["_scroll_answer"] = True
                 st.session_state["last_user_query"] = query
                 st.session_state["last_retrieval_query"] = retrieval_query
@@ -1823,6 +1868,7 @@ def main() -> None:
                     "strategy": strategy,
                     "history_used": history_used,
                     "contextualized": bool(retrieval_query != query),
+                    "retrieval_mode": retrieval_mode,
                 }
 
             _proc_status.update(label="💡 Finished!", state="complete", expanded=False)
@@ -2120,6 +2166,7 @@ def main() -> None:
             uq = _td.get("user_query", "")
             rq = _td.get("retrieval_query", "")
             last_strategy = _td.get("strategy", "")
+            retrieval_mode_render = str(_td.get("retrieval_mode", "dense"))
         else:
             nodes = st.session_state.get("last_nodes") or []
             answer_raw = st.session_state.get("last_answer_raw", "")
@@ -2127,6 +2174,7 @@ def main() -> None:
             uq = st.session_state.get("last_user_query", "")
             rq = st.session_state.get("last_retrieval_query", "")
             last_strategy = st.session_state.get("last_strategy", "")
+            retrieval_mode_render = str(st.session_state.get("last_retrieval_mode", "dense"))
 
         jawaban, bukti = parse_answer(answer_raw)
         global_not_found = is_global_not_found_answer(answer_raw)
@@ -2192,17 +2240,27 @@ def main() -> None:
                     for i, n in enumerate(nodes, start=1):
                         source_file = n.metadata.get("source_file", "")
                         page = n.metadata.get("page", "?")
-                        ctx_rows.append(
-                            {
-                                "CTX": f"CTX {i}",
-                                "doc_id": n.doc_id,
-                                "page": page,
-                                "source_file": source_file,
-                                "sim": round(dist_to_sim(float(n.score)), 4),
-                                "dist": round(float(n.score), 4),
-                                "chunk_id": n.chunk_id,
-                            }
-                        )
+                        row: Dict[str, Any] = {
+                            "CTX": f"CTX {i}",
+                            "doc_id": n.doc_id,
+                            "page": page,
+                            "source_file": source_file,
+                            "chunk_id": n.chunk_id,
+                        }
+                        if retrieval_mode_render == "hybrid":
+                            row["score_rrf"]    = round(float(n.score), 6)
+                            row["score_dense"]  = (
+                                round(float(n.score_dense), 4) if n.score_dense is not None else None
+                            )
+                            row["score_sparse"] = (
+                                round(float(n.score_sparse), 4) if n.score_sparse is not None else None
+                            )
+                            row["rank_dense"]   = n.rank_dense
+                            row["rank_sparse"]  = n.rank_sparse
+                        else:
+                            row["sim"]  = round(dist_to_sim(float(n.score)), 4)
+                            row["dist"] = round(float(n.score), 4)
+                        ctx_rows.append(row)
                     render_ctx_mapping_table(ctx_rows)
 
                     # Highlight terms (manual override). Jika kosong -> auto dari query terakhir
@@ -2234,17 +2292,27 @@ def main() -> None:
                 for i, n in enumerate(nodes, start=1):
                     source_file = n.metadata.get("source_file", "")
                     page = n.metadata.get("page", "?")
-                    ctx_rows.append(
-                        {
-                            "CTX": f"CTX {i}",
-                            "doc_id": n.doc_id,
-                            "page": page,
-                            "source_file": source_file,
-                            "sim": round(dist_to_sim(float(n.score)), 4),
-                            "dist": round(float(n.score), 4),
-                            "chunk_id": n.chunk_id,
-                        }
-                    )
+                    row: Dict[str, Any] = {
+                        "CTX": f"CTX {i}",
+                        "doc_id": n.doc_id,
+                        "page": page,
+                        "source_file": source_file,
+                        "chunk_id": n.chunk_id,
+                    }
+                    if retrieval_mode_render == "hybrid":
+                        row["score_rrf"]    = round(float(n.score), 6)
+                        row["score_dense"]  = (
+                            round(float(n.score_dense), 4) if n.score_dense is not None else None
+                        )
+                        row["score_sparse"] = (
+                            round(float(n.score_sparse), 4) if n.score_sparse is not None else None
+                        )
+                        row["rank_dense"]   = n.rank_dense
+                        row["rank_sparse"]  = n.rank_sparse
+                    else:
+                        row["sim"]  = round(dist_to_sim(float(n.score)), 4)
+                        row["dist"] = round(float(n.score), 4)
+                    ctx_rows.append(row)
                 render_ctx_mapping_table(ctx_rows)
 
                 # Highlight terms (manual override). Jika kosong -> auto dari query terakhir
@@ -2304,20 +2372,60 @@ def main() -> None:
                 st.caption(f"Filter match: {len(filtered)} dari {len(nodes)} sources.")
 
             for i, n in indexed_nodes:
-                dist = float(n.score)
-                sim = dist_to_sim(dist)
                 source_file = n.metadata.get("source_file", "")
                 page = int(n.metadata.get("page", 1) or 1)
 
                 preview = (n.text or "").strip().replace("\n", " ")
                 preview = preview[:260] + ("..." if len(preview) > 260 else "")
 
-                _badge = sim_color_badge(sim)
-                title = (
-                    f"{_badge} {n.doc_id} | sim={sim:.4f} | dist={dist:.4f} | {source_file} p.{page}"
-                )
+                # ── Hitung skor tampilan (mode-aware) ──
+                dist = 0.0  # inisialisasi untuk type-checker
+                sim  = 0.0
+                if retrieval_mode_render == "hybrid":
+                    _rrf_sc    = float(n.score)
+                    _d_dist    = float(n.score_dense)  if n.score_dense  is not None else None
+                    _d_sim     = dist_to_sim(_d_dist)  if _d_dist         is not None else None
+                    _s_bm25    = float(n.score_sparse) if n.score_sparse is not None else None
+                    # Badge berbasis RRF Score - lebih intuitif (fair untuk semua jenis node)
+                    if _rrf_sc >= 0.025:
+                        _badge = "🟢"
+                    elif _rrf_sc >= 0.015:
+                        _badge = "🟡"
+                    else:
+                        _badge = "🔴"
+
+                    _d_str     = f"sim = {_d_sim:.3f}" if _d_sim   is not None else "dense = —"
+                    _s_str     = f"bm25 = {_s_bm25:.2f}" if _s_bm25 is not None else "sparse = —"
+                    title = (
+                        f"{_badge} {n.doc_id} | rrf = {_rrf_sc:.5f} | {_d_str} | {_s_str} | {source_file} p.{page}"
+                    )
+                else:
+                    _rrf_sc = None
+                    _d_dist = None
+                    _d_sim  = None
+                    _s_bm25 = None
+                    dist    = float(n.score)
+                    sim     = dist_to_sim(dist)
+                    _badge  = sim_color_badge(sim)
+                    title   = (
+                        f"{_badge} {n.doc_id} | sim = {sim:.4f} | dist = {dist:.4f} | {source_file} p.{page}"
+                    )
+
                 with st.expander(title):
-                    render_source_score_pills(sim, dist, ctx_label=f"CTX {i}")
+                    # ── Score pills (mode-aware) - delegasi ke app_ui_render ──
+                    if retrieval_mode_render == "hybrid":
+                        assert _rrf_sc is not None 
+                        render_hybrid_source_score_pills(
+                            rrf_score=_rrf_sc,
+                            score_dense=_d_dist,
+                            score_sparse=_s_bm25,
+                            rank_dense=n.rank_dense,
+                            rank_sparse=n.rank_sparse,
+                            ctx_label=f"CTX {i}",
+                        )
+                    else:
+                        render_source_score_pills(sim, dist, ctx_label=f"CTX {i}")
+
                     st.caption(f"Preview: {preview}")
 
                     # Resolve PDF path
