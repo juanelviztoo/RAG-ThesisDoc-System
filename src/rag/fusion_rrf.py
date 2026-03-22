@@ -89,6 +89,8 @@ def rrf_fusion(
             rank_sparse=s_rank.get(cid),    # None jikalau tidak muncul di sparse
             text=base.text,
             metadata=base.metadata,
+            stream      = base.stream,   
+            bab_label   = base.bab_label,  
         )
         result.append(fused)
 

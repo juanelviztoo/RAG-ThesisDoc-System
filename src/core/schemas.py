@@ -6,15 +6,22 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class RetrievedNode:
-    chunk_id: str
-    doc_id: str
-    score: float
-    text: str
-    metadata: Dict[str, Any]
-    score_dense: Optional[float] = None
+    chunk_id:     str
+    doc_id:       str
+    score:        float
+    text:         str
+    metadata:     Dict[str, Any]
+    score_dense:  Optional[float] = None
     score_sparse: Optional[float] = None
-    rank_dense: Optional[int] = None
-    rank_sparse: Optional[int] = None
+    rank_dense:   Optional[int]   = None
+    rank_sparse:  Optional[int]   = None
+    # ── V3.0a ─────────────────────────────────────────────────────────────────
+    # stream    : collection asal chunk ("narasi" | "sitasi")
+    #             None untuk chunk dari pipeline V1/V2 (backward-compat)
+    # bab_label : label section ("BAB_I" | "BAB_II" | ... | "DAFTAR_PUSTAKA" | None)
+    #             Diisi dari metadata["bab_label"] saat retrieve, None untuk V1/V2
+    stream:    Optional[str] = None
+    bab_label: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -27,7 +34,7 @@ class RetrievalLogRecord:
     run_id: str
     turn_id: int
     timestamp: str
-    mode: str  # dense | hybrid
+    mode: str  # dense | hybrid | metadata_router
     query_original: str
     query_rewritten: Optional[str]
     retrieved_nodes: List[Dict[str, Any]]

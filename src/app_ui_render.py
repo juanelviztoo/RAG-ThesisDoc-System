@@ -690,7 +690,8 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
     if is_hybrid:
         # ── Hybrid schema ──
         col_order = [
-            "CTX", "doc_id", "page", "source_file",
+            "CTX", "stream", "bab_label",      # (V3.0a; auto-skip jika tidak ada)
+            "doc_id", "page", "source_file",
             "score_rrf", "score_dense", "score_sparse",
             "rank_dense", "rank_sparse",
             "chunk_id",
@@ -738,13 +739,27 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
             "score_sparse = BM25 ↑&nbsp;|&nbsp;"
             "rank = posisi di masing-masing retriever"
             "</span>"
+            "<span style='margin-left:0.6rem;color:#475569;"
+            "border-left:1px solid #334155;padding-left:0.6rem;'>"
+            "<b style='color:#a855f7;'>stream</b>: "
+            "<b style='color:#a855f7;'>narasi</b> = Konten inti dokumen (BAB I–V)"
+            "&nbsp;·&nbsp;"
+            "<b style='color:#a855f7;'>sitasi</b> = Daftar Pustaka / Referensi"
+            "&nbsp;|&nbsp;"
+            "<b style='color:#a855f7;'>bab_label</b> = Posisi bab asal chunk "
+            "(mis. BAB_II = Tinjauan Pustaka, BAB_III = Metode Penelitian)"
+            "</span>"
             "</div>",
             unsafe_allow_html=True,
         )
 
     else:
         # ── Dense schema (tidak berubah dari V1.5) ──
-        col_order = ["CTX", "doc_id", "page", "source_file", "sim", "dist", "chunk_id"]
+        col_order = [
+            "CTX", "stream", "bab_label",     # (V3.0a; auto-skip jika tidak ada)
+            "doc_id", "page", "source_file",
+            "sim", "dist", "chunk_id",
+        ]
         df = df[[c for c in col_order if c in df.columns]]
 
         def _style_sim(val: float) -> str:
@@ -774,12 +789,26 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
             "<span>🟢 sim &ge; 0.70 &nbsp;(Tinggi)</span>"
             "<span>🟡 sim &ge; 0.55 &nbsp;(Sedang)</span>"
             "<span>🔴 sim &lt; 0.55 &nbsp;(Rendah)</span>"
+            "<span style='margin-left:0.6rem;color:#475569;"
+            "border-left:1px solid #334155;padding-left:0.6rem;'>"
+            "<b style='color:#a855f7;'>stream</b>: "
+            "<b style='color:#a855f7;'>narasi</b> = Konten inti dokumen (BAB I–V)"
+            "&nbsp;·&nbsp;"
+            "<b style='color:#a855f7;'>sitasi</b> = Daftar Pustaka / Referensi"
+            "&nbsp;|&nbsp;"
+            "<b style='color:#a855f7;'>bab_label</b> = Posisi bab asal chunk"
+            "</span>"
             "</div>",
             unsafe_allow_html=True,
         )
 
 
-def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> None:
+def render_source_score_pills(
+    sim: float,
+    dist: float,
+    ctx_label: str = "",
+    stream: Optional[str] = None, 
+) -> None:
     """
     Render mini score pills (CTX label + sim + dist) di awal isi Sources expander.
     Memberikan visual feedback relevansi tanpa perlu membaca angka di title expander.
@@ -797,6 +826,19 @@ def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> N
             f'<span style="background:#1e3a5f;color:#93c5fd;'
             f'padding:2px 8px;border-radius:999px;font-size:0.75rem;'
             f'font-family:monospace;font-weight:600;">{ctx_escaped}</span>'
+        )
+
+    # Stream opsional pill
+    stream_pill = ""
+    if stream:
+        _stream_label = stream.capitalize() 
+        _stream_icon  = "📖" if stream == "narasi" else "🧷"
+        stream_pill = (
+            f'<span style="background:#1a0a2e;border:1px solid #a855f766;'
+            f"color:#a855f7;padding:2px 9px;border-radius:999px;"
+            f'font-size:0.75rem;font-family:monospace;font-weight:600;'
+            f'white-space:nowrap;">'
+            f"{_stream_icon}&nbsp;{_stream_label}</span>"
         )
 
     # Pill sim (warna sesuai threshold)
@@ -821,7 +863,7 @@ def render_source_score_pills(sim: float, dist: float, ctx_label: str = "") -> N
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.45rem;'
         f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
-        f"{ctx_pill}{sim_pill}{dist_pill}"
+        f"{ctx_pill}{stream_pill}{sim_pill}{dist_pill}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -834,6 +876,7 @@ def render_hybrid_source_score_pills(
     rank_dense: Optional[int],
     rank_sparse: Optional[int],
     ctx_label: str = "",
+    stream: Optional[str] = None, 
 ) -> None:
     """
     Render score pills untuk node hasil RRF Hybrid (V2.0).
@@ -889,6 +932,19 @@ def render_hybrid_source_score_pills(
             f'padding:2px 9px;border-radius:999px;font-size:0.75rem;'
             f'font-family:monospace;font-weight:600;white-space:nowrap;">'
             f"{ctx_esc}</span>"
+        )
+
+    # ── Stream opsional pill ──
+    stream_pill = ""
+    if stream:
+        _stream_label = stream.capitalize() 
+        _stream_icon  = "📖" if stream == "narasi" else "🧷"
+        stream_pill = (
+            f'<span style="background:#1a0a2e;border:1px solid #a855f766;'
+            f"color:#a855f7;padding:2px 9px;border-radius:999px;"
+            f'font-size:0.75rem;font-family:monospace;font-weight:600;'
+            f'white-space:nowrap;">'
+            f"{_stream_icon}&nbsp;{_stream_label}</span>"
         )
 
     # ── RRF score pill ──
@@ -959,7 +1015,7 @@ def render_hybrid_source_score_pills(
     rank_html = "".join(rank_parts)
 
     # ── Gabung semua pill dalam satu baris ──
-    pills = " ".join(p for p in [ctx_pill, rrf_pill, dense_pill, sparse_pill, rank_html] if p)
+    pills = " ".join(p for p in [ctx_pill, stream_pill, rrf_pill, dense_pill, sparse_pill, rank_html] if p)
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.4rem;'
         f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'

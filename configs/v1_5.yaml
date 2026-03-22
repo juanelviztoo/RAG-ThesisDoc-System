@@ -1,3 +1,6 @@
+index:
+  collection_name: "skripsi_structured_narasi"
+
 memory:
   enabled: true
   window: 4

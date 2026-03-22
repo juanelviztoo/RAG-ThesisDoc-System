@@ -216,10 +216,27 @@ def is_method_question(q: str) -> bool:
 
 
 def is_steps_question(q: str) -> bool:
-    """True jika query menanyakan tahapan/langkah/alur/prosedur."""
-    return bool(
-        re.search(r"\b(tahap|tahapan)\w*\b|\b(langkah|alur|prosedur)\w*\b", (q or "").lower())
-    )
+    """
+    True jika query menanyakan tahapan/langkah/alur/prosedur dalam konteks
+    pengembangan sistem/metode.
+
+    Perketat deteksi untuk kata 'alur' dan 'prosedur':
+    - 'tahap/tahapan/langkah' → selalu trigger (kata teknis yang spesifik)
+    - 'alur/prosedur' → hanya trigger jika ada konteks teknis
+        (mencegah false positive: "alur penelitian", "alur metodologi penelitian")
+    """
+    ql = (q or "").lower()
+
+    # "tahap/tahapan/langkah" - kata teknis spesifik, selalu trigger
+    if re.search(r"\b(tahap|tahapan)\w*\b|\blangkah\w*\b", ql):
+        return True
+
+    # "alur/prosedur" - hanya trigger jika ada konteks teknis pengembangan sistem
+    _TECH_CONTEXT = r"\b(sistem|pengembangan|aplikasi|software|perangkat\s*lunak|metode\s+pengembangan|sdlc)\b"
+    if re.search(r"\b(alur|prosedur)\w*\b", ql):
+        return bool(re.search(_TECH_CONTEXT, ql))
+
+    return False
 
 
 def is_anaphora_question(q: str) -> bool:

@@ -1,8 +1,43 @@
-index:
-  collection_name: "skripsi_structured"
+# configs/v3.yaml
+# V3.0a — Structure-Aware Parsing + Dual Stream + Dual Collection
+# Override di atas base.yaml via deep merge (src/core/config.py)
 
-# nanti bisa berkembang jadi dual collection:
-# index:
-#   collections:
-#     narrative: "skripsi_structured_narasi"
-#     citations: "skripsi_structured_sitasi"
+index:
+  # V3.0a: ganti dari single collection → dual collection
+  # collection_name (V1/V2) sudah tidak dipakai — field ini diabaikan jika
+  # collections hadir. ingest.py V3.0a akan baca dari index.collections.*
+  collections:
+    narasi: "skripsi_structured_narasi"
+    sitasi: "skripsi_structured_sitasi"
+
+chunking:
+  # Override base chunking untuk narasi (konten bab)
+  # Sitasi lebih kecil: satu entry referensi ≈ 300-500 karakter
+  narasi:
+    chunk_size: 1200
+    chunk_overlap: 200
+  sitasi:
+    chunk_size: 500
+    chunk_overlap: 50
+
+parsing:
+  # Hybrid approach: filename routing dulu, regex fallback untuk PDF utuh
+  filename_routing: true
+  regex_fallback: true
+  # Halaman awal yang di-scan untuk ekstraksi metadata dokumen (0-indexed)
+  metadata_scan_pages: 3
+  # Jika bab header sama muncul > threshold kali → dianggap running header, skip
+  running_header_threshold: 3
+
+retrieval:
+  # V3.0a: default query ke collection narasi
+  # sitasi diquery hanya untuk intent referensi/citation (V3.0b akan perkuat ini)
+  default_collection: "narasi"
+  mode: "hybrid"
+
+bm25:
+  use_sastrawi: true
+
+memory:
+  enabled: true
+  window: 4
