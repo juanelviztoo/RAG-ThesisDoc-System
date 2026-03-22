@@ -11,3 +11,6 @@ bm25:
 memory:
   enabled: true         # base: false → aktifkan memory untuk V2.0
   window: 4             # sama dengan V1.5
+
+index:
+  collection_name: "skripsi_structured_narasi"

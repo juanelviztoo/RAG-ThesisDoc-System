@@ -73,6 +73,23 @@ from src.rag.retrieve_sparse import sparse_retrieve_bm25
 # Doc-focus lock helpers
 # =========================
 
+_CITATION_KEYWORDS = [
+    r"\b(referensi|daftar\s*pustaka|daftar\s*referensi)\b",
+    r"\b(jurnal|buku|artikel|publikasi|acuan|sitasi)\b.*\b(digunakan|dijadikan|ada|apa)\b",
+    r"\b(apa|sebutkan|tampilkan|cari)\b.*\b(jurnal|buku|referensi|pustaka|acuan)\b",
+    r"\b(landasan\s*teori|tinjauan\s*pustaka|kajian\s*literatur)\b",
+    r"\b(cited|citation|bibliography|reference)\b",
+]
+
+def _is_citation_query(query: str) -> bool:
+    """
+    Deteksi apakah query meminta informasi dari Daftar Pustaka / referensi.
+    Jika True → tambahkan retrieval dari collection sitasi ke pipeline.
+    """
+    q = (query or "").lower()
+    return any(re.search(p, q, flags=re.IGNORECASE) for p in _CITATION_KEYWORDS)
+
+
 def _node_doc_id(n: Any) -> str:
     return str(
         getattr(n, "doc_id", "")
@@ -637,7 +654,7 @@ def decide_max_bullets(
 
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", page_icon="🔍", layout="wide")
-    st.title("🔍 RAG ThesisDoc System - V2.0")
+    st.title("🔍 RAG ThesisDoc System - V3.0a")
 
     load_dotenv()  # baca .env (lokal)
 
@@ -653,7 +670,7 @@ def main() -> None:
     # Config path
     config_path = st.sidebar.text_input(
         "Config Path",
-        value="configs/v2.yaml",
+        value="configs/v3.yaml",
         help="Path YAML config yang dipakai untuk run ini (index, retrieval, llm, memory).",
     )
     cfg = load_config(config_path)
@@ -685,7 +702,13 @@ def main() -> None:
     st.sidebar.divider()
     st.sidebar.subheader("📰 Run Information")
     st.sidebar.write("Run ID:", rm.run_id)
-    st.sidebar.write("Collection:", cfg["index"]["collection_name"])
+    _idx_cfg = cfg.get("index", {})
+    if "collections" in _idx_cfg:
+        _cols_map = _idx_cfg["collections"]
+        st.sidebar.write("Collection (Narasi):", _cols_map.get("narasi", "—"))
+        st.sidebar.write("Collection (Sitasi):", _cols_map.get("sitasi", "—"))
+    else:
+        st.sidebar.write("Collection:", _idx_cfg.get("collection_name", "—"))
     st.sidebar.write("Mode:", cfg["retrieval"]["mode"])
 
     st.sidebar.write("LLM Provider:", provider)
@@ -839,7 +862,7 @@ def main() -> None:
     # ===== Main Info =====
     _retrieval_mode_label = str(cfg.get("retrieval", {}).get("mode", "dense")).upper()
     st.success(
-        f"Now Running on **V2.0** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization",
+        f"Now Running on **V3.0a** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization + Structure-Aware Dual Stream",
         icon="🚥",
     )
 
@@ -1211,9 +1234,10 @@ def main() -> None:
                         diversify=False,
                         max_per_doc=int(max_per_doc),
                         candidate_k=_hybrid_candidate_k,
+                        collection="narasi",
                     )
                     # Sparse: BM25 + Sastrawi, ambil top_k standar dari config
-                    sparse_nodes_raw = sparse_retrieve_bm25(cfg_runtime, retrieval_query)
+                    sparse_nodes_raw = sparse_retrieve_bm25(cfg_runtime, retrieval_query, collection="narasi")
                     # RRF Fusion — gabungkan ranking dense + sparse
                     _rrf_k = int((cfg_runtime.get("retrieval") or {}).get("rrf_k", 60))
                     nodes = rrf_fusion(
@@ -1222,6 +1246,39 @@ def main() -> None:
                         k=_rrf_k,
                         top_k=int(top_k_ui),
                     )
+
+                    # ── V3.0a: Citation routing untuk jalur hybrid - tambah nodes dari sitasi collection ──
+                    _has_sitasi = bool(
+                        (cfg_runtime.get("index", {}) or {}).get("collections", {}).get("sitasi")
+                    )
+                    if _has_sitasi and _is_citation_query(retrieval_query):
+                        _sitasi_top_k = max(3, int(top_k_ui) // 2)  # ambil separuh slot untuk sitasi
+                        sitasi_dense = retrieve_dense(
+                            cfg_runtime, retrieval_query,
+                            diversify=False,
+                            max_per_doc=2,
+                            candidate_k=_sitasi_top_k * 2,
+                            collection="sitasi",
+                        )
+                        sitasi_sparse = sparse_retrieve_bm25(
+                            cfg_runtime, retrieval_query,
+                            top_k=_sitasi_top_k,
+                            collection="sitasi",
+                        )
+                        # RRF fusion untuk sitasi
+                        sitasi_fused = rrf_fusion(
+                            sitasi_dense, sitasi_sparse,
+                            k=_rrf_k, top_k=_sitasi_top_k,
+                        )
+                        # Merge: dedupe by chunk_id, narasi tetap prioritas slot pertama
+                        existing_ids = {n.chunk_id for n in nodes}
+                        sitasi_new = [n for n in sitasi_fused if n.chunk_id not in existing_ids]
+                        # Gabungkan: kurangi narasi untuk beri ruang sitasi
+                        narasi_keep = int(top_k_ui) - len(sitasi_new)
+                        nodes = nodes[:narasi_keep] + sitasi_new
+                        nodes = sorted(nodes[:int(top_k_ui)], key=lambda n: float(n.score), reverse=True)
+                        
+                        st.write(f"🧷 Citation routing aktif: +{len(sitasi_new)} chunks dari collection sitasi...")
                 else:
                     # ── Jalur Dense Murni (V1.0 / V1.5 behaviour — tidak berubah) ──
                     retrieval_mode = "dense"  # normalisasi agar konsisten di log
@@ -1231,7 +1288,31 @@ def main() -> None:
                         diversify=diversify,
                         max_per_doc=int(max_per_doc),
                         candidate_k=candidate_k,
+                        collection="narasi",
                     )
+
+                    # ── V3.0a: Citation routing untuk jalur dense ──
+                    _has_sitasi_d = bool(
+                        (cfg_runtime.get("index", {}) or {}).get("collections", {}).get("sitasi")
+                    )
+                    if _has_sitasi_d and _is_citation_query(retrieval_query):
+                        _sitasi_top_k_d = max(3, int(top_k_ui) // 2)
+                        sitasi_nodes_d = retrieve_dense(
+                            cfg_runtime,
+                            retrieval_query,
+                            diversify=False,
+                            max_per_doc=2,
+                            candidate_k=_sitasi_top_k_d * 2,
+                            collection="sitasi",
+                        )
+                        # Merge: dedupe by chunk_id, narasi tetap prioritas
+                        existing_ids_d = {n.chunk_id for n in nodes}
+                        sitasi_new_d = [n for n in sitasi_nodes_d if n.chunk_id not in existing_ids_d]
+                        narasi_keep_d = int(top_k_ui) - len(sitasi_new_d)
+                        nodes = nodes[:narasi_keep_d] + sitasi_new_d
+                        nodes = sorted(nodes[:int(top_k_ui)], key=lambda n: float(n.score), reverse=True)
+
+                        st.write(f"🧷 Citation routing aktif: +{len(sitasi_new_d)} chunks dari collection sitasi...")
 
                 # ===== Coverage per-metode (multi-query dense) =====
                 cov_cfg = cfg_runtime.get("coverage", {}) or {}
@@ -1240,6 +1321,9 @@ def main() -> None:
                 min_methods = int(cov_cfg.get("min_methods", 2))
 
                 # Jika topic_shift terdeteksi, JANGAN bawa metode dari history (hindari carry-over)
+                if topic_shift:
+                    st.session_state["method_doc_map"] = {} # reset method_doc_map agar tidak kontaminasi topik baru
+
                 history_for_methods = [] if topic_shift else history_window
                 target_methods = infer_target_methods(query, history_for_methods)
 
@@ -1257,7 +1341,7 @@ def main() -> None:
                     # ===== steps-aware expansion =====
                     # Jika query adalah steps, cari tambahan PER METODE (bukan hanya yang missing),
                     # karena "metode terdeteksi" ≠ "tahapan tersedia".
-                    steps_q = is_steps_question(query) or is_steps_question(retrieval_query)
+                    steps_q = is_steps_question(query)
 
                     methods_in_base = set(
                         detect_methods_in_text(" ".join([(n.text or "") for n in nodes]))
@@ -1288,6 +1372,7 @@ def main() -> None:
                                 diversify=False,
                                 max_per_doc=int(max_per_doc),
                                 candidate_k=None,
+                                collection="narasi",
                             )
                         )
 
@@ -1337,7 +1422,7 @@ def main() -> None:
                     "method_bias_added": 0,
                 }
 
-                steps_q_now = is_steps_question(query) or is_steps_question(retrieval_query)
+                steps_q_now = is_steps_question(query)
 
                 # --- (A) PRIORITAS 1: explicit doc-focus dari query user ---
                 explicit_doc_focus = extract_doc_focus_from_query(query)  # list[str]
@@ -1388,6 +1473,7 @@ def main() -> None:
                             diversify=False,
                             max_per_doc=int(max_per_doc),
                             candidate_k=None,
+                            collection="narasi",
                         )
 
                         # hard-lock extra ke doc yang sama
@@ -1547,6 +1633,8 @@ def main() -> None:
                             "score_sparse": n.score_sparse,
                             "rank_dense":   n.rank_dense,
                             "rank_sparse":  n.rank_sparse,
+                            "stream":      n.stream,       # (V3.0a; None untuk V1/V2)
+                            "bab_label":   n.bab_label,    # (V3.0a; None untuk V1/V2)
                             "metadata": n.metadata,
                             "text": n.text,  # akan di-trim otomatis oleh RunManager.log_retrieval
                         }
@@ -1803,25 +1891,29 @@ def main() -> None:
                 rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
                 # --- simpan metode ke history agar rewrite steps stabil ---
+                # PENTING: JANGAN gunakan bullets_meta.methods_detected sebagai fallback.
+                # methods_detected berasal dari chunk yang di-retrieve (bukan dari jawaban nyata),
+                # sehingga bisa menyebabkan method carry-over ke turn berikutnya secara keliru.
+                # Contoh: query off-topic (Coldplay) → chunk ETicketing/RAD di-retrieve →
+                # methods_detected = ["RAD", "PROTOTYPING", "XP"] → tersimpan di history →
+                # anaphora follow-up mengira topiknya tentang metode pengembangan.
                 turn_methods: List[str] = []
                 try:
                     # 1) paling reliable: metode yang dipakai generator (gen_targets)
                     if isinstance(gen_targets, list) and gen_targets:
                         turn_methods = [m for m in gen_targets if isinstance(m, str) and m]
 
-                    # 2) fallback: dari bullets_meta (kadang lebih kaya)
+                    # 2) fallback: HANYA target_methods_for_gen (bukan methods_detected!)
                     if not turn_methods and isinstance(bullets_meta, dict):
-                        md = (
-                            bullets_meta.get("target_methods_for_gen")
-                            or bullets_meta.get("methods_detected")
-                            or []
-                        )
+                        md = bullets_meta.get("target_methods_for_gen") or []
                         if isinstance(md, list):
                             turn_methods = [m for m in md if isinstance(m, str) and m]
 
                     # 3) fallback terakhir: scan jawaban raw
+                    # Hanya jika jawaban bukan "tidak ditemukan" (mencegah carry-over kosong)
                     if not turn_methods:
-                        turn_methods = detect_methods_in_text(answer_raw)
+                        if answer_raw and "tidak ditemukan pada dokumen" not in answer_raw.lower():
+                            turn_methods = detect_methods_in_text(answer_raw)
 
                 except Exception:
                     turn_methods = []
@@ -2242,6 +2334,8 @@ def main() -> None:
                         page = n.metadata.get("page", "?")
                         row: Dict[str, Any] = {
                             "CTX": f"CTX {i}",
+                            "stream":    n.stream    or "—",   
+                            "bab_label": n.bab_label or "—",   
                             "doc_id": n.doc_id,
                             "page": page,
                             "source_file": source_file,
@@ -2294,6 +2388,8 @@ def main() -> None:
                     page = n.metadata.get("page", "?")
                     row: Dict[str, Any] = {
                         "CTX": f"CTX {i}",
+                        "stream":    n.stream    or "—",   
+                        "bab_label": n.bab_label or "—",
                         "doc_id": n.doc_id,
                         "page": page,
                         "source_file": source_file,
@@ -2422,9 +2518,10 @@ def main() -> None:
                             rank_dense=n.rank_dense,
                             rank_sparse=n.rank_sparse,
                             ctx_label=f"CTX {i}",
+                            stream=n.stream,
                         )
                     else:
-                        render_source_score_pills(sim, dist, ctx_label=f"CTX {i}")
+                        render_source_score_pills(sim, dist, ctx_label=f"CTX {i}", stream=n.stream)
 
                     st.caption(f"Preview: {preview}")
 

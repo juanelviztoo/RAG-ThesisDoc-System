@@ -1,5 +1,6 @@
 index:
-  collection_name: "skripsi_naive"
+  # collection_name: "skripsi_naive"
+  collection_name: "skripsi_structured_narasi"
 
 retrieval:
   mode: "dense"
