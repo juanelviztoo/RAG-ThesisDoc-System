@@ -56,7 +56,7 @@ from src.rag.method_detection import (
     detect_methods_in_text,
     has_steps_signal,
     is_anaphora_question,
-    is_citation_query,  
+    is_citation_query,
     is_method_question,
     is_multi_doc_question,
     is_multi_target_question,
@@ -69,7 +69,7 @@ from src.rag.method_detection import (
 )
 from src.rag.retrieve_dense import retrieve_dense
 from src.rag.retrieve_sparse import sparse_retrieve_bm25
-from src.rag.self_query import (   # ← V3.0b: Metadata Self-Querying
+from src.rag.self_query import (  # ← V3.0b: Metadata Self-Querying
     SelfQueryResult,
     build_self_query,
     check_filter_has_results,
