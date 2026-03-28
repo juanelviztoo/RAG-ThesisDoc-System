@@ -1,7 +1,7 @@
 # RAG ThesisDoc System
 **Retrieval-Augmented Generation (RAG) untuk Dokumen Skripsi/TA**  
 
-> **Status Terkini:** V3.0a (`v3.0a-structured`) sudah di-tag di `main`. Branch `dev` aktif untuk pengembangan V3.0b+.
+> **Status Terkini:** V3.0b (**DONE ✅ / siap release-tag `v3.0b-selfquery`**) di branch `dev`. `main` saat ini masih mereferensikan V3.0a (`v3.0a-structured`) sampai merge + tag release dilakukan. Fokus pengembangan berikutnya adalah V3.0c.
 
 ---
 
@@ -10,9 +10,9 @@
 - **V1.5 (DONE ✅)** — `v1.5-memory`: Multi-turn Chat (Session Memory) + Query Contextualization + Guardrails + UI/UX Enhancement
 - **V2.0 (DONE ✅)** — `v2.0-hybrid`: Hybrid Retrieval (BM25+Sastrawi Sparse + Dense Vector + RRF Fusion) + UI Hybrid Score Display
 - **V3.0a (DONE ✅)** — `v3.0a-structured`: Structure-Aware PDF Parsing + Dual Stream (Narasi vs Sitasi) + Dual ChromaDB Collection + Citation Routing
-- **V3.0b (NEXT 🔄)**: Metadata Self-Querying Filtering (Tahun, Penulis, Topik, Prodi)
-- **V3.0c (PLANNED)**: Cross-Encoder Reranking (Top-10 → Top-3)
-- **V3.0d (PLANNED)**: Post-Hoc Verification (Confidence Scoring + label Hijau/Merah)
+- **V3.0b (DONE ✅)** — `v3.0b-selfquery`: Metadata Self-Querying Filtering (Tahun, Prodi, Penulis) + Stable JSONL Self-Query Logging + Pre-check Zero-Result Fallback + Metadata Exact-Match Answer Guard + Metadata Router Natural-Language Alias Resolution
+- **V3.0c (NEXT 🔄)** — Cross-Encoder Reranking (Top-10 → Top-3)
+- **V3.0d (PLANNED)** — Post-Hoc Verification (Confidence Scoring + label Hijau/Merah)
 
 **Pemetaan Ablation Study:**
 | Skenario | Versi | Tag | Keterangan |
@@ -25,18 +25,29 @@
 
 ## Summary
 Repo ini berisi prototipe sistem **Question Answering** pada kumpulan PDF skripsi/TA.
-Versi **V3.0a** membangun di atas V2.0 dengan fondasi structure-aware processing:
+
+Versi **V3.0b** membangun di atas V3.0a dengan dua fondasi utama:
+1. **Structure-aware dual-stream retrieval** dari V3.0a (narasi vs sitasi, dual collection, citation routing)
+2. **Metadata Self-Querying Filtering** pada primary retrieval narasi untuk mempersempit kandidat dokumen berdasarkan metadata terstruktur yang diekstrak dari query user
+
+Fitur inti yang telah tersedia hingga **V3.0b**:
 - **Structure-Aware PDF Parsing**: deteksi bab (BAB I–V, Daftar Pustaka, Lampiran) via regex + filename routing — setiap chunk "tahu posisinya" dalam hierarki akademik
 - **Dual Stream**: dokumen dipecah menjadi dua aliran — narasi (BAB I–V) dan sitasi (Daftar Pustaka) — masing-masing diindeks ke ChromaDB collection terpisah
 - **Citation Routing**: sistem mendeteksi otomatis apakah query menanyakan konten (→ narasi) atau referensi/pustaka (→ sitasi), lalu merge hasilnya
 - **Hybrid Retrieval**: BM25+Sastrawi (sparse/keyword) + Dense vector (Chroma) digabungkan via Reciprocal Rank Fusion (RRF)
+- **Metadata Self-Querying Filtering (V3.0b)**: query natural language dipecah menjadi:
+  - `semantic_query` untuk retrieval
+  - filter metadata terstruktur (`tahun`, `prodi`, `penulis`) untuk primary dense retrieval narasi
+- **Graceful Zero-Result Fallback (V3.0b)**: jika metadata filter valid tetapi pre-check menunjukkan 0 hasil, sistem otomatis fallback ke retrieval penuh tanpa crash
+- **Stable Self-Query Logging (V3.0b)**: field `self_query` kini diisi secara konsisten di `retrieval.jsonl` dan `answers.jsonl` pada semua jalur (normal retrieval, metadata-routed, disabled path, fallback path)
+- **Answer Guard untuk Exact Metadata Match (V3.0b)**: jika metadata eksplisit diminta user tetapi exact match tidak ditemukan, sistem memaksa jawaban `not_found` agar tidak menghasilkan false positive
+- **Metadata Routing (page count intent)**: pertanyaan seperti *"berapa halaman dokumen X?"* dijawab langsung dari `doc_catalog.json`; pada V3.0b, resolver juga mendukung alias natural-language seperti `"E-Ticketing"`
 - Dense retrieval (Chroma + embeddings) dengan diversity retrieval
 - Multi-turn memory (sliding window, topic shift detection)
 - Query contextualization (rewrite sebelum retrieval)
 - Generator (LLM) opsional (Groq/OpenAI/Ollama) dengan output guardrails lengkap
 - UI Streamlit demo-ready (turn viewer, history expander, styled sections, hybrid score display, stream pill)
 - Coverage retrieval per-metode (untuk pertanyaan multi-target)
-- Metadata routing (page count intent)
 - Logging lengkap untuk audit (manifest + retrieval.jsonl + answers.jsonl + app.log)
 - PDF Viewer berbasis gambar + **highlight keyword** (auto/manual)
 - Utility `cleanup_runs.py` (dry-run default, aman)
@@ -127,6 +138,7 @@ Folder `runs/<run_id>/` berisi:
 
 #### Metadata Routing
 - Intent **page_count** — *"berapa halaman dokumen X?"* dijawab langsung dari `doc_catalog.json` tanpa retrieval ke Chroma
+- Pada V3.0b, metadata router ini diaktifkan kembali pada `v3.yaml` dan diperluas agar mendukung alias natural-language (mis. `"dokumen E-Ticketing"`)
 - Catalog dibangun saat ingest, merge inkremental (tidak overwrite entry lama saat partial ingest)
 
 #### UI/UX Enhancement (V1.5)
@@ -269,22 +281,112 @@ Plus 3 fix perilaku pipeline:
 - **Fix 2**: `steps_q` hanya dari query asli user (bukan `retrieval_query` hasil rewrite LLM) — di blok Coverage Expansion
 - **Fix 3**: buang `methods_detected` dari fallback `turn_methods` — hanya pakai `target_methods_for_gen` + scan `answer_raw`
 
-#### Arsitektur Modul (V3.0a)
+### [V3.0b — Metadata Self-Querying Filtering + Stabilisasi Pipeline]
+
+#### Metadata Self-Querying Filtering
+V3.0b menambahkan lapisan **self-querying** di atas pipeline retrieval V3.0a. Query user tidak lagi hanya dipakai sebagai string retrieval mentah, tetapi diproses menjadi dua keluaran:
+
+1. **`semantic_query`** — query semantik yang dibersihkan dari metadata eksplisit dan benar-benar dikirim ke retriever
+2. **`filters`** — filter metadata terstruktur untuk primary dense retrieval narasi
+
+Metadata yang saat ini didukung:
+- `tahun`
+- `prodi`
+- `penulis`
+
+Implementasi V3.0b:
+- Modul baru: `src/rag/self_query.py`
+- Ekstraksi metadata: LLM → JSON → validasi → Chroma `where_filter`
+- Batas maksimum filter simultan: `max_filter_fields = 2`
+- Prioritas field saat truncation: `tahun > prodi > penulis`
+
+#### Where Filter Integration
+Filter metadata diterapkan pada:
+- **primary dense retrieval narasi**
+
+Filter **tidak** diterapkan secara end-to-end pada seluruh jalur hybrid. Sparse leg pada mode hybrid masih mengikuti arsitektur V2.0, sehingga hal ini dicatat sebagai **known limitation implementasi V3.0b**, bukan sebagai klaim bahwa seluruh hybrid retrieval sudah hard-filtered metadata.
+
+#### Graceful Pre-check Fallback
+Sebelum filter metadata diterapkan, sistem melakukan pre-check:
+- jika hasil > 0 → filter dipakai
+- jika hasil = 0 → retrieval otomatis fallback ke retrieval penuh
+
+Dengan demikian, V3.0b menghindari kegagalan diam-diam berupa hasil retrieval kosong akibat filter metadata yang terlalu ketat.
+
+#### Stable JSONL Logging
+V3.0b menambahkan field `self_query` ke:
+- `retrieval.jsonl`
+- `answers.jsonl`
+
+Shape field ini dijaga stabil di semua jalur:
+- normal retrieval
+- `metadata_router`
+- disabled path
+- eval-disabled path
+- `precheck_no_results`
+- exception fallback
+
+Field inti `self_query`:
+- `enabled`
+- `semantic_query`
+- `filter_applied`
+- `filter_fields_used`
+- `filters`
+- `extracted_metadata`
+- `fallback_reason`
+
+#### Exact-Match Answer Guard
+V3.0b menambahkan guard pada answer layer:
+- jika user meminta metadata eksplisit
+- self-query berhasil mengekstrak metadata
+- tetapi `precheck_no_results` terjadi
+
+maka sistem **tidak** membiarkan generator menjawab positif berdasarkan retrieval fallback umum. Sebagai gantinya, sistem memaksa jawaban canonical:
+```text
+Jawaban: Tidak ditemukan pada dokumen.
+Bukti: -
+```
+Hal ini mencegah false positive seperti:
+- query meminta `tahun=2021`
+- retrieval fallback menampilkan dokumen 2023
+- generator lalu keliru menjawab “Ya”
+
+#### Citation Routing Stabilization
+Pada V3.0b, citation routing tetap aktif, tetapi ditambahkan stabilisasi:
+- **minimum floor narasi ≥ 60%** saat citation merge aktif
+- sort akhir hybrid dan dense dibedakan sesuai semantik skor:
+  - hybrid: `score_rrf` → descending
+  - dense: Chroma distance → ascending
+
+#### Metadata Router Improvement
+Metadata router (`page_count`) tetap digunakan seperti di V1.5, tetapi V3.0b menambahkan:
+- natural-language alias resolution untuk nama dokumen
+- contoh: `"Berapa halaman dokumen E-Ticketing?"` dapat dipetakan ke entry:
+  - `ITERA_2023_ETicketing_ExtremeProgramming.pdf`
+
+#### Known Limitations (V3.0b)
+- Sparse leg pada hybrid retrieval masih mengikuti arsitektur V2.0; filter metadata belum diterapkan end-to-end pada seluruh hybrid path
+- Citation intent + metadata sudah stabil secara integrasi, tetapi kualitas retrieval sitasi masih dapat bercampur antar-dokumen
+- Filter `prodi` dan `penulis` belum seandal `tahun`, terutama ketika metadata dataset belum cukup bersih atau konsisten
+- Filter `penulis` sudah dapat diekstrak, tetapi exact-match retrieval untuk metadata penulis masih dicatat sebagai ruang pengembangan lanjutan
+
+#### Arsitektur Modul (V3.0b)
 ```
 src/
-├── app_streamlit.py          ← UI utama (citation routing hybrid+dense, Fix 1+2+3+Bug5+6)
-├── app_ui_render.py          ← Render & display helpers (stream pill violet, legend CTX V3.0a)
+├── app_streamlit.py          ← UI utama (hybrid/dense, citation routing, self-query integration, metadata exact-match guard)
+├── app_ui_render.py          ← Render & display helpers (stream pill, legend CTX, hybrid score pills)
 ├── rag/
-│   ├── pdf_parser.py         ← BARU V3.0a: structure-aware parsing (regex + filename routing)
-│   ├── chunking.py           ← BARU V3.0a: dual strategy chunking (narasi + sitasi)
-│   ├── method_detection.py   ← Single source of truth: deteksi metode/query (is_steps_question diperketat)
+│   ├── pdf_parser.py         ← Structure-aware parsing (regex + filename routing)
+│   ├── chunking.py           ← Dual strategy chunking (narasi + sitasi)
+│   ├── method_detection.py   ← Single source of truth: deteksi metode/query + is_citation_query + is_steps_question (diperketat)
+│   ├── self_query.py         ← BARU V3.0b: LLM → JSON metadata filter + semantic_query + pre-check helper
 │   ├── generate.py           ← Thin re-export wrapper 3 fungsi publik
 │   ├── generate_utils.py     ← Semua implementasi generate + guardrails (~2800 baris)
 │   ├── ingest.py             ← PDF ingestion → dual stream → dual ChromaDB collection + doc_catalog
-│   ├── retrieve_dense.py     ← Dense retrieval + _resolve_collection_name + stream/bab_label
+│   ├── retrieve_dense.py     ← Dense retrieval + collection-aware + where_filter + stream/bab_label
 │   ├── retrieve_sparse.py    ← BM25+Sastrawi sparse retrieval + collection-aware + stream/bab_label
 │   ├── fusion_rrf.py         ← RRF fusion: List[RetrievedNode] → List[RetrievedNode] + propagate stream/bab_label
-│   └── metadata_router.py    ← Intent router (page_count aktif V1.5)
+│   └── metadata_router.py    ← Metadata intent router (page_count aktif V1.5) + natural-language alias resolution
 └── core/
     ├── config.py, run_manager.py
     ├── schemas.py             ← RetrievedNode (+ stream + bab_label fields V3.0a)
@@ -293,17 +395,20 @@ src/
 configs/  → base.yaml, v1.yaml, v1_5.yaml, v2.yaml, v3.yaml
 ```
 
-**Dependency Graph Modul V3.0a:**
+**Dependency Graph Modul V3.0b:**
 ```
 pdf_parser.py      ← ingest.py (parsing PDF per-stream)
 chunking.py        ← ingest.py (chunking per-stream)
-retrieve_dense.py  ← app_streamlit.py (narasi + sitasi, collection-aware)
+self_query.py      ← app_streamlit.py (LLM metadata extraction → semantic_query + filters)
+retrieve_dense.py  ← app_streamlit.py (narasi + sitasi + where_filter, collection-aware)
 retrieve_sparse.py ← app_streamlit.py (narasi + sitasi, collection-aware)
 fusion_rrf.py      ← app_streamlit.py (gabungkan dense + sparse, propagate stream/bab_label)
                         ↑
                    schemas.RetrievedNode (shared output type, + stream + bab_label)
  
 _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.py — DRY)
+metadata_router.py  ← app_streamlit.py (page_count intent + natural-language alias resolution)
+method_detection.py ← app_streamlit.py / pdf_parser.py (single source of truth query/type detection)
 ```
 
 ---
@@ -333,8 +438,8 @@ _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.
 
 ## Struktur Repo
 - `src/`
-  - `app_streamlit.py` : UI Streamlit utama (mode-aware: hybrid/dense, citation routing V3.0a)
-  - `app_ui_render.py` : Render & display helpers (V1.5+, hybrid score pills V2.0, stream pill V3.0a)
+  - `app_streamlit.py` : UI Streamlit utama (mode-aware: hybrid/dense, citation routing, self-query integration, metadata exact-match guard)
+  - `app_ui_render.py` : Render & display helpers (V1.5+, hybrid score pills V2.0, stream pill V3.0a, legend CTX V3.0b)
   - `rag/`
     - `pdf_parser.py` : **[BARU V3.0a]** structure-aware PDF parsing (regex + filename routing, dual stream)
     - `chunking.py` : **[BARU V3.0a]** dual strategy chunking (structure-aware narasi + citation-aware sitasi)
@@ -342,10 +447,11 @@ _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.
     - `retrieve_dense.py` : dense retrieval (cached + diversity, `score_dense` + `stream` + `bab_label` terisi)
     - `retrieve_sparse.py` : BM25+Sastrawi sparse retrieval + index caching + collection-aware (V2.0+)
     - `fusion_rrf.py` : RRF fusion dense+sparse → `List[RetrievedNode]` + propagate `stream`/`bab_label` (V3.0a)
+    - `self_query.py` : **[BARU V3.0b]** self-query metadata filtering (LLM → JSON → validasi → where_filter + semantic_query)
     - `generate.py` : thin re-export wrapper public API
     - `generate_utils.py` : semua implementasi generate + guardrails
     - `method_detection.py` : deteksi metode & query type (single source of truth, `is_steps_question` diperketat V3.0a)
-    - `metadata_router.py` : metadata intent routing (page_count)
+    - `metadata_router.py` : metadata intent routing (page_count) + natural-language alias resolution untuk nama dokumen
   - `core/`
     - `config.py` : load config YAML (deep merge base + override)
     - `run_manager.py` : run_id + manifest + logging JSONL
@@ -450,7 +556,7 @@ Di sidebar UI, tersedia toggle **Mode**:
 | `configs/v1.yaml` | dense | `skripsi_structured_narasi` | Skenario A — Naive Dense RAG |
 | `configs/v1_5.yaml` | dense | `skripsi_structured_narasi` | V1.5 dengan memory (bukan skenario ablation) |
 | `configs/v2.yaml` | **hybrid** | `skripsi_structured_narasi` | **Skenario B — Hybrid RAG** |
-| `configs/v3.yaml` | **hybrid** | narasi + sitasi (dual) | **Skenario C — Proposed Method (V3.0a+)** |
+| `configs/v3.yaml` | **hybrid** | narasi + sitasi (dual) | **Skenario C — Proposed Method (V3.0b)** |
 
 ---
 
@@ -489,7 +595,7 @@ coverage:
   min_methods: 2
 
 metadata_routing:
-  enabled: false          # aktifkan jika ingin routing page_count
+  enabled: true          # aktifkan jika ingin routing page_count
 ```
 
 Key penting di `v2.yaml`:
@@ -505,7 +611,7 @@ memory:
   window: 4
 ```
 
-Key penting di `v3.yaml` (V3.0a — Dual Collection):
+Key penting di `v3.yaml` (V3.0b — Dual Collection + Metadata Self-Querying):
 ```yaml
 index:
   collections:
@@ -536,7 +642,24 @@ bm25:
 memory:
   enabled: true
   window: 4
+
+metadata_routing:
+  enabled: true
+  allow_in_eval: false
+  doc_catalog_filename: doc_catalog.json
+
+self_query:
+  enabled: true
+  allow_in_eval: false
+  max_filter_fields: 2
+  llm_temperature: 0.0
+  llm_max_tokens: 256
 ```
+
+> **Catatan V3.0b:**  
+> - `metadata_routing` diaktifkan di `v3.yaml` untuk mempertahankan jalur page-count intent pada pipeline terbaru  
+> - `self_query` hanya diterapkan pada primary dense retrieval narasi  
+> - `v1.yaml` dan `v2.yaml` dipertahankan sebagai baseline historis; fitur V3.0b tidak dipaksakan aktif di config versi lama
 
 ---
 
@@ -576,6 +699,33 @@ Field V3.0a yang ditambahkan ke `retrieved_nodes` di `retrieval.jsonl`:
 - `stream` — `"narasi"` | `"sitasi"` | `null` (null untuk node dari dataset V1/V2 lama)
 - `bab_label` — `"BAB_I"` | `"BAB_II"` | `"BAB_III"` | `"BAB_IV"` | `"BAB_V"` | `"DAFTAR_PUSTAKA"` | `"LAMPIRAN"` | `"FRONT_MATTER"` | `"UNKNOWN"` | `null`
 
+Field V3.0b yang ditambahkan ke `retrieval.jsonl` dan `answers.jsonl`:
+- `self_query` — object stabil lintas jalur:
+  - `enabled`
+  - `semantic_query`
+  - `filter_applied`
+  - `filter_fields_used`
+  - `filters`
+  - `extracted_metadata`
+  - `fallback_reason`
+
+Contoh nilai `fallback_reason`:
+- `not_executed`
+- `self_query_disabled`
+- `disabled_in_eval`
+- `no_valid_filters_extracted`
+- `precheck_no_results`
+- `metadata_routed`
+- `exception:<TypeError>`
+
+Tambahan perilaku V3.0b:
+- `strategy` dapat mengandung suffix `+selfquery` bila filter metadata benar-benar diterapkan
+- `generator_strategy` dapat bernilai:
+  - `llm`
+  - `retrieval_only`
+  - `metadata_router`
+  - `self_query_guard`
+
 ### Prinsip Modifikasi (V1.5+)
 - Logika deteksi metode/query → selalu edit di `method_detection.py`
 - Logika render/display UI → selalu edit di `app_ui_render.py`
@@ -595,6 +745,20 @@ Field V3.0a yang ditambahkan ke `retrieved_nodes` di `retrieval.jsonl`:
 - `is_citation_query()` saat ini ada di `app_streamlit.py` dan `pdf_parser.py` — di V3.0b akan dikonsolidasi ke `method_detection.py`
 - Field `stream` dan `bab_label` di `RetrievedNode` wajib diteruskan (di-copy) di setiap lapisan yang membangun node baru — terutama `fusion_rrf.py`
 - Saat menambah collection baru → daftarkan di `v3.yaml` → handle di `_resolve_collection_name()` → tambahkan routing di `app_streamlit.py`
+
+### Prinsip Modifikasi Tambahan (V3.0b)
+- Logika self-query metadata → selalu edit di `self_query.py`
+- `semantic_query` hasil self-query adalah query final retrieval; jangan langsung pakai query mentah bila self-query aktif
+- `where_filter` hanya diterapkan ke **primary dense retrieval narasi**
+- Jika menambah field baru ke `self_query` log, pastikan shape object tetap sama di semua jalur:
+  - normal retrieval
+  - fallback 0 hasil
+  - disabled path
+  - metadata-routed path
+  - eval-disabled path
+- `+selfquery` pada `strategy` hanya boleh muncul jika filter metadata benar-benar diterapkan
+- Untuk query metadata eksplisit yang gagal exact-match (`precheck_no_results`), answer layer harus tetap jujur dan tidak boleh membuat klaim positif berdasarkan retrieval fallback umum
+- Perbaikan metadata router → selalu edit di `metadata_router.py`; jangan memindahkan logic alias resolution ke `app_streamlit.py`
 
 ### Constraint Hardware (VRAM 4GB)
 - V2.0–V3.0a: BM25 berjalan di CPU, tidak ada tambahan beban VRAM

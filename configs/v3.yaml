@@ -41,3 +41,28 @@ bm25:
 memory:
   enabled: true
   window: 4
+
+metadata_routing:
+  enabled: true
+  allow_in_eval: false
+  doc_catalog_filename: doc_catalog.json
+
+# ── V3.0b: Metadata Self-Querying Filtering ──────────────────────────────────
+self_query:
+  # Aktifkan self-querying filtering
+  # false = fitur mati, semua query langsung ke retrieval penuh (perilaku V3.0a)
+  enabled: true
+
+  # Matikan saat eval mode agar hasil ablation study konsisten/reproducible
+  # (logika ini diterapkan di app_streamlit.py, bukan di self_query.py)
+  allow_in_eval: false
+
+  # Maksimum jumlah field filter yang dipakai sekaligus di where clause
+  # (mis. 2 = hanya tahun + prodi, tidak penulis meski ada di query)
+  max_filter_fields: 2
+
+  # LLM settings override untuk task JSON extraction
+  # temperature=0.0 agar output JSON deterministik dan konsisten
+  llm_temperature: 0.0
+  # max_tokens=256 cukup untuk output JSON pendek
+  llm_max_tokens: 256

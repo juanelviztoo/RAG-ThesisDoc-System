@@ -259,10 +259,11 @@ def retrieve_dense(
     cfg: Dict[str, Any],
     query: str,
     *,
-    diversify:   bool          = False,
-    max_per_doc: int           = 2,
-    candidate_k: Optional[int] = None,
-    collection:  str           = "narasi",
+    diversify:    bool                  = False,
+    max_per_doc:  int                   = 2,
+    candidate_k:  Optional[int]         = None,
+    collection:   str                   = "narasi",
+    where_filter: Optional[Dict[str, Any]] = None,
 ) -> List[RetrievedNode]:
     """
     Dense retrieval dari ChromaDB via similarity_search_with_score().
@@ -277,32 +278,53 @@ def retrieve_dense(
     V1/V2 backward-compat: `collection` diabaikan, selalu pakai collection_name tunggal.
 
     Args:
-        cfg         : config dict dari load_config()
-        query       : query string
-        diversify   : aktifkan diversity retrieval (max_per_doc per dokumen)
-        max_per_doc : batas chunk per dokumen saat diversify=True (default 2)
-        candidate_k : ukuran pool kandidat untuk diversify
-                      (default: min(top_k * 6, _MAX_CANDIDATE_K))
-        collection  : "narasi" | "sitasi" — collection ChromaDB yang diquery
-                    (V3.0a only; diabaikan untuk V1/V2 single-collection config)
+        cfg          : config dict dari load_config()
+        query        : query string
+        diversify    : aktifkan diversity retrieval (max_per_doc per dokumen)
+        max_per_doc  : batas chunk per dokumen saat diversify=True (default 2)
+        candidate_k  : ukuran pool kandidat untuk diversify
+                       (default: min(top_k * 6, _MAX_CANDIDATE_K))
+        collection   : "narasi" | "sitasi" — collection ChromaDB yang diquery
+                        (V3.0a only; diabaikan untuk V1/V2 single-collection config)
+        where_filter : ChromaDB where clause dict dari SelfQueryResult.filters, atau None.
+                        Jika None → retrieval penuh tanpa filter (perilaku V3.0a ke bawah).
+                        Jika dict → diteruskan ke similarity_search_with_score(filter=...)
+                        sehingga hanya dokumen yang metadata-nya cocok yang di-retrieve.
+                        PENTING: caller (app_streamlit.py) WAJIB memanggil
+                        check_filter_has_results() terlebih dahulu untuk memastikan
+                        filter tidak menghasilkan 0 dokumen. Fungsi ini sendiri tidak
+                        melakukan graceful fallback, itu tanggung jawab caller.
+                        Backward-compatible: semua caller lama tidak perlu diubah
+                        karena default None = perilaku identik dengan sebelumnya.
 
     Returns:
-        List[RetrievedNode] - diurutkan descending by score (lower distance = better).
+        List[RetrievedNode] - diurutkan berdasarkan Chroma distance
+        (semakin kecil score, semakin relevan).
         Field stream dan bab_label terisi untuk chunk V3.0a; None untuk V1/V2.
     """
     top_k = int(cfg["retrieval"]["top_k"])
     vs    = _get_vectorstore(cfg, collection)
 
     # ── Hitung k untuk similarity_search ─────────────────────────────────────
+    # where_filter diteruskan ke ChromaDB jika ada (V3.0b Self-Querying).
+    # None = tidak ada filter, ChromaDB mengabaikan parameter ini secara aman.
+    _filter_kwargs: Dict[str, Any] = {}
+    if where_filter is not None:
+        _filter_kwargs["filter"] = where_filter
+
     if diversify:
         if candidate_k is None:
-            # default: pool lebih besar supaya punya “bahan” untuk sebar antar dokumen
+            # default: pool lebih besar supaya punya "bahan" untuk sebar antar dokumen
             _ck = min(max(top_k * 6, top_k), _MAX_CANDIDATE_K)
         else:
             _ck = min(max(int(candidate_k), top_k), _MAX_CANDIDATE_K)
-        results: List[Tuple[Any, float]] = vs.similarity_search_with_score(query, k=_ck)
+        results: List[Tuple[Any, float]] = vs.similarity_search_with_score(
+            query, k=_ck, **_filter_kwargs
+        )
     else:
-        results = vs.similarity_search_with_score(query, k=top_k)
+        results = vs.similarity_search_with_score(
+            query, k=top_k, **_filter_kwargs
+        )
 
     # ── Bangun RetrievedNode ──────────────────────────────────────────────────
     nodes: List[RetrievedNode] = []
