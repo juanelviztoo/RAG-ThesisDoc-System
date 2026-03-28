@@ -13,6 +13,13 @@ Menggantikan duplikasi antara kedua file:
     - is_*_question()                                            → pindah dari app_streamlit
     - _docid_hit_for_method()                                    → docid_hit_for_method()
     - node_supports_method_for_coverage()                        → pindah dari app_streamlit
+
+V3.0b (Konsolidasi):
+    - is_citation_query() — single source of truth untuk deteksi citation query.
+        Menggantikan duplikasi:
+        * _is_citation_query() + _CITATION_KEYWORDS di app_streamlit.py (dihapus)
+        * referensi ke is_citation_query() di pdf_parser.py (tidak perlu ada lagi)
+        Semua caller cukup import dari modul ini.
 """
 from __future__ import annotations
 
@@ -86,6 +93,28 @@ COVERAGE_STRICT_TEXT_PATTERNS: Dict[str, List[str]] = {
         r"\bmetode\s+rad\b",
     ],
 }
+
+
+# =========================
+# Citation query keywords — V3.0b
+# (Sebelumnya: _CITATION_KEYWORDS di app_streamlit.py - dihapus dari sana)
+# =========================
+
+# Superset dari kedua implementasi lama. Setiap perubahan keyword cukup
+# dilakukan di sini - app_streamlit.py dan modul lain cukup import is_citation_query().
+_CITATION_KEYWORDS: List[str] = [
+    # ── Intent eksplisit: menyebut daftar pustaka / referensi secara langsung ──
+    r"\b(referensi|daftar\s*pustaka|daftar\s*referensi)\b",
+    # ── Intent implisit: menyebut jenis sumber + kata kerja/pertanyaan ──
+    r"\b(jurnal|buku|artikel|publikasi|acuan|sitasi)\b.*\b(digunakan|dijadikan|ada|apa)\b",
+    r"\b(apa|sebutkan|tampilkan|cari)\b.*\b(jurnal|buku|referensi|pustaka|acuan)\b",
+    # ── Frasa akademis yang sangat khas bagian literatur ──
+    r"\b(landasan\s*teori|tinjauan\s*pustaka|kajian\s*literatur)\b",
+    # ── Kata kerja turunan sumber: mengutip, sumber pustaka ──
+    r"\b(mengutip|dikutip|menggunakan\s+referensi|sumber\s+pustaka)\b",
+    # ── Bahasa Inggris (dokumen bilingual / query campur) ──
+    r"\b(cited|citation|bibliography|references?)\b",
+]
 
 
 # =========================
@@ -292,6 +321,23 @@ def is_multi_doc_question(q: str) -> bool:
     if re.search(r"\b(beberapa|berbagai|multi)\b.*\b(dokumen|sumber)\b", t):
         return True
     return False
+
+
+def is_citation_query(query: str) -> bool:
+    """
+    Deteksi apakah query meminta informasi dari Daftar Pustaka / referensi.
+    Jika True → pipeline akan menambahkan retrieval dari collection sitasi.
+
+    Single source of truth - menggantikan duplikasi:
+        - _is_citation_query() + _CITATION_KEYWORDS di app_streamlit.py (sudah dihapus)
+        - referensi is_citation_query() di pdf_parser.py (tidak perlu ada lagi)
+
+    Digunakan oleh:
+        - app_streamlit.py  : citation routing (hybrid + dense path)
+        - (future) self_query.py : sebagai sinyal bahwa filter sitasi perlu diaktifkan
+    """
+    q = (query or "").lower()
+    return any(re.search(p, q, flags=re.IGNORECASE) for p in _CITATION_KEYWORDS)
 
 
 # =========================

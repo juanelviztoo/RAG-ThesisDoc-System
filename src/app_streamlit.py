@@ -56,6 +56,7 @@ from src.rag.method_detection import (
     detect_methods_in_text,
     has_steps_signal,
     is_anaphora_question,
+    is_citation_query,  
     is_method_question,
     is_multi_doc_question,
     is_multi_target_question,
@@ -68,27 +69,15 @@ from src.rag.method_detection import (
 )
 from src.rag.retrieve_dense import retrieve_dense
 from src.rag.retrieve_sparse import sparse_retrieve_bm25
+from src.rag.self_query import (   # ← V3.0b: Metadata Self-Querying
+    SelfQueryResult,
+    build_self_query,
+    check_filter_has_results,
+)
 
 # =========================
 # Doc-focus lock helpers
 # =========================
-
-_CITATION_KEYWORDS = [
-    r"\b(referensi|daftar\s*pustaka|daftar\s*referensi)\b",
-    r"\b(jurnal|buku|artikel|publikasi|acuan|sitasi)\b.*\b(digunakan|dijadikan|ada|apa)\b",
-    r"\b(apa|sebutkan|tampilkan|cari)\b.*\b(jurnal|buku|referensi|pustaka|acuan)\b",
-    r"\b(landasan\s*teori|tinjauan\s*pustaka|kajian\s*literatur)\b",
-    r"\b(cited|citation|bibliography|reference)\b",
-]
-
-def _is_citation_query(query: str) -> bool:
-    """
-    Deteksi apakah query meminta informasi dari Daftar Pustaka / referensi.
-    Jika True → tambahkan retrieval dari collection sitasi ke pipeline.
-    """
-    q = (query or "").lower()
-    return any(re.search(p, q, flags=re.IGNORECASE) for p in _CITATION_KEYWORDS)
-
 
 def _node_doc_id(n: Any) -> str:
     return str(
@@ -246,6 +235,7 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["turn_data"] = {}       # turn_id -> full render data per turn
     st.session_state["viewing_turn_id"] = None  # None = tampilkan turn terbaru
     st.session_state["last_retrieval_mode"] = "dense" # default saat belum ada query
+    st.session_state["last_self_query_result"] = None  # ← V3.0b
     return rm, logger
 
 
@@ -652,9 +642,118 @@ def decide_max_bullets(
     return max_b, meta
 
 
+def _make_self_query_log(
+    *,
+    enabled: bool,
+    semantic_query: Optional[str] = None,
+    filter_applied: bool = False,
+    filter_fields_used: Optional[List[str]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    extracted_metadata: Optional[Dict[str, Any]] = None,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Shape log self_query yang STABIL di semua jalur:
+    - normal path
+    - metadata_routed
+    - self_query disabled
+    - disabled_in_eval
+    - precheck 0 hasil
+    - exception path
+    """
+    return {
+        "enabled": bool(enabled),
+        "semantic_query": semantic_query,
+        "filter_applied": bool(filter_applied),
+        "filter_fields_used": list(filter_fields_used or []),
+        "filters": filters,
+        "extracted_metadata": dict(extracted_metadata or {}),
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _self_query_log_from_result(
+    result: Optional[SelfQueryResult],
+    *,
+    enabled: bool,
+    semantic_query: Optional[str] = None,
+    filter_applied: Optional[bool] = None,
+    fallback_reason: Optional[str] = None,
+    clear_filter_payload: bool = False,
+) -> Dict[str, Any]:
+    """
+    Normalisasi SelfQueryResult -> shape log yang konsisten.
+    clear_filter_payload=True dipakai saat filter sempat terbentuk,
+    tetapi TIDAK jadi diterapkan (mis. pre-check 0 hasil).
+    """
+    base = _make_self_query_log(enabled=enabled)
+
+    if result is not None:
+        base.update(result.to_log_dict())
+
+    base["enabled"] = bool(enabled)
+
+    if semantic_query is not None:
+        base["semantic_query"] = semantic_query
+
+    if filter_applied is not None:
+        base["filter_applied"] = bool(filter_applied)
+
+    if fallback_reason is not None:
+        base["fallback_reason"] = fallback_reason
+
+    if clear_filter_payload and not base["filter_applied"]:
+        base["filters"] = None
+        base["filter_fields_used"] = []
+
+    return base
+
+
+def _has_explicit_metadata_constraints(sq_log: Optional[Dict[str, Any]]) -> bool:
+    """
+    True jika self_query log menunjukkan bahwa user memang meminta metadata eksplisit
+    (tahun / prodi / penulis), walaupun filter akhirnya tidak jadi diterapkan.
+    """
+    if not isinstance(sq_log, dict):
+        return False
+
+    ext = sq_log.get("extracted_metadata") or {}
+    if not isinstance(ext, dict):
+        return False
+
+    tahun = ext.get("tahun")
+    prodi = str(ext.get("prodi") or "").strip()
+    penulis = str(ext.get("penulis") or "").strip()
+
+    return (tahun is not None) or bool(prodi) or bool(penulis)
+
+
+def _should_force_metadata_not_found_answer(sq_log: Optional[Dict[str, Any]]) -> bool:
+    """
+    Guard utama:
+    Jika self-query mendeteksi metadata eksplisit, tetapi pre-check mengembalikan 0 hasil,
+    maka generator tidak boleh membuat klaim positif dari retrieval fallback umum.
+    """
+    if not isinstance(sq_log, dict):
+        return False
+
+    if str(sq_log.get("fallback_reason") or "") != "precheck_no_results":
+        return False
+
+    return _has_explicit_metadata_constraints(sq_log)
+
+
+def _build_metadata_not_found_answer() -> str:
+    """
+    Memakai canonical global not-found format agar build_generation_meta()
+    dan guardrail generator tetap konsisten.
+    """
+    return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", page_icon="🔍", layout="wide")
-    st.title("🔍 RAG ThesisDoc System - V3.0a")
+    st.title("🔍 RAG ThesisDoc System - V3.0b")
 
     load_dotenv()  # baca .env (lokal)
 
@@ -862,7 +961,7 @@ def main() -> None:
     # ===== Main Info =====
     _retrieval_mode_label = str(cfg.get("retrieval", {}).get("mode", "dense")).upper()
     st.success(
-        f"Now Running on **V3.0a** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization + Structure-Aware Dual Stream",
+        f"Now Running on **V3.0b** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization + Structure-Aware Dual Stream + Metadata Self-Querying",
         icon="🚥",
     )
 
@@ -871,12 +970,19 @@ def main() -> None:
     _llm_icon = "🟢" if use_llm else "⚫"
     _mode_badge = "🧪 eval" if eval_mode else "🎯 demo"
     _retrieval_icon = "🔀" if _retrieval_mode_label == "HYBRID" else "🔵"
+    # V3.0b: cek apakah self-query aktif dari config
+    _sq_cfg_info  = cfg.get("self_query") or {}
+    _sq_enabled_info = bool(_sq_cfg_info.get("enabled", False))
+    _sq_allow_eval   = bool(_sq_cfg_info.get("allow_in_eval", False))
+    _sq_on_info   = _sq_enabled_info and (run_mode != "eval" or _sq_allow_eval)
+    _sq_icon      = "🟢" if _sq_on_info else "⚫"
     _info_parts = [
         f"<b>Mode:</b> {_mode_badge}",
         f"{_retrieval_icon} Retrieval: {_retrieval_mode_label}",
         f"{_llm_icon} Generator",
         f"{_mem_icon} Memory ({mem_window} turns)",
         f"{_ctx_icon} Contextualize",
+        f"{_sq_icon} Self-Query Filter",   # ← V3.0b
     ]
     st.markdown(
         '<div style="background:#1e293b; border:1px solid #334155; padding:0.6rem 1rem; '
@@ -1036,6 +1142,24 @@ def main() -> None:
                 "min_terms": int(ts_min_terms),
             }
 
+            # ===== V3.0b: Self-Querying Metadata Filter (inisialisasi default) =====
+            # Diinisialisasi di sini agar field JSONL konsisten di SEMUA jalur
+            # retrieval_query = hasil contextualization / rewrite
+            # effective_retrieval_query = query FINAL yang benar-benar dikirim ke retrieval
+            retrieval_query_before_self_query = retrieval_query
+            effective_retrieval_query = retrieval_query_before_self_query
+
+            # reset state agar tidak bocor antar turn
+            st.session_state["last_self_query_result"] = None
+
+            _self_query_result: Optional[SelfQueryResult] = None
+            _self_query_filter: Optional[Dict[str, Any]] = None
+            _self_query_log: Dict[str, Any] = _make_self_query_log(
+                enabled=False,
+                semantic_query=None,
+                fallback_reason="not_executed",
+            )
+
             # ===== Metadata Routing (page_count) =====
             md_cfg = cfg_runtime.get("metadata_routing", {}) or {}
             md_enabled = bool(md_cfg.get("enabled", False))
@@ -1103,6 +1227,11 @@ def main() -> None:
                         "retrieved_nodes": [],
                         "coverage": None,
                         "metadata_route": metadata_meta,
+                        "self_query": _make_self_query_log(  # ← V3.0b
+                            enabled=False,
+                            semantic_query=None,
+                            fallback_reason="metadata_routed",
+                        ),
                     }
                     rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
 
@@ -1157,6 +1286,11 @@ def main() -> None:
                         "error": None,
                         "coverage": None,
                         "metadata_route": metadata_meta,
+                        "self_query": _make_self_query_log(  # ← V3.0b
+                            enabled=False,
+                            semantic_query=None,
+                            fallback_reason="metadata_routed",
+                        ),
                     }
                     rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
@@ -1199,6 +1333,7 @@ def main() -> None:
                         "history_used": history_used,
                         "contextualized": False,
                         "retrieval_mode": "metadata_router",
+                        "self_query_filter_applied": False,
                     }
 
             if not metadata_routed:
@@ -1223,6 +1358,86 @@ def main() -> None:
                 # mode-aware
                 retrieval_mode = str(cfg_runtime["retrieval"]["mode"])
 
+                # ===== V3.0b: Eksekusi Self-Querying Metadata Filter =====
+                sq_cfg_rt     = cfg_runtime.get("self_query") or {}
+                sq_enabled    = bool(sq_cfg_rt.get("enabled", False))
+                sq_allow_eval = bool(sq_cfg_rt.get("allow_in_eval", False))
+                _sq_active    = sq_enabled and (run_mode != "eval" or sq_allow_eval)
+
+                if not _sq_active:
+                    _disabled_reason = (
+                        "disabled_in_eval"
+                        if (sq_enabled and run_mode == "eval" and not sq_allow_eval)
+                        else "self_query_disabled"
+                    )
+                    _self_query_log = _make_self_query_log(
+                        enabled=False,
+                        semantic_query=retrieval_query_before_self_query,
+                        fallback_reason=_disabled_reason,
+                    )
+                else:
+                    st.write("🔎 Self-querying metadata filter...")
+                    try:
+                        # build dari query hasil contextualization / rewrite
+                        _self_query_result = build_self_query(cfg_runtime, retrieval_query_before_self_query)
+                        st.session_state["last_self_query_result"] = _self_query_result
+
+                        # semantic_query hasil self-query adalah query FINAL untuk retrieval
+                        _candidate_semantic_query = (_self_query_result.semantic_query or "").strip()
+                        if _candidate_semantic_query:
+                            effective_retrieval_query = _candidate_semantic_query
+
+                        # default log dari result
+                        _self_query_log = _self_query_log_from_result(
+                            _self_query_result,
+                            enabled=True,
+                            semantic_query=effective_retrieval_query,
+                        )
+
+                        if _self_query_result.filter_applied and _self_query_result.filters:
+                            _pre_check_ok = check_filter_has_results(
+                                _self_query_result.filters,
+                                cfg_runtime,
+                                "narasi",
+                            )
+
+                            if _pre_check_ok:
+                                _self_query_filter = _self_query_result.filters
+                                _sq_fields = ", ".join(_self_query_result.filter_fields_used)
+                                st.write(f"🏷️ Metadata filter aktif: [{_sq_fields}]")
+
+                                _self_query_log = _self_query_log_from_result(
+                                    _self_query_result,
+                                    enabled=True,
+                                    semantic_query=effective_retrieval_query,
+                                    filter_applied=True,
+                                )
+                            else:
+                                # graceful fallback: filter sempat terbentuk, tapi TIDAK dipakai
+                                st.write("🔄 Metadata filter: 0 hasil → fallback ke retrieval penuh")
+
+                                _self_query_filter = None
+                                _self_query_log = _self_query_log_from_result(
+                                    _self_query_result,
+                                    enabled=True,
+                                    semantic_query=effective_retrieval_query,
+                                    filter_applied=False,
+                                    fallback_reason="precheck_no_results",
+                                    clear_filter_payload=True,
+                                )
+
+                    except Exception as _sq_exc:
+                        # self-query TIDAK BOLEH menjatuhkan pipeline utama
+                        logger.warning(f"[V3.0b] Self-query failed (non-critical): {_sq_exc}")
+                        st.session_state["last_self_query_result"] = None
+                        effective_retrieval_query = retrieval_query_before_self_query
+                        _self_query_log = _make_self_query_log(
+                            enabled=True,
+                            semantic_query=effective_retrieval_query,
+                            filter_applied=False,
+                            fallback_reason=f"exception:{type(_sq_exc).__name__}",
+                        )
+
                 st.write("🔍 Retrieval dokumen dari vector store...")
                 if retrieval_mode == "hybrid":
                     # ── Jalur Hybrid: Dense + Sparse BM25 + RRF Fusion ──
@@ -1230,14 +1445,19 @@ def main() -> None:
                     _hybrid_candidate_k = max(int(top_k_ui) * 3, int(top_k_ui) + 5)
                     dense_nodes_raw = retrieve_dense(
                         cfg_runtime,
-                        retrieval_query,
+                        effective_retrieval_query,
                         diversify=False,
                         max_per_doc=int(max_per_doc),
                         candidate_k=_hybrid_candidate_k,
                         collection="narasi",
+                        where_filter=_self_query_filter,   # ← V3.0b
                     )
                     # Sparse: BM25 + Sastrawi, ambil top_k standar dari config
-                    sparse_nodes_raw = sparse_retrieve_bm25(cfg_runtime, retrieval_query, collection="narasi")
+                    sparse_nodes_raw = sparse_retrieve_bm25(
+                        cfg_runtime,
+                        effective_retrieval_query,
+                        collection="narasi",
+                    )
                     # RRF Fusion — gabungkan ranking dense + sparse
                     _rrf_k = int((cfg_runtime.get("retrieval") or {}).get("rrf_k", 60))
                     nodes = rrf_fusion(
@@ -1251,17 +1471,18 @@ def main() -> None:
                     _has_sitasi = bool(
                         (cfg_runtime.get("index", {}) or {}).get("collections", {}).get("sitasi")
                     )
-                    if _has_sitasi and _is_citation_query(retrieval_query):
+                    _citation_intent_query = retrieval_query_before_self_query or query
+                    if _has_sitasi and is_citation_query(_citation_intent_query):
                         _sitasi_top_k = max(3, int(top_k_ui) // 2)  # ambil separuh slot untuk sitasi
                         sitasi_dense = retrieve_dense(
-                            cfg_runtime, retrieval_query,
+                            cfg_runtime, effective_retrieval_query,
                             diversify=False,
                             max_per_doc=2,
                             candidate_k=_sitasi_top_k * 2,
                             collection="sitasi",
                         )
                         sitasi_sparse = sparse_retrieve_bm25(
-                            cfg_runtime, retrieval_query,
+                            cfg_runtime, effective_retrieval_query,
                             top_k=_sitasi_top_k,
                             collection="sitasi",
                         )
@@ -1273,33 +1494,47 @@ def main() -> None:
                         # Merge: dedupe by chunk_id, narasi tetap prioritas slot pertama
                         existing_ids = {n.chunk_id for n in nodes}
                         sitasi_new = [n for n in sitasi_fused if n.chunk_id not in existing_ids]
-                        # Gabungkan: kurangi narasi untuk beri ruang sitasi
-                        narasi_keep = int(top_k_ui) - len(sitasi_new)
+
+                        # V3.0b: minimum floor narasi ≥60% dari top_k agar konteks konseptual
+                        # tidak terlalu terkorbankan saat citation routing aktif
+                        _narasi_floor = max(1, int(top_k_ui * 0.6))
+                        _sitasi_cap   = int(top_k_ui) - _narasi_floor
+                        sitasi_new    = sitasi_new[:_sitasi_cap]   # terapkan cap sitasi
+
+                        narasi_keep   = int(top_k_ui) - len(sitasi_new)
                         nodes = nodes[:narasi_keep] + sitasi_new
-                        nodes = sorted(nodes[:int(top_k_ui)], key=lambda n: float(n.score), reverse=True)
-                        
+
+                        # HYBRID: n.score = RRF score → lebih besar = lebih relevan
+                        nodes = sorted(
+                            nodes[:int(top_k_ui)],
+                            key=lambda n: float(n.score),
+                            reverse=True,
+                        )
+
                         st.write(f"🧷 Citation routing aktif: +{len(sitasi_new)} chunks dari collection sitasi...")
                 else:
                     # ── Jalur Dense Murni (V1.0 / V1.5 behaviour — tidak berubah) ──
                     retrieval_mode = "dense"  # normalisasi agar konsisten di log
                     nodes = retrieve_dense(
                         cfg_runtime,
-                        retrieval_query,
+                        effective_retrieval_query,
                         diversify=diversify,
                         max_per_doc=int(max_per_doc),
                         candidate_k=candidate_k,
                         collection="narasi",
+                        where_filter=_self_query_filter,   # ← V3.0b
                     )
 
                     # ── V3.0a: Citation routing untuk jalur dense ──
                     _has_sitasi_d = bool(
                         (cfg_runtime.get("index", {}) or {}).get("collections", {}).get("sitasi")
                     )
-                    if _has_sitasi_d and _is_citation_query(retrieval_query):
+                    _citation_intent_query_d = retrieval_query_before_self_query or query
+                    if _has_sitasi_d and is_citation_query(_citation_intent_query_d):
                         _sitasi_top_k_d = max(3, int(top_k_ui) // 2)
                         sitasi_nodes_d = retrieve_dense(
                             cfg_runtime,
-                            retrieval_query,
+                            effective_retrieval_query,
                             diversify=False,
                             max_per_doc=2,
                             candidate_k=_sitasi_top_k_d * 2,
@@ -1308,9 +1543,20 @@ def main() -> None:
                         # Merge: dedupe by chunk_id, narasi tetap prioritas
                         existing_ids_d = {n.chunk_id for n in nodes}
                         sitasi_new_d = [n for n in sitasi_nodes_d if n.chunk_id not in existing_ids_d]
-                        narasi_keep_d = int(top_k_ui) - len(sitasi_new_d)
+
+                        # V3.0b: minimum floor narasi ≥60% dari top_k
+                        _narasi_floor_d = max(1, int(top_k_ui * 0.6))
+                        _sitasi_cap_d   = int(top_k_ui) - _narasi_floor_d
+                        sitasi_new_d    = sitasi_new_d[:_sitasi_cap_d]  # terapkan cap sitasi
+
+                        narasi_keep_d   = int(top_k_ui) - len(sitasi_new_d)
                         nodes = nodes[:narasi_keep_d] + sitasi_new_d
-                        nodes = sorted(nodes[:int(top_k_ui)], key=lambda n: float(n.score), reverse=True)
+
+                        # DENSE: n.score = Chroma distance → lebih kecil = lebih relevan
+                        nodes = sorted(
+                            nodes[:int(top_k_ui)],
+                            key=lambda n: float(n.score),
+                        )
 
                         st.write(f"🧷 Citation routing aktif: +{len(sitasi_new_d)} chunks dari collection sitasi...")
 
@@ -1576,8 +1822,10 @@ def main() -> None:
                 retrieval_stats = compute_retrieval_stats(nodes)
 
                 strategy = retrieval_mode  # "dense" atau "hybrid"
-                if retrieval_query != query:
+                if retrieval_query_before_self_query != query:
                     strategy = f"{strategy}+rewrite"
+                if _self_query_filter is not None:
+                    strategy = f"{strategy}+selfquery"   # ← V3.0b
                 # +diverse marker hanya relevan untuk jalur dense murni
                 if diversify and retrieval_mode != "hybrid":
                     strategy = f"{strategy}+diverse"
@@ -1595,13 +1843,13 @@ def main() -> None:
                     "use_llm": use_llm,
                     "top_k": int(top_k_ui),
                     "user_query": query,
-                    "retrieval_query": retrieval_query,
+                    "retrieval_query": effective_retrieval_query,
                     "run_mode": run_mode,
                     "use_memory": use_memory,
                     "mem_window": int(mem_window),
                     "history_used": history_used,
                     "history_turn_ids": history_turn_ids,
-                    "contextualized": (retrieval_query != query),
+                    "contextualized": (retrieval_query_before_self_query != query),
                     "detect_flags": detect_flags,
                     "topic_shift_meta": topic_shift_meta,
                     "history_policy": history_policy_meta,
@@ -1619,6 +1867,7 @@ def main() -> None:
                     },
                     "retrieval_stats": retrieval_stats,
                     "retrieval_confidence": retrieval_stats.get("sim_top1"),
+                    "self_query": _self_query_log,   # ← V3.0b
                     "retrieved_nodes": [
                         {
                             "doc_id": n.doc_id,
@@ -1812,8 +2061,15 @@ def main() -> None:
                     }
                 )
 
+                generator_strategy_name = "llm" if use_llm else "retrieval_only"
+                _force_metadata_not_found = _should_force_metadata_not_found_answer(_self_query_log)
                 st.write("🎰 Generating jawaban dengan LLM..." if use_llm else "📄 Mode retrieval-only...")
-                if use_llm:
+
+                if _force_metadata_not_found:
+                    st.write("⛔ Exact metadata match tidak ditemukan; jawaban dipaksa not-found untuk mencegah false positive.")
+                    answer_raw = _build_metadata_not_found_answer()
+                    generator_strategy_name = "self_query_guard"
+                elif use_llm:
                     try:
                         answer_raw = generate_answer(
                             cfg_runtime,
@@ -1855,13 +2111,13 @@ def main() -> None:
                     "use_llm": use_llm,
                     "top_k": int(top_k_ui),
                     "user_query": query,
-                    "retrieval_query": retrieval_query,
+                    "retrieval_query": effective_retrieval_query,
                     "run_mode": run_mode,
                     "use_memory": use_memory,
                     "mem_window": int(mem_window),
                     "history_used": history_used,
                     "history_turn_ids": history_turn_ids,
-                    "contextualized": (retrieval_query != query),
+                    "contextualized": bool(retrieval_query_before_self_query != query),
                     "detect_flags": detect_flags,
                     "topic_shift_meta": topic_shift_meta,
                     "history_policy": history_policy_meta,
@@ -1881,12 +2137,13 @@ def main() -> None:
                     },
                     "retrieval_stats": retrieval_stats,
                     "retrieval_confidence": retrieval_stats.get("sim_top1"),
-                    "generator_strategy": "llm" if use_llm else "retrieval_only",
+                    "generator_strategy": generator_strategy_name,
                     "generator_status": generator_status,
                     "generator_meta": generator_meta,
                     "max_bullets": int(max_bullets),
                     "bullet_policy": bullets_meta,  # berisi methods_detected, anaphora, multi_target, dll
                     "error": generator_error,
+                    "self_query": _self_query_log,   # ← V3.0b
                 }
                 rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
@@ -1942,7 +2199,7 @@ def main() -> None:
                 st.session_state["last_retrieval_mode"] = retrieval_mode 
                 st.session_state["_scroll_answer"] = True
                 st.session_state["last_user_query"] = query
-                st.session_state["last_retrieval_query"] = retrieval_query
+                st.session_state["last_retrieval_query"] = effective_retrieval_query
 
                 # tandai bahwa konfigurasi UI saat ini sudah dipakai untuk hasil terakhir
                 st.session_state["last_applied_ui_cfg"] = current_ui_cfg.copy()
@@ -1956,11 +2213,12 @@ def main() -> None:
                     "nodes": nodes,
                     "answer_raw": answer_raw,
                     "user_query": query,
-                    "retrieval_query": retrieval_query,
+                    "retrieval_query": effective_retrieval_query,
                     "strategy": strategy,
                     "history_used": history_used,
-                    "contextualized": bool(retrieval_query != query),
+                    "contextualized": bool(retrieval_query_before_self_query != query),
                     "retrieval_mode": retrieval_mode,
+                    "self_query_filter_applied": bool(_self_query_filter is not None),  # ← V3.0b
                 }
 
             _proc_status.update(label="💡 Finished!", state="complete", expanded=False)
