@@ -33,7 +33,7 @@ retrieval:
   # V3.0a: default query ke collection narasi
   # sitasi diquery hanya untuk intent referensi/citation (V3.0b akan perkuat ini)
   default_collection: "narasi"
-  mode: "hybrid"
+  mode: "dense"
 
 bm25:
   use_sastrawi: true

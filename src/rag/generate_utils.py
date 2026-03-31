@@ -816,6 +816,67 @@ def _extract_steps_from_text(text: str, max_items: int = 5) -> List[str]:
     return []
 
 
+def _candidate_ctx_indices_for_method_steps(
+    method: str,
+    contexts: List[str],
+    used_ctx: int,
+    *,
+    max_candidates: int = 3,
+) -> List[int]:
+    """
+    Ambil beberapa CTX kandidat untuk satu metode.
+    Prioritas:
+    1) method-hit + steps-signal
+    2) method-hit saja
+    """
+    pats = _METHOD_MATCH_PATTERNS.get(method, [])
+    if not pats:
+        return []
+
+    ranked: List[Tuple[int, int]] = []
+    for i, c in enumerate((contexts or [])[:used_ctx], start=1):
+        cc = c or ""
+        if not any(re.search(p, cc, flags=re.IGNORECASE) for p in pats):
+            continue
+
+        priority = 0 if _has_steps_signal_local(cc) else 1
+        ranked.append((priority, i))
+
+    ranked.sort(key=lambda x: (x[0], x[1]))
+    return [idx for _, idx in ranked[: max(1, int(max_candidates))]]
+
+
+def _extract_steps_from_ctx_candidates(
+    contexts: List[str],
+    ctx_indices: List[int],
+    *,
+    max_items: int = 6,
+) -> List[str]:
+    """
+    Gabungkan tahapan unik dari beberapa CTX kandidat.
+    Tetap konservatif: hanya memakai hasil _extract_steps_from_text().
+    """
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    for idx in ctx_indices or []:
+        if not (1 <= idx <= len(contexts)):
+            continue
+
+        items = _extract_steps_from_text(contexts[idx - 1] or "", max_items=max_items)
+        for item in items:
+            norm = re.sub(r"\s+", " ", (item or "").strip()).lower()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            merged.append(item.strip())
+
+            if len(merged) >= int(max_items):
+                return merged
+
+    return merged
+
+
 def _find_best_ctx_for_method_steps(
     method: str, contexts: List[str], used_ctx: int
 ) -> Optional[int]:
@@ -823,27 +884,28 @@ def _find_best_ctx_for_method_steps(
     Pilih CTX terbaik untuk tahapan metode:
     prefer: (metode match) + (ada sinyal tahapan).
     """
-    pats = _METHOD_MATCH_PATTERNS.get(method, [])
-    if not pats:
-        return None
+    candidates = _candidate_ctx_indices_for_method_steps(
+        method,
+        contexts,
+        used_ctx,
+        max_candidates=1,
+    )
+    return candidates[0] if candidates else None
 
-    # pass-1: method hit + steps signal
-    for i, c in enumerate((contexts or [])[:used_ctx], start=1):
-        cc = c or ""
-        if any(re.search(p, cc, flags=re.IGNORECASE) for p in pats) and _has_steps_signal_local(cc):
-            return i
 
-    # pass-2: method hit saja
-    for i, c in enumerate((contexts or [])[:used_ctx], start=1):
-        cc = c or ""
-        if any(re.search(p, cc, flags=re.IGNORECASE) for p in pats):
-            return i
-
-    return None
+def _partial_steps_note(*, is_comparison: bool = False) -> str:
+    base = (
+        "Konteks final mengonfirmasi metode ini dibahas, tetapi daftar tahapan eksplisitnya "
+        "tidak tampil pada potongan yang tersedia."
+    )
+    if is_comparison:
+        return base + " Perbedaannya dengan metode lain hanya bisa dijelaskan secara parsial."
+    return base
 
 
 def _deterministic_steps_answer(
     *,
+    question: str,
     targets: List[str],
     contexts: List[str],
     used_ctx: int,
@@ -864,23 +926,40 @@ def _deterministic_steps_answer(
     jaw_lines: List[str] = ["Jawaban:"]
     bukti_lines: List[str] = []
 
+    is_comparison = bool(
+        re.search(r"\b(perbedaan|beda|bandingkan|dibandingkan|versus|vs)\b", (question or "").lower())
+    )
+
     for m in targets:
         lab = _nice_method(m)
-        idx = _find_best_ctx_for_method_steps(m, contexts, used_ctx)
+        ctx_candidates = _candidate_ctx_indices_for_method_steps(
+            m, contexts, used_ctx, max_candidates=3
+        )
+        idx = ctx_candidates[0] if ctx_candidates else None
+
         if not idx:
             jaw_lines.append(f"{lab}: Tidak ditemukan pada dokumen.")
             continue
 
-        raw = contexts[idx - 1] or ""
-        steps = _extract_steps_from_text(raw, max_items=max_items_per_method)
+        steps = _extract_steps_from_ctx_candidates(
+            contexts,
+            ctx_candidates,
+            max_items=max_items_per_method,
+        )
 
         if len(steps) >= 2:
             joined = "; ".join(steps[:max_items_per_method])
             jaw_lines.append(f"{lab}: {joined} [CTX {idx}]")
-            bukti_lines.append(f"- ({lab}) {joined} [CTX {idx}]")
+            bukti_lines.append(f"- ({lab}) Tahapan yang disebutkan: {joined} [CTX {idx}]")
         else:
-            # ada metode, tapi tidak ada tahapan eksplisit yang bisa diekstrak secara aman
-            jaw_lines.append(f"{lab}: Tidak ditemukan pada dokumen.")
+            note = (
+                "Konteks final mengonfirmasi metode ini, tetapi daftar tahapan eksplisitnya tidak tampil "
+                "pada potongan yang tersedia."
+            )
+            if is_comparison:
+                note += " Perbedaannya dengan metode lain hanya bisa dijelaskan secara parsial."
+            jaw_lines.append(f"{lab}: {note}")
+            bukti_lines.append(f"- ({lab}) {note} [CTX {idx}]")
 
     # cap bukti
     bukti_lines = bukti_lines[:max_bullets]
@@ -908,7 +987,6 @@ def _structured_steps_answer_llm(
         (a) tidak sama persis dengan Jawaban
         (b) ada bukti per metode yang memang punya dukungan
     """
-
     if used_ctx <= 0 or not contexts or len(targets) < 2:
         return ""
 
@@ -918,11 +996,18 @@ def _structured_steps_answer_llm(
     ql = (question or "").lower()
     wants_explain = bool(re.search(r"\b(jelaskan|uraikan|paparkan)\b", ql))
 
+    is_comparison = bool(
+        re.search(r"\b(perbedaan|beda|bandingkan|dibandingkan|versus|vs)\b", ql)
+    )
+
     # -------- 1) Ekstrak fakta aman per metode --------
     facts: List[Dict[str, Any]] = []
     for m in targets:
         lab = _nice_method(m)
-        idx = _find_best_ctx_for_method_steps(m, contexts, used_ctx)
+        ctx_candidates = _candidate_ctx_indices_for_method_steps(
+            m, contexts, used_ctx, max_candidates=3
+        )
+        idx = ctx_candidates[0] if ctx_candidates else None
 
         if not idx:
             facts.append(
@@ -930,10 +1015,11 @@ def _structured_steps_answer_llm(
             )
             continue
 
-        raw = contexts[idx - 1] or ""
-        raw2 = _strip_doc_header_line(raw)
-
-        steps = _extract_steps_from_text(raw2, max_items=6)
+        steps = _extract_steps_from_ctx_candidates(
+            contexts,
+            ctx_candidates,
+            max_items=6,
+        )
 
         if len(steps) >= 2:
             facts.append({"method": lab, "ctx": idx, "steps": steps[:6], "note": ""})
@@ -944,7 +1030,7 @@ def _structured_steps_answer_llm(
                     "method": lab,
                     "ctx": idx,
                     "steps": [],
-                    "note": "Potongan konteks menyebut metode ini, tetapi tidak menampilkan urutan tahapannya secara eksplisit.",
+                    "note": _partial_steps_note(is_comparison=is_comparison),
                 }
             )
 
@@ -1006,7 +1092,11 @@ def _structured_steps_answer_llm(
                 "   (dst, tiap item di baris baru)\n"
                 "   [CTX n]\n"
                 "   (kosongkan 1 baris antar metode)\n"
-                "4) Jika sebuah metode TIDAK punya daftar tahapan dan hanya ada CATATAN, tulis:\n"
+                "4) Jika sebuah metode tidak punya daftar tahapan eksplisit tetapi masih punya CTX pendukung,\n"
+                "   tulis secara jujur bahwa metode tersebut terkonfirmasi dibahas, namun daftar tahap eksplisit\n"
+                "   tidak tampil pada potongan konteks yang tersedia.\n"
+                "   Jangan mengganti kondisi ini menjadi 'Tidak ditemukan pada dokumen.' bila CTX pendukung ada.\n"
+                "   Format:\n"
                 "   <METODE>:\n"
                 "   <bridging singkat> + <CATATAN>\n"
                 "   [CTX n] (jika CTX ada) atau tanpa sitasi jika CTX '-'\n"
@@ -1277,8 +1367,18 @@ def _humanize_multimethod_steps_answer(
         content = " ".join([inline] + extra).strip()
         content_low = content.lower()
 
+        has_partial_note = bool(
+            "daftar tahapan eksplisit" in content_low
+            or "konteks final mengonfirmasi metode ini" in content_low
+            or "perbedaannya dengan metode lain hanya bisa dijelaskan secara parsial" in content_low
+        )
+
         # not-found tetap
-        if (not content) or ("tidak ditemukan pada dokumen" in content_low):
+        if not content:
+            rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
+            continue
+
+        if "tidak ditemukan pada dokumen" in content_low:
             rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
             continue
 
@@ -1293,7 +1393,10 @@ def _humanize_multimethod_steps_answer(
                         r"\b(planning|design|coding|testing|implementasi|pengujian)\b", content_low
                     )
                 ):
-                    rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
+                    if has_partial_note:
+                        rebuilt.append(f"{lab}: {content.strip()}")
+                    else:
+                        rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
                     continue
 
         # bersihkan CTX dari konten (untuk formatting)
@@ -1303,7 +1406,10 @@ def _humanize_multimethod_steps_answer(
         steps = _steps_from_content(content_no_ctx, ctx_primary)
 
         if len(steps) < 2:
-            rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
+            if has_partial_note:
+                rebuilt.append(f"{lab}: {content.strip()}")
+            else:
+                rebuilt.append(f"{lab}: Tidak ditemukan pada dokumen.")
             continue
 
         # bangun section yang lebih manusiawi
@@ -2552,25 +2658,32 @@ def _extractive_fallback_from_contexts(
         bukti_lines: List[str] = []
 
         for m in ts:
-            idx = _best_ctx_for_method(m)
             lab = _nice_method(m)
+            ctx_candidates = _candidate_ctx_indices_for_method_steps(
+                m, contexts, used_ctx, max_candidates=3
+            )
+            idx = ctx_candidates[0] if ctx_candidates else None
 
             if not idx:
                 jawaban_lines.append(f"{lab}: Tidak ditemukan pada dokumen.")
                 continue
 
-            raw = _strip_doc_header(contexts[idx - 1])
-            raw_flat = " ".join(raw.split()).strip()
-            sn = raw_flat[:260] + ("..." if len(raw_flat) > 260 else "")
+            steps = _extract_steps_from_ctx_candidates(
+                contexts,
+                ctx_candidates,
+                max_items=6,
+            )
 
-            # Jawaban per-metode tetap harus ada sitasi karena memuat klaim
-            jawaban_lines.append(f"{lab}: {sn} [CTX {idx}]")
-
-            # Bukti per-metode (cap total di akhir)
-            if sn:
-                bukti_lines.append(
-                    f"- ({lab}) {sn[:240]}{'...' if len(sn) > 240 else ''} [CTX {idx}]"
-                )
+            if len(steps) >= 2:
+                joined = "; ".join(steps[:6])
+                # Jawaban per-metode tetap harus ada sitasi karena memuat klaim
+                jawaban_lines.append(f"{lab}: {joined} [CTX {idx}]")
+                # Bukti per-metode (cap total di akhir)
+                bukti_lines.append(f"- ({lab}) Tahapan yang disebutkan: {joined} [CTX {idx}]")
+            else:
+                note = _partial_steps_note(is_comparison=False)
+                jawaban_lines.append(f"{lab}: {note}")
+                bukti_lines.append(f"- ({lab}) {note} [CTX {idx}]")
 
         # cap bukti total
         bukti_lines = bukti_lines[:max_total_bullets]
@@ -2679,28 +2792,29 @@ def generate_answer(
     # ===== Stabilizer: deterministic untuk pertanyaan METODE =====
     # Supaya pertanyaan seperti "metode pengembangan apa yang digunakan?"
     # tidak jatuh ke jawaban template "Informasi relevan ditemukan..."
+    # Semua jalur harus tetap melewati repair/humanize/final cleanup bersama.
+    out = ""
+
     det_on = _get_cfg(cfg, ["generation", "deterministic_method_answer"], True)
     if bool(det_on) and used_ctx > 0 and q_intent == "METODE":
         det = _deterministic_method_answer(
             question=question,
-            targets=det_targets,  # <-- pakai fallback
+            targets=det_targets,
             contexts=contexts,
             used_ctx=used_ctx,
             max_bullets=max_bullets,
         )
         if det:
-            # cleanup sebelum early return
-            det = _fix_empty_numbered_lines(det)
-            det = _strip_ctx_from_jawaban(det)
-            return det
+            out = det
 
     # ===== Stabilizer: deterministic untuk pertanyaan TAHAP + multi-metode =====
     det_steps_on = _get_cfg(cfg, ["generation", "deterministic_steps_answer"], False)
 
-    if used_ctx > 0 and q_intent == "TAHAP" and len(targets) >= 2:
+    if (not out) and used_ctx > 0 and q_intent == "TAHAP" and len(targets) >= 2:
         # (A) Jikalau user sengaja mengaktifkan mode deterministik (pure extractive)
         if bool(det_steps_on):
             dets = _deterministic_steps_answer(
+                question=question,
                 targets=targets,
                 contexts=contexts,
                 used_ctx=used_ctx,
@@ -2708,25 +2822,21 @@ def generate_answer(
                 max_items_per_method=5,
             )
             if dets:
-                # cleanup sebelum early return
-                dets = _fix_empty_numbered_lines(dets)
-                dets = _strip_ctx_from_jawaban(dets)
-                return dets
+                out = dets
 
-        # (B) Default (dan rekomendasi): structured steps + LLM polish (tanpa konteks mentah)
-        structured = _structured_steps_answer_llm(
-            llm=llm,
-            question=question,
-            targets=targets,
-            contexts=contexts,
-            used_ctx=used_ctx,
-            max_bullets=max_bullets,
-        )
-        if structured:
-            # cleanup sebelum early return
-            structured = _fix_empty_numbered_lines(structured)
-            structured = _strip_ctx_from_jawaban(structured)
-            return structured
+        if not out:
+            # (B) Default (dan rekomendasi): structured steps + LLM polish (tanpa konteks mentah)
+            structured = _structured_steps_answer_llm(
+                llm=llm,
+                question=question,
+                targets=targets,
+                contexts=contexts,
+                used_ctx=used_ctx,
+                max_bullets=max_bullets,
+            )
+            if structured:
+                # cleanup sebelum early return
+                out = structured
 
     targets_str = ", ".join([_nice_method(m) for m in targets]) if targets else "-"
     missing = [m for m in (missing_methods or []) if m]
@@ -2779,7 +2889,9 @@ def generate_answer(
             "\nKhusus TAHAPAN/LANGKAH:\n"
             "- Yang dimaksud tahapan adalah urutan langkah/fase (mis. planning, design, coding, testing, implementasi, pengujian, dsb) yang dinyatakan eksplisit di CTX.\n"
             "- JANGAN menganggap kelebihan/karakteristik metode (mis. 'waktu singkat', 'adaptasi cepat', 'incremental') sebagai tahapan.\n"
-            "- Jika CTX hanya berisi deskripsi umum/kelebihan tanpa daftar/urutan tahapan, tulis untuk metode tersebut: '<METODE>: Tidak ditemukan pada dokumen.'\n"
+            "- Jika CTX hanya mengonfirmasi metode atau menjelaskan karakteristik umum tanpa daftar/urutan tahapan yang eksplisit,\n"
+            "- jangan mengarang langkah. Tulis secara jujur bahwa daftar tahapan eksplisit tidak tampil pada potongan konteks yang tersedia.\n"
+            "- Gunakan 'Tidak ditemukan pada dokumen.' hanya jika memang tidak ada dukungan konteks untuk metode tersebut.\n"
         )
 
     prompt = ChatPromptTemplate.from_messages(
@@ -2832,14 +2944,15 @@ def generate_answer(
         ]
     )
 
-    chain = prompt | llm | StrOutputParser()
-    out = chain.invoke(
-        {
-            "intent": q_intent,
-            "question": (question or "").strip(),
-            "context": ctx_block,
-        }
-    ).strip()
+    if not out:
+        chain = prompt | llm | StrOutputParser()
+        out = chain.invoke(
+            {
+                "intent": q_intent,
+                "question": (question or "").strip(),
+                "context": ctx_block,
+            }
+        ).strip()
 
     # ======= Normalisasi awal =======
     # 0) bersihkan kemungkinan preamble "Pertanyaan:"

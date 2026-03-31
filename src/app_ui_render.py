@@ -14,7 +14,9 @@ Diimpor oleh app_streamlit.py:
         render_answer_card_header, render_bukti_section,
         render_ctx_mapping_header, render_sources_header,
         render_pdf_viewer_header, render_viewing_banner,
-        sim_color_badge, render_ctx_mapping_table, render_source_score_pills,
+        sim_color_badge, render_ctx_mapping_table,
+        render_source_score_pills, render_hybrid_source_score_pills,
+        render_rerank_summary_box, build_ctx_rows, render_rerank_before_after_panel,
     )
 
 Tidak mengimpor dari app_streamlit.py (mencegah circular import).
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import html
 import re
+import textwrap
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -619,6 +622,82 @@ _SIM_MED  = 0.55    # >= MED   → kuning / sedang
                     # <  MED   → merah  / rendah
 
 
+# =========================
+# Rerank visual helpers (V3.0c)
+# =========================
+# CATATAN PENTING:
+# score dari Cross-Encoder (BAAI/bge-reranker-base) adalah raw relevance score / logit,
+# BUKAN probabilitas terkalibrasi. Karena itu:
+# - rerank_rank adalah sinyal yang paling dapat dipercaya untuk UI
+# - threshold rerank_score di bawah ini bersifat HEURISTIC / UI-ONLY,
+#   bukan threshold ilmiah atau threshold keputusan sistem.
+_RERANK_HIGH = 1.5      # kuat
+_RERANK_MED  = 0.5      # sedang
+                        # < 0.5 -> rendah/weak (ditampilkan muted, bukan "salah")
+
+
+def _rerank_score_hex(score: float) -> str:
+    """Return warna untuk rerank_score (UI-only heuristic)."""
+    if score >= _RERANK_HIGH:
+        return "#4ade80"   # green-400
+    if score >= _RERANK_MED:
+        return "#facc15"   # yellow-400
+    return "#94a3b8"       # slate-400 (muted, sengaja bukan merah)
+
+
+def _rerank_score_label(score: float) -> str:
+    """Return label teks untuk rerank_score (UI-only heuristic)."""
+    if score >= _RERANK_HIGH:
+        return "Kuat"
+    if score >= _RERANK_MED:
+        return "Sedang"
+    return "Lemah"
+
+
+def _rerank_rank_hex(rank: int) -> str:
+    """
+    Return warna untuk rerank_rank.
+    Rank lebih bermakna daripada raw rerank_score.
+    """
+    if rank == 1:
+        return "#4ade80" 
+    if rank == 2:
+        return "#facc15" 
+    if rank == 3:
+        return "#a78bfa" 
+    return "#94a3b8" 
+
+
+def _style_rerank_score(val: Any) -> str:
+    """
+    CSS inline untuk kolom rerank_score.
+    Heuristic UI-only: high/med/muted.
+    """
+    if val is None or (isinstance(val, float) and val != val):
+        return ""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return ""
+    color = _rerank_score_hex(v)
+    return f"color: {color}; font-weight: 700"
+
+
+def _style_rerank_rank(val: Any) -> str:
+    """
+    CSS inline untuk kolom rerank_rank.
+    Rank adalah indikator paling penting untuk hasil akhir rerank.
+    """
+    if val is None:
+        return ""
+    try:
+        v = int(val)
+    except (TypeError, ValueError):
+        return ""
+    color = _rerank_rank_hex(v)
+    return f"color: {color}; font-weight: 800"
+
+
 def sim_color_badge(sim: float) -> str:
     """
     Return emoji badge berdasarkan nilai similarity.
@@ -654,17 +733,211 @@ def _sim_label(sim: float) -> str:
     return "Rendah"
 
 
+# =========================
+# Legend HTML helpers (UI polish V3.0c)
+# =========================
+
+def _legend_token(label: str, color: str) -> str:
+    """
+    Token kecil berwarna untuk nama field/kolom pada legend.
+    Dipakai agar header seperti score_dense / score_sparse / rank_dense
+    lebih mudah dipindai user.
+    """
+    return (
+        f"<span style='color:{color};font-weight:500;"
+        f"font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'>"
+        f"{html.escape(label)}</span>"
+    )
+
+
+def _legend_divider() -> str:
+    """Divider konsisten untuk fragmen legend."""
+    return "<span style='color:#475569;font-weight:700;'>&nbsp;|&nbsp;</span>"
+
+
+def _legend_metric_note_html(*, hybrid: bool) -> str:
+    """
+    Legend penjelasan metric retrieval.
+    - hybrid: score_rrf / score_dense / score_sparse / rank_*
+    - dense : sim / dist
+    """
+    base_style = (
+        "margin-left:0.5rem;color:#475569;"
+        "border-left:1px solid #334155;padding-left:0.5rem;"
+    )
+
+    if hybrid:
+        return (
+            f"<span style='{base_style}'>"
+            f"<span style='white-space:nowrap;'>"
+            f"{_legend_token('score_dense', '#60a5fa')} = "
+            f"<span style='color:#cbd5e1;'>Chroma dist ↓</span>"
+            f"</span>"
+            f"{_legend_divider()}"
+            f"<span style='white-space:nowrap;'>"
+            f"{_legend_token('score_sparse', '#fb923c')} = "
+            f"<span style='color:#cbd5e1;'>BM25 ↑</span>"
+            f"</span>"
+            f"{_legend_divider()}"
+            f"<span style='white-space:nowrap;'>"
+            f"{_legend_token('rank_dense', '#e2e8f0')}"
+            f"<span style='color:#475569;'>&nbsp;/&nbsp;</span>"
+            f"{_legend_token('rank_sparse', '#e2e8f0')} = "
+            f"<span style='color:#cbd5e1;'>posisi di masing-masing retriever</span>"
+            f"</span>"
+            f"</span>"
+        )
+
+    return (
+        f"<span style='{base_style}'>"
+        f"<span style='white-space:nowrap;'>"
+        f"{_legend_token('sim', '#93c5fd')} = "
+        f"<span style='color:#cbd5e1;'>semantic similarity ↑</span>"
+        f"</span>"
+        f"{_legend_divider()}"
+        f"<span style='white-space:nowrap;'>"
+        f"{_legend_token('dist', '#e2e8f0')} = "
+        f"<span style='color:#cbd5e1;'>Chroma dist ↓</span>"
+        f"</span>"
+        f"</span>"
+    )
+
+
+def _legend_stream_note_html() -> str:
+    """
+    Legend stream/bab_label yang sedikit lebih kaya warna
+    agar lebih mudah dibaca user.
+    """
+    base_style = (
+        "margin-left:0.5rem;color:#475569;"
+        "border-left:1px solid #334155;padding-left:0.5rem;"
+    )
+
+    return (
+        f"<span style='{base_style}'>"
+        f"{_legend_token('stream', '#a855f7')}: "
+        f"{_legend_token('narasi', '#c084fc')} = "
+        f"<span style='color:#94a3b8;'>Konten inti dokumen (BAB I–V)</span>"
+        f"<span style='color:#334155;'>&nbsp;·&nbsp;</span>"
+        f"{_legend_token('sitasi', '#e879f9')} = "
+        f"<span style='color:#94a3b8;'>Daftar Pustaka / Referensi</span>"
+        f"{_legend_divider()}"
+        f"{_legend_token('bab_label', '#8b5cf6')} = "
+        f"<span style='color:#94a3b8;'>Posisi bab asal chunk "
+        f"(mis. BAB_II = Tinjauan Pustaka, BAB_III = Metode Penelitian)</span>"
+        f"</span>"
+    )
+
+
+def _node_has_rerank_ui_signal(n: Any) -> bool:
+    """
+    True jika node membawa sinyal rerank yang memang layak dirender di UI:
+    - rerank_rank ada
+    - atau rerank_score ada
+    - atau node adalah reserved anchor
+    """
+    return bool(
+        getattr(n, "rerank_rank", None) is not None
+        or getattr(n, "rerank_score", None) is not None
+        or getattr(n, "is_reserved_anchor", False)
+    )
+
+
+def build_ctx_rows(
+    nodes: List[Any],
+    retrieval_mode: str,
+    *,
+    include_rerank: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Bangun row CTX Mapping dari nodes.
+    Dipakai oleh:
+    - main CTX table
+    - before-vs-after rerank panel
+    """
+    rows: List[Dict[str, Any]] = []
+
+    effective_include_rerank = bool(include_rerank) and any(
+        _node_has_rerank_ui_signal(n) for n in (nodes or [])
+    )
+
+    for i, n in enumerate(nodes, start=1):
+        md = getattr(n, "metadata", {}) or {}
+        source_file = md.get("source_file", "")
+        page = md.get("page", "?")
+
+        row: Dict[str, Any] = {
+            "CTX": f"CTX {i}",
+            "stream": getattr(n, "stream", None) or "—",
+            "bab_label": getattr(n, "bab_label", None) or "—",
+            "doc_id": getattr(n, "doc_id", ""),
+            "page": page,
+            "source_file": source_file,
+            "chunk_id": getattr(n, "chunk_id", ""),
+        }
+
+        if retrieval_mode == "hybrid":
+            row["score_rrf"] = round(float(getattr(n, "score", 0.0)), 6)
+            row["score_dense"] = (
+                round(float(getattr(n, "score_dense", 0.0)), 4)
+                if getattr(n, "score_dense", None) is not None
+                else None
+            )
+            row["score_sparse"] = (
+                round(float(getattr(n, "score_sparse", 0.0)), 4)
+                if getattr(n, "score_sparse", None) is not None
+                else None
+            )
+            row["rank_dense"] = getattr(n, "rank_dense", None)
+            row["rank_sparse"] = getattr(n, "rank_sparse", None)
+        else:
+            dist = float(getattr(n, "score", 0.0))
+            row["sim"] = round(dist_to_sim(dist), 4)
+            row["dist"] = round(dist, 4)
+
+        if effective_include_rerank:
+            row["rerank_score"] = (
+                round(float(getattr(n, "rerank_score", 0.0)), 4)
+                if getattr(n, "rerank_score", None) is not None
+                else None
+            )
+            row["rerank_rank"] = getattr(n, "rerank_rank", None)
+
+        if effective_include_rerank:
+            row["is_reserved_anchor"] = bool(getattr(n, "is_reserved_anchor", False))
+            row["reserved_for_method"] = getattr(n, "reserved_for_method", None)
+
+            if row["is_reserved_anchor"]:
+                row["anchor_reserve"] = f"anchor:{row['reserved_for_method']}"
+            else:
+                row["anchor_reserve"] = None
+
+        rows.append(row)
+
+    return rows
+
+
 def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
     """
-    Render CTX Mapping sebagai st.dataframe() native dengan kolom `sim` color-coded.
+    Render CTX Mapping sebagai st.dataframe() native dengan kolom retrieval + rerank.
     Mode-aware: deteksi schema hybrid vs dense dari keys ctx_rows.
 
-    Dense schema  — kolom: CTX | doc_id | page | source_file | sim ↑ | dist ↓ | chunk_id
-                    styling: warna pada kolom `sim`.
+    Dense schema  — kolom: CTX | doc_id | page | source_file | sim ↑ | dist ↓ |
+                    rerank_score | rerank_rank | chunk_id
+                    styling utama:
+                    - `sim` untuk kualitas dense
+                    - `rerank_score` dan `rerank_rank` jika reranker aktif
 
     Hybrid schema — kolom: CTX | doc_id | page | source_file | score_rrf ↑ |
-                            score_dense ↓ | score_sparse ↑ | rank_dense | rank_sparse | chunk_id
-                    styling: warna pada kolom `score_rrf` (lebih tinggi = lebih relevan).
+                    score_dense ↓ | score_sparse ↑ | rank_dense | rank_sparse |
+                    rerank_score | rerank_rank | chunk_id
+                    styling utama:
+                    - `score_rrf` untuk retrieval hybrid
+                    - `rerank_score` dan `rerank_rank` jika reranker aktif
+
+    Catatan penting:
+    - rerank_rank adalah indikator yang paling bermakna untuk urutan final hasil reranking
+    - rerank_score ditampilkan dengan threshold heuristic UI-only (tidak terkalibrasi ilmiah)
 
     Threshold warna kolom `sim`:
         >= 0.70 → #4ade80  (hijau  / tinggi)
@@ -684,6 +957,12 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
 
     df = pd.DataFrame(ctx_rows)
 
+    has_rerank_signal = False
+    for col in ("rerank_rank", "rerank_score", "anchor_reserve"):
+        if col in df.columns and df[col].notna().any():
+            has_rerank_signal = True
+            break
+
     # ── Deteksi schema dari kolom yang tersedia ──
     is_hybrid = "score_rrf" in df.columns
 
@@ -694,12 +973,15 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
             "doc_id", "page", "source_file",
             "score_rrf", "score_dense", "score_sparse",
             "rank_dense", "rank_sparse",
+            # ← V3.0c
+            "rerank_score", "rerank_rank",
+            "anchor_reserve",
             "chunk_id",
         ]
         df = df[[c for c in col_order if c in df.columns]]
 
         # ── cast rank ke nullable Int64 agar tampil 1/2/3 bukan 1.000000/None ──
-        for rank_col in ["rank_dense", "rank_sparse"]:
+        for rank_col in ["rank_dense", "rank_sparse", "rerank_rank"]:
             if rank_col in df.columns:
                 df[rank_col] = df[rank_col].astype(pd.Int64Dtype())
 
@@ -720,35 +1002,74 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
                 return "color: #facc15; font-weight: bold" 
             return "color: #f87171; font-weight: bold"
 
+        styled = df.style
         try:
-            styled = df.style.map(_style_rrf, subset=["score_rrf"])  # type: ignore[arg-type]
+            styled = styled.map(_style_rrf, subset=["score_rrf"])  # type: ignore[arg-type]
+            if has_rerank_signal and "rerank_score" in df.columns:
+                styled = styled.map(_style_rerank_score, subset=["rerank_score"])  # type: ignore[arg-type]
+            if has_rerank_signal and "rerank_rank" in df.columns:
+                styled = styled.map(_style_rerank_rank, subset=["rerank_rank"])  # type: ignore[arg-type]
         except AttributeError:
             styled = df.style.applymap(_style_rrf, subset=["score_rrf"])  # type: ignore[attr-defined]
+            if has_rerank_signal and "rerank_score" in df.columns:
+                styled = styled.applymap(_style_rerank_score, subset=["rerank_score"])  # type: ignore[attr-defined]
+            if has_rerank_signal and "rerank_rank" in df.columns:
+                styled = styled.applymap(_style_rerank_rank, subset=["rerank_rank"])  # type: ignore[attr-defined]
 
         st.dataframe(styled, width="stretch", hide_index=True)
 
         # Legend hybrid threshold (di bawah tabel, ukuran kecil muted)
+        _rerank_legend_html = ""
+        if has_rerank_signal:
+            _rerank_legend_html = (
+                "<span style='margin-left:0.5rem;color:#475569;border-left:1px solid #334155;padding-left:0.5rem;'>"
+                "<b style='color:#4ade80;'>rerank_rank</b>: "
+                "<b style='color:#4ade80;'>#1 = terbaik</b> &nbsp;·&nbsp; "
+                "<b style='color:#facc15;'>#2</b> &nbsp;·&nbsp; "
+                "<b style='color:#a78bfa;'>#3</b>"
+                "</span>"
+                "<span style='color:#475569;'>"
+                "<b style='color:#93c5fd;'>rerank_score</b> = heuristic UI-only "
+                "(raw Cross-Encoder score, tidak terkalibrasi)"
+                "</span>"
+            )
+
+        _metric_legend_html = _legend_metric_note_html(hybrid=True)
+        _stream_legend_html = _legend_stream_note_html()
+
+        _rrf_threshold_html = (
+            "<span style='white-space:nowrap;'>"
+            "🟢 "
+            f"{_legend_token('score_rrf', '#34d399')} "
+            "<span style='color:#cbd5e1;'>&ge;</span> "
+            "<b style='color:#4ade80;'>0.025</b> "
+            "<span style='color:#cbd5e1;'>(Tinggi)</span>"
+            "</span>"
+
+            "<span style='white-space:nowrap;'>"
+            "🟡 "
+            f"{_legend_token('score_rrf', '#facc15')} "
+            "<span style='color:#cbd5e1;'>&ge;</span> "
+            "<b style='color:#facc15;'>0.015</b> "
+            "<span style='color:#cbd5e1;'>(Sedang)</span>"
+            "</span>"
+
+            "<span style='white-space:nowrap;'>"
+            "🔴 "
+            f"{_legend_token('score_rrf', '#f87171')} "
+            "<span style='color:#cbd5e1;'>&lt;</span> "
+            "<b style='color:#f87171;'>0.015</b> "
+            "<span style='color:#cbd5e1;'>(Rendah)</span>"
+            "</span>"
+        )
+
         st.markdown(
             '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;'
-            'flex-wrap:wrap;font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
-            "<span>🟢 score_rrf &ge; 0.025 &nbsp;(Tinggi)</span>"
-            "<span>🟡 score_rrf &ge; 0.015 &nbsp;(Sedang)</span>"
-            "<span>🔴 score_rrf &lt; 0.015 &nbsp;(Rendah)</span>"
-            "<span style='margin-left:0.6rem;color:#475569;'>"
-            "score_dense = Chroma dist ↓&nbsp;|&nbsp;"
-            "score_sparse = BM25 ↑&nbsp;|&nbsp;"
-            "rank = posisi di masing-masing retriever"
-            "</span>"
-            "<span style='margin-left:0.6rem;color:#475569;"
-            "border-left:1px solid #334155;padding-left:0.6rem;'>"
-            "<b style='color:#a855f7;'>stream</b>: "
-            "<b style='color:#a855f7;'>narasi</b> = Konten inti dokumen (BAB I–V)"
-            "&nbsp;·&nbsp;"
-            "<b style='color:#a855f7;'>sitasi</b> = Daftar Pustaka / Referensi"
-            "&nbsp;|&nbsp;"
-            "<b style='color:#a855f7;'>bab_label</b> = Posisi bab asal chunk "
-            "(mis. BAB_II = Tinjauan Pustaka, BAB_III = Metode Penelitian)"
-            "</span>"
+            'flex-wrap:wrap;font-size:0.71rem;color:#64748b;padding-left:0.1rem;">'
+            f"{_rrf_threshold_html}"
+            f"{_metric_legend_html}"
+            f"{_rerank_legend_html}"
+            f"{_stream_legend_html}"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -758,9 +1079,16 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
         col_order = [
             "CTX", "stream", "bab_label",     # (V3.0a; auto-skip jika tidak ada)
             "doc_id", "page", "source_file",
-            "sim", "dist", "chunk_id",
+            "sim", "dist",
+            # ← V3.0c
+            "rerank_score", "rerank_rank",
+            "anchor_reserve",
+            "chunk_id",
         ]
         df = df[[c for c in col_order if c in df.columns]]
+
+        if has_rerank_signal:
+            df["rerank_rank"] = df["rerank_rank"].astype(pd.Int64Dtype())
 
         def _style_sim(val: float) -> str:
             """CSS inline untuk sel kolom 'sim' dengan parameter 'val'."""
@@ -774,30 +1102,51 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
                 return "color: #facc15; font-weight: bold"
             return "color: #f87171; font-weight: bold"
 
+        styled = df.style
         # Pylance-safe: try/except menghindari false-positive
         try:
-            styled = df.style.map(_style_sim, subset=["sim"])  # type: ignore[arg-type]
+            styled = styled.map(_style_sim, subset=["sim"])  # type: ignore[arg-type]
+            if has_rerank_signal and "rerank_score" in df.columns:
+                styled = styled.map(_style_rerank_score, subset=["rerank_score"])  # type: ignore[arg-type]
+            if has_rerank_signal and "rerank_rank" in df.columns:
+                styled = styled.map(_style_rerank_rank, subset=["rerank_rank"])  # type: ignore[arg-type]
         except AttributeError:
             styled = df.style.applymap(_style_sim, subset=["sim"])  # type: ignore[attr-defined]
+            if has_rerank_signal and "rerank_score" in df.columns:
+                styled = styled.applymap(_style_rerank_score, subset=["rerank_score"])  # type: ignore[attr-defined]
+            if has_rerank_signal and "rerank_rank" in df.columns:
+                styled = styled.applymap(_style_rerank_rank, subset=["rerank_rank"])  # type: ignore[attr-defined]
 
         st.dataframe(styled, width="stretch", hide_index=True)
 
         # Legend dense threshold
+        _rerank_legend_html = ""
+        if has_rerank_signal:
+            _rerank_legend_html = (
+                "<span style='margin-left:0.6rem;color:#475569;border-left:1px solid #334155;padding-left:0.6rem;'>"
+                "<b style='color:#4ade80;'>rerank_rank</b>: "
+                "#1 = terbaik &nbsp;·&nbsp; "
+                "<b style='color:#facc15;'>#2</b> &nbsp;·&nbsp; "
+                "<b style='color:#a78bfa;'>#3</b>"
+                "</span>"
+                "<span style='color:#475569;'>"
+                "<b style='color:#93c5fd;'>rerank_score</b> = heuristic UI-only "
+                "(raw Cross-Encoder score, tidak terkalibrasi)"
+                "</span>"
+            )
+
+        _metric_legend_html = _legend_metric_note_html(hybrid=False)
+        _stream_legend_html = _legend_stream_note_html()
+
         st.markdown(
             '<div style="display:flex;gap:1.1rem;margin-top:-0.8rem;margin-bottom:1.4rem;flex-wrap:wrap;'
             'font-size:0.75rem;color:#64748b;padding-left:0.1rem;">'
             "<span>🟢 sim &ge; 0.70 &nbsp;(Tinggi)</span>"
             "<span>🟡 sim &ge; 0.55 &nbsp;(Sedang)</span>"
             "<span>🔴 sim &lt; 0.55 &nbsp;(Rendah)</span>"
-            "<span style='margin-left:0.6rem;color:#475569;"
-            "border-left:1px solid #334155;padding-left:0.6rem;'>"
-            "<b style='color:#a855f7;'>stream</b>: "
-            "<b style='color:#a855f7;'>narasi</b> = Konten inti dokumen (BAB I–V)"
-            "&nbsp;·&nbsp;"
-            "<b style='color:#a855f7;'>sitasi</b> = Daftar Pustaka / Referensi"
-            "&nbsp;|&nbsp;"
-            "<b style='color:#a855f7;'>bab_label</b> = Posisi bab asal chunk"
-            "</span>"
+            f"{_metric_legend_html}"
+            f"{_rerank_legend_html}"
+            f"{_stream_legend_html}"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -806,8 +1155,13 @@ def render_ctx_mapping_table(ctx_rows: List[Dict[str, Any]]) -> None:
 def render_source_score_pills(
     sim: float,
     dist: float,
-    ctx_label: str = "",
-    stream: Optional[str] = None, 
+    *,
+    ctx_label: Optional[str] = None,
+    stream: Optional[str] = None,
+    rerank_score: Optional[float] = None,   # ← V3.0c
+    rerank_rank: Optional[int] = None,      # ← V3.0c
+    is_reserved_anchor: bool = False,
+    reserved_for_method: Optional[str] = None,
 ) -> None:
     """
     Render mini score pills (CTX label + sim + dist) di awal isi Sources expander.
@@ -860,23 +1214,63 @@ def render_source_score_pills(
         f'</span>'
     )
 
+    # Pill rerank opsional (V3.0c)
+    rerank_pill = ""
+    if rerank_rank is not None:
+        rk_color = _rerank_rank_hex(int(rerank_rank))
+        if rerank_score is not None:
+            rs_lbl = _rerank_score_label(float(rerank_score))
+            rerank_pill = (
+                f'<span style="background:#111827;border:1px solid {rk_color}55;'
+                f'color:{rk_color};padding:2px 10px;border-radius:999px;'
+                f'font-size:0.78rem;font-weight:700;font-family:monospace;white-space:nowrap;">'
+                f'⚡&nbsp;rerank #{int(rerank_rank)}'
+                f'<span style="font-size:0.7rem;opacity:0.75;margin-left:5px;">'
+                f'score={float(rerank_score):.4f} ({rs_lbl})'
+                f'</span>'
+                f'</span>'
+            )
+        else:
+            rerank_pill = (
+                f'<span style="background:#111827;border:1px solid {rk_color}55;'
+                f'color:{rk_color};padding:2px 10px;border-radius:999px;'
+                f'font-size:0.78rem;font-weight:700;font-family:monospace;white-space:nowrap;">'
+                f'⚡&nbsp;rerank #{int(rerank_rank)}'
+                f'</span>'
+            )
+
+    anchor_pill = ""
+    if is_reserved_anchor and reserved_for_method:
+        anchor_pill = (
+            '<span style="display:inline-block; padding:0.2rem 0.55rem; '
+            'border-radius:999px; font-size:0.78rem; font-weight:700; '
+            'background:#4c1d95; color:#ddd6fe; border:1px solid #7c3aed55;">'
+            f'🛟 anchor {html.escape(str(reserved_for_method))}'
+            '</span>'
+        )
+
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.45rem;'
         f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
-        f"{ctx_pill}{stream_pill}{sim_pill}{dist_pill}"
+        f"{ctx_pill}{stream_pill}{anchor_pill}{rerank_pill}{sim_pill}{dist_pill}"
         f"</div>",
         unsafe_allow_html=True,
     )
 
 
 def render_hybrid_source_score_pills(
+    *,
     rrf_score: float,
     score_dense: Optional[float],
     score_sparse: Optional[float],
     rank_dense: Optional[int],
     rank_sparse: Optional[int],
-    ctx_label: str = "",
-    stream: Optional[str] = None, 
+    ctx_label: Optional[str] = None,
+    stream: Optional[str] = None,
+    rerank_score: Optional[float] = None,   # ← V3.0c
+    rerank_rank: Optional[int] = None,      # ← V3.0c
+    is_reserved_anchor: bool = False,
+    reserved_for_method: Optional[str] = None,
 ) -> None:
     """
     Render score pills untuk node hasil RRF Hybrid (V2.0).
@@ -1014,8 +1408,54 @@ def render_hybrid_source_score_pills(
         )
     rank_html = "".join(rank_parts)
 
+    # ── Rerank pill (V3.0c) ──
+    rerank_pill = ""
+    if rerank_rank is not None:
+        rk_color = _rerank_rank_hex(int(rerank_rank))
+        if rerank_score is not None:
+            rs_lbl = _rerank_score_label(float(rerank_score))
+            rerank_pill = (
+                f'<span style="background:#111827;border:1px solid {rk_color}55;'
+                f'color:{rk_color};padding:2px 10px;border-radius:999px;'
+                f'font-size:0.78rem;font-weight:700;font-family:monospace;white-space:nowrap;">'
+                f'⚡&nbsp;rerank #{int(rerank_rank)}'
+                f'<span style="font-size:0.7rem;opacity:0.75;margin-left:5px;">'
+                f'score={float(rerank_score):.4f} ({rs_lbl})'
+                f'</span>'
+                f'</span>'
+            )
+        else:
+            rerank_pill = (
+                f'<span style="background:#111827;border:1px solid {rk_color}55;'
+                f'color:{rk_color};padding:2px 10px;border-radius:999px;'
+                f'font-size:0.78rem;font-weight:700;font-family:monospace;white-space:nowrap;">'
+                f'⚡&nbsp;rerank #{int(rerank_rank)}'
+                f'</span>'
+            )
+
+    anchor_pill = ""
+    if is_reserved_anchor and reserved_for_method:
+        anchor_pill = (
+            '<span style="display:inline-block; padding:0.2rem 0.55rem; '
+            'border-radius:999px; font-size:0.78rem; font-weight:700; '
+            'background:#4c1d95; color:#ddd6fe; border:1px solid #7c3aed55;">'
+            f'🛟 anchor {html.escape(str(reserved_for_method))}'
+            '</span>'
+        )
+
     # ── Gabung semua pill dalam satu baris ──
-    pills = " ".join(p for p in [ctx_pill, stream_pill, rrf_pill, dense_pill, sparse_pill, rank_html] if p)
+    pills = " ".join(
+        p for p in [
+            ctx_pill,
+            stream_pill,
+            anchor_pill,
+            rerank_pill,
+            rrf_pill,
+            dense_pill,
+            sparse_pill,
+            rank_html,
+        ] if p
+    )
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.4rem;'
         f'margin:0.25rem 0 0.55rem 0;flex-wrap:wrap;">'
@@ -1049,3 +1489,262 @@ def render_viewing_banner(turn_id: int) -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
+
+def render_rerank_summary_box(
+    *,
+    reranker_applied: bool,
+    candidate_count: Optional[int],
+    top_n: Optional[int],
+    retrieval_stats_pre_rerank: Optional[Dict[str, Any]] = None,
+    generation_context_stats: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Render ringkasan dampak reranking secara deskriptif (bukan evaluatif).
+
+    Tujuan:
+    - Menjelaskan bahwa retrieval menghasilkan candidate pool lebih besar
+    - Menjelaskan bahwa hanya Top-N final yang dikirim ke LLM
+    - Menyediakan before-vs-after stats secara ringkas untuk demo/audit
+
+    Catatan:
+    - Box ini TIDAK mengklaim "lebih baik", hanya menampilkan perubahan pipeline.
+    - Dipanggil setelah processing box, sebelum CTX Mapping / Sources.
+    """
+    if not reranker_applied:
+        return
+
+    cand = int(candidate_count or 0)
+    topn = int(top_n or 0)
+
+    pre = retrieval_stats_pre_rerank or {}
+    post = generation_context_stats or {}
+
+    pre_docs = pre.get("n_docs")
+    post_docs = post.get("n_docs")
+    pre_sim = pre.get("sim_top1")
+    post_sim = post.get("sim_top1")
+    pre_avg = pre.get("sim_avg")
+    post_avg = post.get("sim_avg")
+
+    def _fmt(v: Any) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.4f}"
+        except Exception:
+            return str(v)
+
+    html_block = textwrap.dedent(
+        f"""
+        <div style="
+        background:linear-gradient(90deg, rgba(16,185,129,0.09), rgba(59,130,246,0.05));
+        border:1px solid #1f6f5d;
+        border-left:4px solid #10b981;
+        padding:0.7rem 1rem;
+        border-radius:0.7rem;
+        margin:0.35rem 0 1rem 0;
+        ">
+        <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
+            <span style="font-size:1rem;">⚡</span>
+            <span style="color:#6ee7b7;font-weight:800;font-size:0.95rem;">
+            Cross-Encoder Reranking Applied
+            </span>
+            <span style="background:#0f172a;border:1px solid #10b98155;color:#a7f3d0;
+                        padding:2px 10px;border-radius:999px;font-size:0.76rem;font-weight:700;">
+            Top-{cand} retrieved → Top-{topn} sent to LLM
+            </span>
+        </div>
+
+        <div style="display:flex;gap:1.25rem;flex-wrap:wrap;margin-top:0.55rem;
+                    font-size:0.8rem;color:#cbd5e1;">
+            <span><b style="color:#93c5fd;">Candidate Pool</b>: nodes = {cand} · docs = {pre_docs if pre_docs is not None else "—"}</span>
+            <span><b style="color:#93c5fd;">Final Contexts</b>: nodes = {topn} · docs = {post_docs if post_docs is not None else "—"}</span>
+            <span><b style="color:#93c5fd;">sim_top1</b>: {_fmt(pre_sim)} → {_fmt(post_sim)}</span>
+            <span><b style="color:#93c5fd;">sim_avg</b>: {_fmt(pre_avg)} → {_fmt(post_avg)}</span>
+        </div>
+
+        <div style="margin-top:0.45rem;color:#94a3b8;font-size:0.75rem;">
+            Ringkasan ini bersifat deskriptif untuk menunjukkan perubahan pipeline sebelum vs sesudah rerank,
+            bukan klaim evaluasi otomatis bahwa kualitas jawaban pasti meningkat.
+        </div>
+        </div>
+        """
+    ).strip()
+
+    st.markdown(html_block, unsafe_allow_html=True)
+
+
+def _source_snapshot_lines(
+    nodes: List[Any],
+    retrieval_mode: str,
+    *,
+    max_items: int = 6,
+) -> List[str]:
+    """
+    Ringkasan source snapshot singkat untuk panel before-vs-after.
+    Dibuat lebih ringkas agar enak dipindai user.
+    """
+    lines: List[str] = []
+
+    for i, n in enumerate(nodes[:max_items], start=1):
+        md = getattr(n, "metadata", {}) or {}
+        source_file = str(md.get("source_file", "") or "")
+        page = md.get("page", "?")
+        doc_id = str(getattr(n, "doc_id", "") or "unknown")
+
+        short_doc = doc_id.replace("ITERA_2023_", "")
+        if len(short_doc) > 34:
+            short_doc = short_doc[:31] + "..."
+
+        short_file = source_file
+        if len(short_file) > 38:
+            short_file = short_file[:35] + "..."
+
+        metric_parts: List[str] = []
+
+        if retrieval_mode == "hybrid":
+            metric_parts.append(f"rrf={float(getattr(n, 'score', 0.0)):.5f}")
+            if getattr(n, "score_sparse", None) is not None:
+                metric_parts.append(f"bm25={float(getattr(n, 'score_sparse', 0.0)):.2f}")
+            if getattr(n, "score_dense", None) is not None:
+                metric_parts.append(f"dense={dist_to_sim(float(getattr(n, 'score_dense', 0.0))):.3f}")
+        else:
+            dist = float(getattr(n, "score", 0.0))
+            sim = dist_to_sim(dist)
+            metric_parts.append(f"sim={sim:.4f}")
+
+        rk = getattr(n, "rerank_rank", None)
+        if rk is not None:
+            metric_parts.append(f"rk#{int(rk)}")
+
+        if bool(getattr(n, "is_reserved_anchor", False)):
+            reserved_for = str(getattr(n, "reserved_for_method", "") or "").strip()
+            if reserved_for:
+                metric_parts.append(f"anchor={reserved_for}")
+
+        metrics = " · ".join(metric_parts)
+
+        lines.append(
+            f"""
+<div style="
+  margin:0 0 0.55rem 0;
+  padding:0.52rem 0.68rem;
+  border:1px solid #1f2937;
+  border-radius:0.6rem;
+  background:rgba(15,23,42,0.50);
+">
+  <div style="font-weight:700;color:#e5e7eb;font-size:0.86rem;">
+    CTX {i}
+    <span style="color:#93c5fd;">— {html.escape(short_doc)}</span>
+    <span style="color:#94a3b8;">· p.{html.escape(str(page))}</span>
+  </div>
+  <div style="margin-top:0.18rem;color:#cbd5e1;font-size:0.78rem;">
+    <code style="background:#111827;padding:1px 6px;border-radius:999px;color:#a7f3d0;">{html.escape(short_file)}</code>
+  </div>
+  <div style="margin-top:0.24rem;color:#94a3b8;font-size:0.77rem;font-family:monospace;">
+    {html.escape(metrics)}
+  </div>
+</div>
+"""
+        )
+
+    return lines
+
+
+def render_rerank_before_after_panel(
+    *,
+    reranker_applied: bool,
+    nodes_before_rerank: List[Any],
+    nodes_after_rerank: List[Any],
+    retrieval_mode: str,
+    anchor_meta: Optional[Dict[str, Any]] = None,
+    max_pre_rows: int = 6,
+) -> None:
+    """
+    Panel audit before-vs-after rerank.
+    Menampilkan:
+    - CTX Mapping candidate pool sebelum rerank
+    - CTX Mapping final contexts sesudah rerank
+    - source snapshot ringkas sebelum vs sesudah
+    """
+    if not reranker_applied:
+        return
+    if not nodes_before_rerank or not nodes_after_rerank:
+        return
+
+    pre_rows = build_ctx_rows(
+        nodes_before_rerank[:max_pre_rows],
+        retrieval_mode,
+        include_rerank=False,
+    )
+    post_rows = build_ctx_rows(
+        nodes_after_rerank,
+        retrieval_mode,
+        include_rerank=True,
+    )
+
+    anchor_meta = anchor_meta if isinstance(anchor_meta, dict) else {}
+    reserved_methods = anchor_meta.get("reserved_methods") or []
+    modified = bool(anchor_meta.get("modified", False))
+
+    with st.expander("🧮 Before vs After Rerank (Debug / Audit)", expanded=False):
+        if reserved_methods:
+            reserved_txt = ", ".join(str(x) for x in reserved_methods)
+            status_txt = "FINAL SET DIMODIFIKASI" if modified else "ANCHOR TERVALIDASI"
+            st.markdown(
+                f"""
+<div style="
+  background:rgba(139,92,246,0.08);
+  border:1px solid #7c3aed55;
+  border-left:4px solid #8b5cf6;
+  padding:0.55rem 0.85rem;
+  border-radius:0.55rem;
+  margin:0 0 0.8rem 0;
+  color:#ddd6fe;
+  font-size:0.82rem;
+">
+  <b>Anchor Reservation:</b> {html.escape(reserved_txt)} ·
+  <span style="color:#c4b5fd;">{html.escape(status_txt)}</span>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+        st.caption(
+            "**Catatan:** jika suatu final context masuk melalui *anchor reservation* "
+            "dan tidak termasuk hasil urutan rerank mentah, maka *rerank_score* / "
+            "*rerank_rank* dapat kosong. Pada kasus ini lihat kolom **anchor_reserve**."
+        )
+
+        c1, c2 = st.columns(2, gap="large")
+
+        with c1:
+            st.markdown("**Before Rerank — Candidate Pool 📈**")
+            st.caption(
+                f"Menampilkan {min(max_pre_rows, len(nodes_before_rerank))} kandidat awal "
+                f"dari pool pre-rerank."
+            )
+            render_ctx_mapping_table(pre_rows)
+
+            pre_lines = _source_snapshot_lines(
+                nodes_before_rerank,
+                retrieval_mode,
+                max_items=max_pre_rows,
+            )
+            if pre_lines:
+                st.markdown("**Source Snapshot (Before) 📷**")
+                st.markdown("".join(pre_lines), unsafe_allow_html=True)
+
+        with c2:
+            st.markdown("**After Rerank — Final Contexts 📉**")
+            st.caption("Tabel berikut adalah contexts final yang benar-benar dikirim ke LLM.")
+            render_ctx_mapping_table(post_rows)
+
+            post_lines = _source_snapshot_lines(
+                nodes_after_rerank,
+                retrieval_mode,
+                max_items=max(3, len(nodes_after_rerank)),
+            )
+            if post_lines:
+                st.markdown("**Source Snapshot (After) 📸**")
+                st.markdown("".join(post_lines), unsafe_allow_html=True)

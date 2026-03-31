@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from src.app_ui_render import (
     _prepare_jawaban_markdown,
     build_contexts_with_meta,
+    build_ctx_rows,
     build_retrieval_only_answer,
     compute_retrieval_stats,
     dist_to_sim,
@@ -29,6 +30,8 @@ from src.app_ui_render import (
     render_hybrid_source_score_pills,
     render_pdf_viewer_header,
     render_processing_box,
+    render_rerank_before_after_panel,
+    render_rerank_summary_box,
     render_source_score_pills,
     render_sources_header,
     render_viewing_banner,
@@ -66,6 +69,15 @@ from src.rag.method_detection import (
 )
 from src.rag.method_detection import (
     docid_hit_for_method as _docid_hit_for_method,
+)
+from src.rag.reranker import (  # ← V3.0c: Cross-Encoder Reranking
+    get_reranker_info,
+    is_reranker_loaded,
+    load_reranker,
+    unload_reranker,
+)
+from src.rag.reranker import (
+    rerank as rerank_nodes,
 )
 from src.rag.retrieve_dense import retrieve_dense
 from src.rag.retrieve_sparse import sparse_retrieve_bm25
@@ -219,7 +231,11 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["history"] = []  # list of dicts: {turn_id, query, answer}
     st.session_state["pdf_view"] = None  # {"path": str, "page": int}
     st.session_state["last_nodes"] = None
+    st.session_state["last_nodes_before_rerank"] = None   # ← V3.0c: candidate pool pre-rerank
     st.session_state["last_answer_raw"] = None
+    # ← V3.0c: stats eksplisit
+    st.session_state["last_retrieval_stats_pre_rerank"] = None
+    st.session_state["last_generation_context_stats"] = None
     st.session_state["_scroll_answer"] = False
     st.session_state["last_applied_ui_cfg"] = None
     st.session_state["hl_terms"] = ""
@@ -236,6 +252,9 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["viewing_turn_id"] = None  # None = tampilkan turn terbaru
     st.session_state["last_retrieval_mode"] = "dense" # default saat belum ada query
     st.session_state["last_self_query_result"] = None  # ← V3.0b
+    st.session_state["last_reranker_applied"] = False   # ← V3.0c
+    st.session_state["last_reranker_info"] = None       # ← V3.0c
+    st.session_state["last_rerank_anchor_reservation"] = None  # ← V3.0c
     return rm, logger
 
 
@@ -354,6 +373,92 @@ def build_steps_standalone_query(methods: List[str]) -> str:
         return ""
     labels = ", ".join(pretty_method_name(m) for m in ms)
     return f"Apa saja tahapan dari metode {labels}?"
+
+
+# =========================
+# Compression-followup helpers (T08 fix)
+# =========================
+
+_COMPRESSION_FOLLOWUP_PATTERNS = [
+    r"\blebih\s+ringkas(?:\s+lagi)?\b",
+    r"\blebih\s+singkat(?:\s+lagi)?\b",
+    r"\bsingkatnya\b",
+    r"\bversi\s+ringkas\b",
+    r"\binti(?:nya)?\b",
+    r"\bpoin\s+utamanya\b",
+    r"\blangkah\s+utama(?:nya)?\b",
+    r"\btahap(?:an)?\s+utama(?:nya)?\b",
+]
+
+
+def _history_has_steps_or_method_context(history_window: List[Dict[str, Any]]) -> bool:
+    """
+    True jika riwayat terdekat masih jelas berada pada konteks:
+    - metode tertentu
+    - tahapan / langkah / alur / prosedur
+    """
+    for h in reversed(history_window or []):
+        q = str(h.get("query", "") or "")
+        ap = str(h.get("answer_preview", "") or "")
+        methods = h.get("methods") or []
+
+        if methods:
+            return True
+
+        if is_steps_question(q) or is_method_question(q):
+            return True
+
+        if re.search(
+            r"\b(tahap|tahapan|langkah|alur|prosedur)\w*\b",
+            (q + " " + ap).lower(),
+        ):
+            return True
+
+    return False
+
+
+def is_compression_followup_question(
+    query: str,
+    history_window: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """
+    Deteksi follow-up kompresi / peringkasan yang secara semantik masih lanjutan,
+    walau overlap token literal dengan history bisa sangat rendah.
+
+    Contoh:
+    - "Bisa lebih ringkas lagi langkah utamanya?"
+    - "Singkatnya bagaimana?"
+    - "Inti langkahnya apa?"
+    """
+    q = " ".join((query or "").lower().split())
+    if not q:
+        return False
+
+    has_cue = any(
+        re.search(p, q, flags=re.IGNORECASE)
+        for p in _COMPRESSION_FOLLOWUP_PATTERNS
+    )
+    if not has_cue:
+        return False
+
+    # mode surface-only: dipakai sebelum history_window final dibangun
+    if history_window is None:
+        return True
+
+    return _history_has_steps_or_method_context(history_window)
+
+
+def build_steps_summary_standalone_query(methods: List[str]) -> str:
+    """
+    Rewrite deterministic untuk follow-up kompresi langkah:
+    "Bisa lebih ringkas lagi langkah utamanya?"
+    -> "Apa saja tahapan utama dari metode Prototyping?"
+    """
+    ms = [m for m in (methods or []) if m]
+    if not ms:
+        return ""
+    labels = ", ".join(pretty_method_name(m) for m in ms)
+    return f"Apa saja tahapan utama dari metode {labels}?"
 
 
 def infer_target_methods(user_query: str, history_window: List[Dict[str, Any]]) -> List[str]:
@@ -498,6 +603,774 @@ def select_nodes_with_coverage(
     return selected[: int(top_k)], meta
 
 
+def _method_surface_patterns(method: str) -> List[str]:
+    """
+    Regex cue yang lebih ketat untuk mendeteksi representasi metode pada node.
+
+    Tujuan:
+    - hindari false positive karena kata lepas seperti "prototype" di node yang
+        sebenarnya bukan membahas metode Prototyping sebagai target utama
+    - cukup fleksibel untuk menangkap pola umum seperti:
+        "metode RAD", "model prototyping", "tahapan metode RAD", dst.
+    """
+    m = str(method or "").strip().upper()
+
+    if m == "RAD":
+        return [
+            r"\b(?:metode|model)\s+(?:rapid\s+application\s+development|rad)\b",
+            r"\b(?:rapid\s+application\s+development|rad)\b\s+(?:adalah|merupakan|digunakan)\b",
+            r"\btahapan?\b[^.\n]{0,80}\b(?:rapid\s+application\s+development|rad)\b",
+            r"\b(?:rapid\s+application\s+development|rad)\b[^.\n]{0,80}\btahapan?\b",
+            r"\blangkah(?:-langkah)?\b[^.\n]{0,80}\b(?:rapid\s+application\s+development|rad)\b",
+        ]
+
+    if m == "PROTOTYPING":
+        return [
+            r"\b(?:metode|model)\s+prototyp(?:e|ing)\b",
+            r"\bprototyp(?:e|ing)\b\s+(?:adalah|merupakan|digunakan)\b",
+            r"\btahapan?\b[^.\n]{0,80}\bprototyp(?:e|ing)\b",
+            r"\bprototyp(?:e|ing)\b[^.\n]{0,80}\btahapan?\b",
+            r"\blangkah(?:-langkah)?\b[^.\n]{0,80}\bprototyp(?:e|ing)\b",
+        ]
+
+    if m == "EXTREME_PROGRAMMING":
+        return [
+            r"\b(?:metode|model)\s+extreme\s+programming\b",
+            r"\bextreme\s+programming\b\s+(?:adalah|merupakan|digunakan)\b",
+            r"\b(?:metode|model)\s+xp\b",
+            r"\bxp\b\s+(?:adalah|merupakan|digunakan)\b",
+        ]
+
+    if m == "WATERFALL":
+        return [
+            r"\b(?:metode|model)\s+waterfall\b",
+            r"\bwaterfall\b\s+(?:adalah|merupakan|digunakan)\b",
+        ]
+
+    # fallback generik: exact term
+    term = re.escape(str(method or "").strip().lower())
+    return [rf"\b{term}\b"]
+
+
+def _has_strong_method_cue(text: str, method: str) -> bool:
+    """
+    True jika text mengandung cue metode yang cukup kuat.
+    """
+    t = " ".join(str(text or "").lower().split())
+    if not t:
+        return False
+    for pat in _method_surface_patterns(method):
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _node_metadata_blob(n: Any) -> str:
+    """
+    Gabungkan surface metadata yang sering membawa sinyal metode:
+    doc_id, source_file, judul, bab_label, stream.
+    """
+    meta = getattr(n, "metadata", {}) or {}
+    parts = [
+        str(getattr(n, "doc_id", "") or ""),
+        str(meta.get("source_file", "") or ""),
+        str(meta.get("judul", "") or ""),
+        str(meta.get("bab_label", "") or ""),
+        str(meta.get("stream", "") or ""),
+    ]
+    return " | ".join(parts)
+
+
+def _steps_signal_strength(text: str) -> int:
+    """
+    Heuristic strength untuk mendeteksi apakah node benar-benar step-like.
+
+    Bukan sekadar ada kata 'tahap', tetapi lebih menekankan:
+    - tahapan / langkah-langkah
+    - pola enumerasi 1. 2. 3.
+    - frase seperti 'tiga tahapan', 'fase'
+    """
+    t = " ".join(str(text or "").lower().split())
+    if not t:
+        return 0
+
+    score = 0
+
+    # strong lexical cues
+    if "langkah-langkah" in t or "langkah langkah" in t:
+        score += 4
+    if "tahapan-tahapan" in t or "tahapan" in t:
+        score += 4
+    if re.search(r"\btiga\s+tahapan\b", t):
+        score += 3
+    if re.search(r"\bfase\b", t):
+        score += 2
+
+    # enumeration cues
+    if re.search(r"(?:^|\s)1\.\s", t):
+        score += 2
+    if re.search(r"(?:^|\s)2\.\s", t):
+        score += 2
+    if re.search(r"(?:^|\s)3\.\s", t):
+        score += 2
+
+    # weak cues (tidak cukup sendirian)
+    if re.search(r"\btahap\b", t):
+        score += 1
+
+    return score
+
+
+def _node_has_strong_steps_signal(n: Any) -> bool:
+    """
+    True bila node cukup kuat untuk dianggap menjelaskan tahapan/langkah.
+    Threshold sengaja > sekadar kata 'tahap' agar tidak terlalu permisif.
+    """
+    return _steps_signal_strength(_node_text(n)) >= 4
+
+
+# =========================
+# V3.0c: Coverage-preserving rescue after rerank
+# =========================
+
+def _node_supports_target_method(n: Any, method: str) -> bool:
+    """
+    Cek apakah node benar-benar mendukung metode target.
+
+    V2 improvement:
+    - doc_id/source_file/judul yang eksplisit mengandung metode → langsung valid
+    - body text harus punya strong method cue (bukan sekadar kata lepas)
+    - fallback ke matcher coverage lama hanya jika memang tidak ada sinyal kuat lain
+    """
+    # 1) Sinyal paling kuat: doc_id / metadata surface
+    try:
+        if _docid_hit_for_method(getattr(n, "doc_id", ""), method):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if _has_strong_method_cue(_node_metadata_blob(n), method):
+            return True
+    except Exception:
+        pass
+
+    # 2) Body text dengan cue yang cukup kuat
+    try:
+        if _has_strong_method_cue(_node_text(n), method):
+            return True
+    except Exception:
+        pass
+
+    # 3) Fallback lama (biarkan paling belakang agar tidak terlalu permisif)
+    try:
+        if node_supports_method_for_coverage(n, method):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _node_adequately_supports_method(
+    n: Any,
+    method: str,
+    *,
+    prefer_steps: bool,
+) -> bool:
+    """
+    Adequate representation:
+    - normal query : node cukup mendukung metode target
+    - steps query  : node harus mendukung metode target DAN punya STRONG steps signal
+
+    Perubahan penting:
+    - tidak lagi memakai has_steps_signal() yang terlalu permisif
+    - untuk steps/comparison, node yang hanya menyebut metode tanpa struktur tahapan
+        tidak dianggap cukup
+    """
+    if not _node_supports_target_method(n, method):
+        return False
+
+    if prefer_steps:
+        return _node_has_strong_steps_signal(n)
+
+    return True
+
+
+def _supported_target_methods(n: Any, target_methods: List[str]) -> List[str]:
+    """Daftar metode target yang didukung node ini."""
+    out: List[str] = []
+    for m in target_methods:
+        if _node_supports_target_method(n, m):
+            out.append(m)
+    return out
+
+
+def _is_method_adequately_represented(
+    nodes: List[Any],
+    method: str,
+    *,
+    prefer_steps: bool,
+) -> bool:
+    """
+    True jika dalam list nodes sudah ada minimal 1 node yang cukup mewakili metode tsb.
+    """
+    for n in nodes:
+        if _node_adequately_supports_method(n, method, prefer_steps=prefer_steps):
+            return True
+    return False
+
+
+def _node_docid_supports_method(n: Any, method: str) -> bool:
+    """
+    True jika doc_id node secara eksplisit mewakili metode target.
+    Hal ini lebih ketat daripada sekadar mention di body text.
+    """
+    try:
+        return _docid_hit_for_method(str(getattr(n, "doc_id", "") or ""), method)
+    except Exception:
+        return False
+
+
+def _select_best_anchor_node(
+    candidate_nodes: List[Any],
+    method: str,
+    *,
+    preferred_doc_id: Optional[str] = None,
+    preferred_chunk_id: Optional[str] = None,
+    prefer_steps: bool = False,
+) -> Optional[Any]:
+    """
+    Pilih 1 node anchor terbaik untuk metode target dari candidate pool pre-rerank.
+
+    Final patch T02:
+    - untuk query steps, kandidat dari doc yang benar-benar merepresentasikan metode
+        (via doc_id hit) diprioritaskan di atas dokumen lain yang hanya menyebut metode
+    - di dalam pool itu, pilih node yang paling step-rich
+    - preferred_doc_id / preferred_chunk_id tetap dipakai sebagai tie-break
+    """
+    if not candidate_nodes:
+        return None
+
+    pref_doc = str(preferred_doc_id or "").strip()
+    pref_chunk = str(preferred_chunk_id or "").strip()
+    indexed_nodes = list(enumerate(candidate_nodes))
+
+    def _doc_match(n: Any) -> int:
+        return 1 if (pref_doc and str(getattr(n, "doc_id", "") or "") == pref_doc) else 0
+
+    def _chunk_match(n: Any) -> int:
+        return 1 if (pref_chunk and str(getattr(n, "chunk_id", "") or "") == pref_chunk) else 0
+
+    def _docid_supports(n: Any) -> bool:
+        return _node_docid_supports_method(n, method)
+
+    def _supports(n: Any) -> bool:
+        return _node_supports_target_method(n, method)
+
+    def _steps_strength(n: Any) -> int:
+        return _steps_signal_strength(_node_text(n))
+
+    def _pick_best(pool: List[Tuple[int, Any]]) -> Optional[Any]:
+        if not pool:
+            return None
+        # score priority:
+        # 1) stronger steps signal
+        # 2) same preferred doc
+        # 3) exact preferred chunk
+        # 4) earlier rank/order in candidate pool
+        best = max(
+            pool,
+            key=lambda item: (
+                _steps_strength(item[1]),     # PALING penting untuk steps query
+                _doc_match(item[1]),          # tie-break 1
+                _chunk_match(item[1]),        # tie-break 2
+                -item[0],                     # candidate pool order lama
+            ),
+        )
+        return best[1]
+
+    if prefer_steps:
+        # 1) Kandidat dari doc yang memang "milik" metode + strong steps signal
+        pool = [
+            (i, n) for i, n in indexed_nodes
+            if _docid_supports(n) and _steps_strength(n) >= 4
+        ]
+        hit = _pick_best(pool)
+        if hit is not None:
+            return hit
+
+        # 2) Kandidat dari doc yang memang "milik" metode (meski steps signal tidak sekuat threshold)
+        pool = [
+            (i, n) for i, n in indexed_nodes
+            if _docid_supports(n)
+        ]
+        hit = _pick_best(pool)
+        if hit is not None:
+            return hit
+
+        # 3) Fallback: kandidat manapun yang support metode + strong steps signal
+        pool = [
+            (i, n) for i, n in indexed_nodes
+            if _supports(n) and _steps_strength(n) >= 4
+        ]
+        hit = _pick_best(pool)
+        if hit is not None:
+            return hit
+
+        # 4) Fallback terakhir: kandidat manapun yang support metode
+        pool = [
+            (i, n) for i, n in indexed_nodes
+            if _supports(n)
+        ]
+        hit = _pick_best(pool)
+        if hit is not None:
+            return hit
+
+        return None
+
+    # non-steps fallback
+    # 1) exact preferred_chunk + support
+    for _, n in indexed_nodes:
+        if _chunk_match(n) and _supports(n):
+            return n
+
+    # 2) preferred_doc + support
+    for _, n in indexed_nodes:
+        if _doc_match(n) and _supports(n):
+            return n
+
+    # 3) Doc ID support
+    for _, n in indexed_nodes:
+        if _docid_supports(n):
+            return n
+
+    # 4) any support
+    for _, n in indexed_nodes:
+        if _supports(n):
+            return n
+
+    # 5) exact preferred chunk as last resort
+    for _, n in indexed_nodes:
+        if _chunk_match(n):
+            return n
+
+    return None
+
+
+# LEGACY rescue helper — tidak lagi dipakai di main flow V3.0c
+def enforce_method_coverage_after_rerank(
+    *,
+    reranked_nodes: List[Any],
+    candidate_nodes: List[Any],
+    target_methods: List[str],
+    coverage_detail: Optional[Dict[str, Any]] = None,
+    final_k: int,
+    prefer_steps: bool = False,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """
+    Jaga agar hasil final pasca-rerank tetap merepresentasikan semua metode target.
+
+    Kapan dipakai?
+    - comparison / multi-target
+    - steps query
+    - atau kasus coverage sudah berhasil menemukan metode target pre-rerank,
+        tetapi reranker menghilangkan salah satunya dari final Top-N.
+
+    Prinsip:
+    - rerank order tetap dihormati semaksimal mungkin
+    - namun jika metode target hilang / tidak adequately represented,
+        inject 1 anchor node terbaik dari candidate pool pre-rerank
+    - jika perlu, ganti node paling aman untuk dibuang (node non-target / duplicate)
+    """
+    methods = [m for m in target_methods if isinstance(m, str) and m]
+    methods = list(dict.fromkeys(methods))
+
+    final_nodes = list(reranked_nodes[: int(final_k)])
+
+    meta: Dict[str, Any] = {
+        "triggered": bool(methods),
+        "applied": False,
+        "prefer_steps": bool(prefer_steps),
+        "target_methods": methods,
+        "rescued_methods": [],
+        "anchor_chunk_ids": {},
+        "adequately_represented_after": {},
+        "final_n": len(final_nodes),
+    }
+
+    if not methods or not candidate_nodes or not final_nodes:
+        for m in methods:
+            meta["adequately_represented_after"][m] = _is_method_adequately_represented(
+                final_nodes,
+                m,
+                prefer_steps=prefer_steps,
+            )
+        return final_nodes, meta
+
+    cov_map = coverage_detail if isinstance(coverage_detail, dict) else {}
+
+    # bangun anchor candidate terbaik per metode
+    anchors_by_method: Dict[str, Any] = {}
+    for m in methods:
+        _cov = cov_map.get(m) if isinstance(cov_map, dict) else None
+        _pref_doc = None
+        _pref_chunk = None
+        if isinstance(_cov, dict):
+            _pref_doc = str(_cov.get("doc_id") or "").strip() or None
+            _pref_chunk = str(_cov.get("chunk_id") or "").strip() or None
+
+        anchor = _select_best_anchor_node(
+            candidate_nodes,
+            m,
+            preferred_doc_id=_pref_doc,
+            preferred_chunk_id=_pref_chunk,
+            prefer_steps=prefer_steps,
+        )
+        if anchor is not None:
+            anchors_by_method[m] = anchor
+            meta["anchor_chunk_ids"][m] = str(getattr(anchor, "chunk_id", "") or "")
+
+    for m in methods:
+        # Jika belum adequately represented, metode ini WAJIB diselamatkan.
+        # Setelah V2, adequacy checker sudah lebih ketat:
+        # - false positive lexical mention harus berkurang
+        # - query steps butuh node yang benar-benar step-like
+        if _is_method_adequately_represented(
+            final_nodes,
+            m,
+            prefer_steps=prefer_steps,
+        ):
+            continue
+
+        anchor = anchors_by_method.get(m)
+        if anchor is None:
+            continue
+
+        anchor_cid = str(getattr(anchor, "chunk_id", "") or "")
+        if anchor_cid and any(
+            str(getattr(n, "chunk_id", "") or "") == anchor_cid for n in final_nodes
+        ):
+            # anchor sudah ada di final nodes; kalau masih tidak adequate,
+            # berarti memang tidak ada candidate yang lebih baik untuk metode ini.
+            continue
+
+        drop_idx: Optional[int] = None
+
+        # cari node yang paling aman untuk diganti:
+        # prioritas drop:
+        # 1) node yang tidak mendukung target_methods mana pun
+        # 2) node yang hanya duplikasi / tidak menjadi satu-satunya representasi adequate
+        for idx in range(len(final_nodes) - 1, -1, -1):
+            cand = final_nodes[idx]
+            supported = _supported_target_methods(cand, methods)
+
+            # kandidat non-target = paling aman dibuang
+            if not supported:
+                drop_idx = idx
+                break
+
+            remaining = [n for j, n in enumerate(final_nodes) if j != idx]
+
+            safe_to_drop = True
+            for sm in supported:
+                # hanya node yang "adequate" yang perlu diproteksi.
+                # kalau node ini tidak adequate (mis. query steps tapi node tidak punya steps signal),
+                # maka node tersebut aman untuk diganti dengan anchor yang lebih baik.
+                if _node_adequately_supports_method(cand, sm, prefer_steps=prefer_steps):
+                    if not _is_method_adequately_represented(
+                        remaining,
+                        sm,
+                        prefer_steps=prefer_steps,
+                    ):
+                        safe_to_drop = False
+                        break
+
+            if safe_to_drop:
+                drop_idx = idx
+                break
+
+        if drop_idx is None:
+            # fallback terakhir: ganti node paling akhir
+            drop_idx = len(final_nodes) - 1
+
+        final_nodes[drop_idx] = anchor
+        meta["applied"] = True
+        meta["rescued_methods"].append(m)
+
+    # dedupe sembari jaga urutan
+    deduped: List[Any] = []
+    seen_chunk_ids = set()
+
+    for n in final_nodes:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        if cid and cid in seen_chunk_ids:
+            continue
+        if cid:
+            seen_chunk_ids.add(cid)
+        deduped.append(n)
+
+    final_nodes = deduped[: int(final_k)]
+
+    # jika dedupe membuat jumlah final berkurang, isi lagi dari reranked_nodes lalu candidate_nodes
+    if len(final_nodes) < int(final_k):
+        for pool in (reranked_nodes, candidate_nodes):
+            for n in pool:
+                cid = str(getattr(n, "chunk_id", "") or "")
+                if cid and cid in seen_chunk_ids:
+                    continue
+                if cid:
+                    seen_chunk_ids.add(cid)
+                final_nodes.append(n)
+                if len(final_nodes) >= int(final_k):
+                    break
+            if len(final_nodes) >= int(final_k):
+                break
+
+    final_nodes = final_nodes[: int(final_k)]
+    meta["final_n"] = len(final_nodes)
+
+    for m in methods:
+        meta["adequately_represented_after"][m] = _is_method_adequately_represented(
+            final_nodes,
+            m,
+            prefer_steps=prefer_steps,
+        )
+
+    return final_nodes, meta
+
+
+def _dedupe_nodes_keep_order(nodes: List[Any]) -> List[Any]:
+    out: List[Any] = []
+    seen = set()
+
+    for n in nodes:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        key = cid if cid else f"__obj_{id(n)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+
+    return out
+
+
+def build_final_nodes_with_anchor_reservation(
+    *,
+    reranked_nodes: List[Any],
+    candidate_nodes: List[Any],
+    target_methods: List[str],
+    coverage_detail: Optional[Dict[str, Any]],
+    final_k: int,
+    prefer_steps: bool,
+    top_n_base: int,
+    top_n_effective: int,
+    dynamic_top_n: bool,
+    complex_query: bool,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """
+    Deterministic anchor reservation:
+    - tiap metode target reserve 1 anchor terbaik lebih dulu
+    - sisa slot diisi dari urutan rerank
+    - dedupe & fill dari candidate pool jika perlu
+
+    Hal ini lebih tegas daripada adequacy heuristic.
+    """
+    methods = [m for m in target_methods if isinstance(m, str) and m]
+    methods = list(dict.fromkeys(methods))
+    final_k = max(1, int(final_k))
+
+    meta: Dict[str, Any] = {
+        "triggered": bool(methods),
+        "applied": False,
+        "modified": False,
+        "strategy": "deterministic_anchor_reservation",
+        "prefer_steps": bool(prefer_steps),
+        "dynamic_top_n": bool(dynamic_top_n),
+        "complex_query": bool(complex_query),
+        "top_n_base": int(top_n_base),
+        "top_n_effective": int(top_n_effective),
+        "target_methods": methods,
+        "reserved_methods": [],
+        "reserved_anchor_chunk_ids": {},
+        "final_n": 0,
+    }
+
+    if not methods:
+        final_nodes = list(reranked_nodes[:final_k])
+        meta["final_n"] = len(final_nodes)
+        return final_nodes, meta
+
+    cov_map = coverage_detail if isinstance(coverage_detail, dict) else {}
+
+    reserved_nodes: List[Any] = []
+    reserved_methods: List[str] = []
+    reserved_anchor_chunk_ids: Dict[str, str] = {}
+    seen_reserved = set()
+
+    # 1) Reserve 1 anchor per target method
+    for m in methods:
+        _cov = cov_map.get(m) if isinstance(cov_map, dict) else None
+        _pref_doc = None
+        _pref_chunk = None
+        if isinstance(_cov, dict):
+            _pref_doc = str(_cov.get("doc_id") or "").strip() or None
+            _pref_chunk = str(_cov.get("chunk_id") or "").strip() or None
+
+        anchor = _select_best_anchor_node(
+            candidate_nodes,
+            m,
+            preferred_doc_id=_pref_doc,
+            preferred_chunk_id=_pref_chunk,
+            prefer_steps=prefer_steps,
+        )
+        if anchor is None:
+            continue
+
+        cid = str(getattr(anchor, "chunk_id", "") or "")
+        reserved_anchor_chunk_ids[m] = cid
+
+        if cid and cid in seen_reserved:
+            continue
+
+        if cid:
+            seen_reserved.add(cid)
+        reserved_nodes.append(anchor)
+        reserved_methods.append(m)
+
+    # 2) Tambahkan remainder dari hasil rerank
+    remainder: List[Any] = []
+    for n in reranked_nodes:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        if cid and cid in seen_reserved:
+            continue
+        remainder.append(n)
+
+    final_nodes = reserved_nodes + remainder
+    final_nodes = _dedupe_nodes_keep_order(final_nodes)
+
+    # 3) Jika masih kurang, isi dari candidate pool pre-rerank
+    if len(final_nodes) < final_k:
+        seen_final = {
+            str(getattr(n, "chunk_id", "") or "")
+            for n in final_nodes
+            if str(getattr(n, "chunk_id", "") or "")
+        }
+        for n in candidate_nodes:
+            cid = str(getattr(n, "chunk_id", "") or "")
+            if cid and cid in seen_final:
+                continue
+            final_nodes.append(n)
+            if cid:
+                seen_final.add(cid)
+            if len(final_nodes) >= final_k:
+                break
+
+    original_ids = [
+        str(getattr(n, "chunk_id", "") or "")
+        for n in list(reranked_nodes[:final_k])
+    ]
+    final_nodes = final_nodes[:final_k]
+    final_ids = [str(getattr(n, "chunk_id", "") or "") for n in final_nodes]
+
+    meta["applied"] = bool(reserved_methods)
+    meta["modified"] = final_ids != original_ids
+    meta["reserved_methods"] = reserved_methods
+    meta["reserved_anchor_chunk_ids"] = reserved_anchor_chunk_ids
+    meta["final_n"] = len(final_nodes)
+
+    return final_nodes, meta
+
+
+def _build_rerank_meta_map(nodes: List[Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Ambil map chunk_id -> rerank metadata dari node-node hasil rerank/candidate pool.
+    Dipakai untuk menyinkronkan metadata rerank ke final nodes setelah anchor reservation.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for n in nodes or []:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        if not cid:
+            continue
+
+        rs = getattr(n, "rerank_score", None)
+        rr = getattr(n, "rerank_rank", None)
+
+        if rs is None and rr is None:
+            continue
+
+        out[cid] = {
+            "rerank_score": float(rs) if rs is not None else None,
+            "rerank_rank": int(rr) if rr is not None else None,
+        }
+
+    return out
+
+
+def _sync_rerank_metadata_to_final_nodes(
+    final_nodes: List[Any],
+    rerank_meta_map: Dict[str, Dict[str, Any]],
+) -> List[Any]:
+    """
+    Pastikan setiap final node membawa rerank_score / rerank_rank yang benar,
+    termasuk node yang masuk lewat anchor reservation.
+    """
+    for n in final_nodes or []:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        if not cid:
+            continue
+
+        meta = rerank_meta_map.get(cid)
+        if not meta:
+            continue
+
+        if meta.get("rerank_score") is not None:
+            n.rerank_score = meta["rerank_score"]
+        if meta.get("rerank_rank") is not None:
+            n.rerank_rank = meta["rerank_rank"]
+
+    return final_nodes
+
+
+def _tag_reserved_anchor_nodes(
+    final_nodes: List[Any],
+    anchor_meta: Optional[Dict[str, Any]],
+) -> List[Any]:
+    """
+    Tandai final node yang masuk karena anchor reservation, agar UI dapat membedakan:
+    - node yang punya rerank_rank/rerank_score
+    - node reserved anchor yang memang valid walau rerank metadata = None
+    """
+    anchor_meta = anchor_meta if isinstance(anchor_meta, dict) else {}
+    reserved_map = anchor_meta.get("reserved_anchor_chunk_ids") or {}
+    if not isinstance(reserved_map, dict):
+        reserved_map = {}
+
+    # chunk_id -> method
+    reverse_map: Dict[str, str] = {}
+    for method, cid in reserved_map.items():
+        _cid = str(cid or "").strip()
+        _m = str(method or "").strip()
+        if _cid and _m:
+            reverse_map[_cid] = _m
+
+    for n in final_nodes or []:
+        cid = str(getattr(n, "chunk_id", "") or "")
+        reserved_for = reverse_map.get(cid)
+
+        n.is_reserved_anchor = bool(reserved_for)
+        n.reserved_for_method = reserved_for
+
+        # Label kecil supaya UI bisa memakai satu field saja jikalau sanggup
+        if reserved_for:
+            n.rerank_display_label = f"anchor:{reserved_for}"
+        else:
+            n.rerank_display_label = None
+
+    return final_nodes
+
+
 # =========================
 # Topic Shift Detection
 # =========================
@@ -574,7 +1447,11 @@ def detect_topic_shift(
     if any(m in t for m in _SHIFT_MARKERS):
         return True, {"reason": "explicit_marker", "marker_hit": True}
 
-    # follow-up anafora: anggap masih topik sama
+    # follow-up kompresi / peringkasan: masih topik sama
+    if is_compression_followup_question(q, history_window):
+        return False, {"reason": "compression_followup"}
+
+    # follow-up anafora biasa: anggap masih topik sama
     if is_anaphora_question(q):
         return False, {"reason": "anaphora"}
 
@@ -751,9 +1628,119 @@ def _build_metadata_not_found_answer() -> str:
     return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
 
 
+# =========================
+# Reranker telemetry gating (T10 polish)
+# =========================
+
+def _is_reranker_feature_enabled(cfg: Dict[str, Any]) -> bool:
+    """
+    True hanya jika config aktif memang punya section reranker.enabled = true.
+    Untuk legacy configs (v1_5.yaml / v2.yaml), hasilnya False.
+    """
+    rk_cfg = cfg.get("reranker") or {}
+    return bool(rk_cfg.get("enabled", False))
+
+
+def _make_disabled_reranker_info(
+    cfg: Dict[str, Any],
+    *,
+    reason: str,
+) -> Dict[str, Any]:
+    """
+    Placeholder info yang netral / bersih untuk jalur:
+    - legacy config tanpa reranker
+    - metadata router bypass
+    - path non-rerank lain yang memang sengaja tidak memakai reranker
+    """
+    rk_cfg = cfg.get("reranker") or {}
+    model_name = rk_cfg.get("model_name")
+
+    return {
+        "loaded": False,
+        "model_name": model_name if model_name else None,
+        "requested_device": None,
+        "resolved_device": None,
+        "fallback_reason": None,
+        "load_failed": False,
+        "error_msg": None,
+        "unloaded_after_use": False,
+        "loaded_after_unload": False,
+        "disabled_reason": reason,
+    }
+
+
+def _build_reranker_telemetry(
+    *,
+    cfg: Dict[str, Any],
+    feature_context_enabled: bool,
+    reranker_applied: bool,
+    reranker_info: Optional[Dict[str, Any]],
+    nodes_before_rerank: Optional[List[Any]],
+    top_n_base: Optional[int],
+    top_n_effective: Optional[int],
+    rerank_anchor_reservation: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Satu pintu untuk menormalkan telemetry reranker agar:
+    - legacy config tidak membawa jejak reranker palsu
+    - metadata router tidak membawa stale reranker_info
+    - fail-path T06 tetap menyimpan info error dengan jujur
+    """
+    feature_enabled = _is_reranker_feature_enabled(cfg)
+
+    # 1) Legacy config / reranker memang mati di config
+    if not feature_enabled:
+        return {
+            "applied": False,
+            "candidate_count": 0,
+            "top_n": None,
+            "top_n_base": None,
+            "top_n_effective": None,
+            "info": _make_disabled_reranker_info(
+                cfg,
+                reason="disabled_in_config",
+            ),
+            "anchor_reservation": None,
+        }
+
+    # 2) Reranker ada di config, tapi untuk jalur ini sengaja tidak dipakai
+    #    (mis. metadata_router bypass).
+    if not feature_context_enabled:
+        return {
+            "applied": False,
+            "candidate_count": 0,
+            "top_n": None,
+            "top_n_base": None,
+            "top_n_effective": None,
+            "info": _make_disabled_reranker_info(
+                cfg,
+                reason="bypass_path",
+            ),
+            "anchor_reservation": None,
+        }
+
+    # 3) Jalur reranker memang relevan untuk turn ini.
+    #    Jika gagal load / graceful skip, info error tetap dipertahankan.
+    info = dict(reranker_info or {})
+    if not info:
+        info = _make_disabled_reranker_info(cfg, reason="not_attempted")
+
+    return {
+        "applied": bool(reranker_applied),
+        "candidate_count": len(nodes_before_rerank or []),
+        "top_n": int(top_n_effective) if top_n_effective is not None else None,
+        "top_n_base": int(top_n_base) if top_n_base is not None else None,
+        "top_n_effective": int(top_n_effective) if top_n_effective is not None else None,
+        "info": info,
+        "anchor_reservation": (
+            rerank_anchor_reservation if bool(reranker_applied) else None
+        ),
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", page_icon="🔍", layout="wide")
-    st.title("🔍 RAG ThesisDoc System - V3.0b")
+    st.title("🔍 RAG ThesisDoc System - V3.0c")
 
     load_dotenv()  # baca .env (lokal)
 
@@ -774,6 +1761,15 @@ def main() -> None:
     )
     cfg = load_config(config_path)
     data_raw_dir = Path(cfg.get("paths", {}).get("data_raw_dir", "data_raw"))
+
+    # T10 polish:
+    # Jika config lama / legacy dipakai (tanpa reranker aktif),
+    # bersihkan state module-level reranker agar info lama tidak "bocor" ke log / sidebar / history viewer.
+    if not _is_reranker_feature_enabled(cfg):
+        try:
+            unload_reranker()
+        except Exception:
+            pass
 
     # init/reuse run per session
     rm, logger = get_or_create_run(cfg, config_path)
@@ -816,6 +1812,11 @@ def main() -> None:
     elif provider == "openai":
         st.sidebar.write("Model:", openai_model)
 
+    # ← V3.0c: Tampilkan info reranker model di sidebar
+    _rk_sidebar_cfg = cfg.get("reranker") or {}
+    if bool(_rk_sidebar_cfg.get("enabled", False)):
+        st.sidebar.write("Reranker:", _rk_sidebar_cfg.get("model_name", "—"))
+
     # --- Runtime status turn terakhir ---
     st.sidebar.divider()
     last_turn_status_slot = st.sidebar.empty()  # diisi setelah processing
@@ -835,11 +1836,11 @@ def main() -> None:
 
     # Basic retrieval + prompt sizing
     top_k_ui = st.sidebar.slider(
-        "top_k (override)",
+        "candidate top_k (before rerank)",
         min_value=3,
         max_value=15,
         value=int(cfg["retrieval"]["top_k"]),
-        help="Jumlah chunk (sumber) yang diambil dari vector DB untuk konteks jawaban.",
+        help="Jumlah kandidat retrieval awal. Jika reranker aktif, kandidat final akan di-rerank lalu dipotong lagi sesuai top_n_rerank.",
     )
     max_chars_ctx_ui = st.sidebar.slider(
         "max_chars_per_ctx (override)",
@@ -958,10 +1959,21 @@ def main() -> None:
         help="Jika ON, setiap baris JSONL menyimpan snapshot config untuk audit (file log jadi lebih besar, namun audit lebih solid).",
     )
 
-    # ===== Main Info =====
+    # ===== Main Info Bar =====
     _retrieval_mode_label = str(cfg.get("retrieval", {}).get("mode", "dense")).upper()
+
+    # ← V3.0c: baca status reranker dari config
+    _rk_cfg_info      = cfg.get("reranker") or {}
+    _rk_enabled_info  = bool(_rk_cfg_info.get("enabled", False))
+    _rk_allow_eval_i  = bool(_rk_cfg_info.get("allow_in_eval", True))
+    _rk_on_info       = _rk_enabled_info and (run_mode != "eval" or _rk_allow_eval_i)
+    _rk_icon          = "🟢" if _rk_on_info else "⚫"
+
+    # ← V3.0c: banner awal diperbarui
     st.success(
-        f"Now Running on **V3.0b** — **{_retrieval_mode_label}** Retrieval + Memory & Contextualization + Structure-Aware Dual Stream + Metadata Self-Querying",
+        f"Now Running on **V3.0c** — **{_retrieval_mode_label}** Retrieval + "
+        f"Memory & Contextualization + Structure-Aware Dual Stream + "
+        f"Metadata Self-Querying + **Cross-Encoder Reranking**",
         icon="🚥",
     )
 
@@ -970,12 +1982,14 @@ def main() -> None:
     _llm_icon = "🟢" if use_llm else "⚫"
     _mode_badge = "🧪 eval" if eval_mode else "🎯 demo"
     _retrieval_icon = "🔀" if _retrieval_mode_label == "HYBRID" else "🔵"
+
     # V3.0b: cek apakah self-query aktif dari config
     _sq_cfg_info  = cfg.get("self_query") or {}
     _sq_enabled_info = bool(_sq_cfg_info.get("enabled", False))
     _sq_allow_eval   = bool(_sq_cfg_info.get("allow_in_eval", False))
     _sq_on_info   = _sq_enabled_info and (run_mode != "eval" or _sq_allow_eval)
     _sq_icon      = "🟢" if _sq_on_info else "⚫"
+
     _info_parts = [
         f"<b>Mode:</b> {_mode_badge}",
         f"{_retrieval_icon} Retrieval: {_retrieval_mode_label}",
@@ -983,6 +1997,7 @@ def main() -> None:
         f"{_mem_icon} Memory ({mem_window} turns)",
         f"{_ctx_icon} Contextualize",
         f"{_sq_icon} Self-Query Filter",   # ← V3.0b
+        f"{_rk_icon} Reranker",            # ← V3.0c
     ]
     st.markdown(
         '<div style="background:#1e293b; border:1px solid #334155; padding:0.6rem 1rem; '
@@ -1039,6 +2054,13 @@ def main() -> None:
             detect_anaphora = is_anaphora_question(query)
             detect_multi_target = is_multi_target_question(query)
 
+            # T08 fix:
+            # surface detector dipakai lebih awal agar history policy tidak terlalu keras
+            detect_compression_followup_surface = is_compression_followup_question(
+                query,
+                None,
+            )
+
             # ===== History window (policy) =====
             # Ambil window percakapan terakhir (history) untuk membantu rewrite query.
             history_pairs = st.session_state.get("history", [])
@@ -1053,12 +2075,21 @@ def main() -> None:
                 mem_window=int(mem_window),
                 segment_on_topic_shift=segment_on_shift,
                 anaphora_skip_last_shift=anaphora_skip_last_shift,
-                current_is_anaphora=detect_anaphora,
+                current_is_anaphora=bool(
+                    detect_anaphora or detect_compression_followup_surface
+                ),
             )
 
             # Ringkasan memory yang dipakai untuk turn ini (untuk audit log)
             history_used = len(history_window) if (use_memory and mem_window > 0) else 0
             history_turn_ids = [h.get("turn_id") for h in history_window] if history_window else []
+
+            # T08 fix:
+            # setelah history_window final terbentuk, evaluasi ulang compression-followup dengan konteks history yang benar-benar dipakai
+            detect_compression_followup = is_compression_followup_question(
+                query,
+                history_window,
+            )
 
             st.write("💭 Mendeteksi konteks & riwayat percakapan...")
 
@@ -1088,6 +2119,7 @@ def main() -> None:
                 "anaphora": bool(detect_anaphora),
                 "multi_target": bool(detect_multi_target),
                 "topic_shift": bool(topic_shift),
+                "compression_followup": bool(detect_compression_followup),
             }
 
             # ===== Contextualize / rewrite query =====
@@ -1099,8 +2131,29 @@ def main() -> None:
             contextualize_mode = "none"
 
             if use_memory and contextualize_on and history_window and (not topic_shift):
-                # CASE 1: anaphora + steps -> deterministic rewrite (lebih stabil dari LLM)
-                if is_steps_question(query) and is_anaphora_question(query):
+                # T08 fix:
+                # treat compression-followup singkat sebagai kelanjutan steps/method, bukan fresh query.
+
+                # CASE 1A: compression follow-up + steps/method context -> deterministic rewrite
+                if detect_compression_followup and _history_has_steps_or_method_context(history_window):
+                    tm = infer_target_methods(query, history_window)
+                    rq2 = build_steps_summary_standalone_query(tm)
+                    if rq2:
+                        retrieval_query = rq2
+                        contextualize_attempted = True
+                        contextualize_mode = "heuristic_steps_summary"
+                    else:
+                        contextualize_attempted = True
+                        contextualize_mode = "llm"
+                        retrieval_query = contextualize_question(
+                            cfg_runtime,
+                            question=query,
+                            history_pairs=history_window,
+                            use_llm=use_llm,
+                        )
+
+                # CASE 1B: anaphora + steps -> deterministic rewrite (perilaku lama)
+                elif is_steps_question(query) and is_anaphora_question(query):
                     tm = infer_target_methods(query, history_window)
                     rq2 = build_steps_standalone_query(tm)
                     if rq2:
@@ -1116,8 +2169,9 @@ def main() -> None:
                             history_pairs=history_window,
                             use_llm=use_llm,
                         )
+
+                # CASE 2: default -> LLM/heuristic bawaan contextualize_question()
                 else:
-                    # CASE 2: default -> LLM/heuristic bawaan contextualize_question()
                     contextualize_attempted = True
                     contextualize_mode = "llm"
                     retrieval_query = contextualize_question(
@@ -1160,6 +2214,73 @@ def main() -> None:
                 fallback_reason="not_executed",
             )
 
+            # ===== V3.0c: Reranker defaults - diinisialisasi sebelum kedua jalur =====
+            # ⚠️ Jangan pindah ke dalam if not metadata_routed - harus ada di kedua jalur
+            # agar JSONL shape konsisten di metadata_routed path maupun normal path.
+            reranker_applied: bool = False
+            reranker_info: Dict[str, Any] = get_reranker_info()
+
+            # ← Legacy telemetry (sementara tetap dipertahankan agar backward-compatible)
+            rerank_coverage_rescue: Dict[str, Any] = {
+                "triggered": False,
+                "applied": False,
+                "prefer_steps": False,
+                "target_methods": [],
+                "rescued_methods": [],
+                "anchor_chunk_ids": {},
+                "adequately_represented_after": {},
+                "final_n": 0,
+            }
+
+            # ← V3.0c: metadata rescue pasca-rerank (default agar shape log stabil)
+            # refinement: deterministic anchor reservation
+            rerank_anchor_reservation: Dict[str, Any] = {
+                "triggered": False,
+                "applied": False,
+                "modified": False,
+                "strategy": "deterministic_anchor_reservation",
+                "prefer_steps": False,
+                "dynamic_top_n": False,
+                "complex_query": False,
+                "top_n_base": None,
+                "top_n_effective": None,
+                "target_methods": [],
+                "reserved_methods": [],
+                "reserved_anchor_chunk_ids": {},
+                "final_n": 0,
+            }
+
+            # Resolve config reranker di sini agar candidate pool pre-rerank
+            # bisa dipakai oleh retrieval utama (bukan hanya tercatat di log).
+            _reranker_cfg = cfg_runtime.get("reranker") or {}
+            _reranker_en = bool(_reranker_cfg.get("enabled", False))
+            _rk_allow_eval = bool(_reranker_cfg.get("allow_in_eval", True))
+            _reranker_act = _reranker_en and (run_mode != "eval" or _rk_allow_eval)
+
+            # ── Base vs complex top-n (effective top-n baru ditentukan nanti setelah target_methods terlihat)
+            _top_n_rerank_base = max(1, int(_reranker_cfg.get("top_n_rerank", 3)))
+            _dynamic_top_n = bool(_reranker_cfg.get("dynamic_top_n", True))
+            _top_n_rerank_complex = max(
+                _top_n_rerank_base,
+                int(_reranker_cfg.get("top_n_rerank_complex", 5)),
+            )
+
+            # candidate_k harus aman untuk skenario top-n terbesar
+            _max_top_n_rerank = _top_n_rerank_complex if _dynamic_top_n else _top_n_rerank_base
+            _candidate_k_rerank = max(
+                _max_top_n_rerank,
+                int(_reranker_cfg.get("candidate_k", top_k_ui)),
+            )
+
+            # Jumlah kandidat FINAL sebelum rerank.
+            # - Jika reranker aktif: minimal mengikuti candidate_k dari config
+            # - Jika reranker nonaktif: kembali ke perilaku lama (top_k_ui)
+            _candidate_pool_k = (
+                max(int(top_k_ui), _candidate_k_rerank)
+                if _reranker_act
+                else int(top_k_ui)
+            )
+
             # ===== Metadata Routing (page_count) =====
             md_cfg = cfg_runtime.get("metadata_routing", {}) or {}
             md_enabled = bool(md_cfg.get("enabled", False))
@@ -1187,11 +2308,34 @@ def main() -> None:
                     st.write("✏️ Menjawab dari metadata catalog...")
 
                     # Untuk metadata routing: tidak ada nodes/context
-                    nodes = []
-                    contexts = []
-                    retrieval_stats = compute_retrieval_stats(nodes)
+                    nodes: List[Any] = []
+                    nodes_before_rerank: List[Any] = []   # ← V3.0c
+                    contexts: List[str] = []
+
+                    # ← V3.0c:
+                    # retrieval_stats_pre_rerank  = stats candidate pool retrieval
+                    # generation_context_stats    = stats context final yang benar-benar masuk ke LLM/generator
+                    # Pada metadata routing keduanya identik (kosong), tapi tetap diisi agar shape stabil.
+                    retrieval_stats_pre_rerank = compute_retrieval_stats(nodes_before_rerank)
+                    generation_context_stats = compute_retrieval_stats(nodes)
+
+                    # Backward-compatible:
+                    # pertahankan retrieval_stats lama agar consumer lama tidak rusak.
+                    retrieval_stats = generation_context_stats
+
                     strategy = "metadata_router"
                     ts = datetime.now().isoformat(timespec="seconds")
+
+                    _rk_meta = _build_reranker_telemetry(
+                        cfg=cfg_runtime,
+                        feature_context_enabled=False,   # metadata router = bypass
+                        reranker_applied=False,
+                        reranker_info=None,
+                        nodes_before_rerank=nodes_before_rerank,
+                        top_n_base=None,
+                        top_n_effective=None,
+                        rerank_anchor_reservation=None,
+                    )
 
                     retrieval_record = {
                         "run_id": rm.run_id,
@@ -1222,7 +2366,10 @@ def main() -> None:
                             "pool_mult": 0,
                             "candidate_k": None,
                         },
-                        "retrieval_stats": retrieval_stats,
+                        "retrieval_stats": retrieval_stats,  # Backward-compatible: retrieval_stats tetap ada
+                        # ← V3.0c: stats eksplisit pre vs post
+                        "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                        "generation_context_stats": generation_context_stats,
                         "retrieval_confidence": None,
                         "retrieved_nodes": [],
                         "coverage": None,
@@ -1232,6 +2379,15 @@ def main() -> None:
                             semantic_query=None,
                             fallback_reason="metadata_routed",
                         ),
+                        # ← V3.0c: reranker tidak jalan di metadata routing
+                        "reranker_applied":         _rk_meta["applied"],
+                        "reranker_candidate_count": _rk_meta["candidate_count"],
+                        "reranker_top_n":           _rk_meta["top_n"],
+                        "reranker_top_n_base":      _rk_meta["top_n_base"],
+                        "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                        "reranker_info":            _rk_meta["info"],
+                        "rerank_coverage_rescue":   rerank_coverage_rescue,         # legacy telemetry
+                        "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
                     }
                     rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
 
@@ -1276,7 +2432,10 @@ def main() -> None:
                             "pool_mult": 0,
                             "candidate_k": None,
                         },
-                        "retrieval_stats": retrieval_stats,
+                        "retrieval_stats": retrieval_stats,  # Backward-compatible
+                        # ← V3.0c: stats eksplisit pre vs post
+                        "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                        "generation_context_stats": generation_context_stats,
                         "retrieval_confidence": None,
                         "generator_strategy": "metadata_router",
                         "generator_status": "metadata",
@@ -1291,6 +2450,14 @@ def main() -> None:
                             semantic_query=None,
                             fallback_reason="metadata_routed",
                         ),
+                        # ← V3.0c /T10 polish
+                        "reranker_applied": _rk_meta["applied"],
+                        "reranker_model":   (_rk_meta["info"] or {}).get("model_name"),
+                        "reranker_top_n":   _rk_meta["top_n"],
+                        "reranker_top_n_base": _rk_meta["top_n_base"],
+                        "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                        "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
+                        "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
                     }
                     rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
@@ -1312,20 +2479,31 @@ def main() -> None:
                     # set last result untuk UI
                     st.session_state["last_answer_raw"] = answer_raw
                     st.session_state["last_turn_id"] = turn_id
-                    st.session_state["last_nodes"] = []
+                    st.session_state["last_nodes"] = []                 # final contexts
+                    st.session_state["last_nodes_before_rerank"] = []   # candidate pool pre-rerank
                     st.session_state["last_strategy"] = strategy
+                    # ← V3.0c
+                    st.session_state["last_retrieval_stats_pre_rerank"] = retrieval_stats_pre_rerank
+                    st.session_state["last_generation_context_stats"] = generation_context_stats
                     st.session_state["_scroll_answer"] = True
                     st.session_state["last_user_query"] = query
                     st.session_state["last_retrieval_query"] = query
                     st.session_state["last_applied_ui_cfg"] = current_ui_cfg.copy()
                     st.session_state["last_history_used"] = history_used
                     st.session_state["last_contextualized"] = False
+                    st.session_state["last_reranker_applied"] = _rk_meta["applied"]  # ← V3.0c
+                    st.session_state["last_reranker_info"] = _rk_meta["info"]  # ← V3.0c
+                    st.session_state["last_rerank_anchor_reservation"] = _rk_meta["anchor_reservation"]  # ← V3.0c
 
                     # simpan full render data untuk turn viewer
                     if "turn_data" not in st.session_state:
                         st.session_state["turn_data"] = {}
                     st.session_state["turn_data"][turn_id] = {
+                        # ← V3.0c:
+                        # nodes                = final contexts yang benar-benar dipakai
+                        # nodes_before_rerank  = candidate pool pre-rerank
                         "nodes": [],
+                        "nodes_before_rerank": [],
                         "answer_raw": answer_raw,
                         "user_query": query,
                         "retrieval_query": query,
@@ -1334,6 +2512,17 @@ def main() -> None:
                         "contextualized": False,
                         "retrieval_mode": "metadata_router",
                         "self_query_filter_applied": False,
+                        "reranker_applied": _rk_meta["applied"],  # ← V3.0c
+                        # ← V3.0c: siap dipakai nanti di app_ui_render.py
+                        "reranker_candidate_count": _rk_meta["candidate_count"],
+                        "reranker_top_n": _rk_meta["top_n"],
+                        "reranker_top_n_base": _rk_meta["top_n_base"],
+                        "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                        "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                        "generation_context_stats": generation_context_stats,
+                        "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
+                        "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
+                        "reranker_info": _rk_meta["info"], 
                     }
 
             if not metadata_routed:
@@ -1353,7 +2542,13 @@ def main() -> None:
                 else:
                     diversify = is_multi_doc_question(query)  # pakai user query (lebih natural)
 
-                candidate_k = int(top_k_ui) * int(pool_mult) if diversify else None
+                candidate_k = int(_candidate_pool_k) * int(pool_mult) if diversify else None
+
+                # cfg retrieval khusus agar pool kandidat pre-rerank benar-benar bisa > top_k_ui
+                # tanpa mengubah cfg_runtime utama yang dipakai untuk logika lain.
+                cfg_retrieval = dict(cfg_runtime)
+                cfg_retrieval["retrieval"] = dict(cfg_runtime.get("retrieval", {}))
+                cfg_retrieval["retrieval"]["top_k"] = int(_candidate_pool_k)
 
                 # mode-aware
                 retrieval_mode = str(cfg_runtime["retrieval"]["mode"])
@@ -1442,9 +2637,9 @@ def main() -> None:
                 if retrieval_mode == "hybrid":
                     # ── Jalur Hybrid: Dense + Sparse BM25 + RRF Fusion ──
                     # Dense: ambil pool lebih besar (bahan RRF), diversify ditangani RRF
-                    _hybrid_candidate_k = max(int(top_k_ui) * 3, int(top_k_ui) + 5)
+                    _hybrid_candidate_k = max(int(_candidate_pool_k) * 3, int(_candidate_pool_k) + 5)
                     dense_nodes_raw = retrieve_dense(
-                        cfg_runtime,
+                        cfg_retrieval,
                         effective_retrieval_query,
                         diversify=False,
                         max_per_doc=int(max_per_doc),
@@ -1452,19 +2647,22 @@ def main() -> None:
                         collection="narasi",
                         where_filter=_self_query_filter,   # ← V3.0b
                     )
-                    # Sparse: BM25 + Sastrawi, ambil top_k standar dari config
+
+                    # Sparse: BM25 + Sastrawi, ambil minimal sebanyak candidate pool pre-rerank
                     sparse_nodes_raw = sparse_retrieve_bm25(
-                        cfg_runtime,
+                        cfg_retrieval,
                         effective_retrieval_query,
+                        top_k=int(_candidate_pool_k),
                         collection="narasi",
                     )
-                    # RRF Fusion — gabungkan ranking dense + sparse
-                    _rrf_k = int((cfg_runtime.get("retrieval") or {}).get("rrf_k", 60))
+
+                    # RRF Fusion — gabungkan ranking dense + sparse menjadi candidate pool pre-rerank
+                    _rrf_k = int((cfg_retrieval.get("retrieval") or {}).get("rrf_k", 60))
                     nodes = rrf_fusion(
                         dense_nodes_raw,
                         sparse_nodes_raw,
                         k=_rrf_k,
-                        top_k=int(top_k_ui),
+                        top_k=int(_candidate_pool_k),
                     )
 
                     # ── V3.0a: Citation routing untuk jalur hybrid - tambah nodes dari sitasi collection ──
@@ -1473,40 +2671,44 @@ def main() -> None:
                     )
                     _citation_intent_query = retrieval_query_before_self_query or query
                     if _has_sitasi and is_citation_query(_citation_intent_query):
-                        _sitasi_top_k = max(3, int(top_k_ui) // 2)  # ambil separuh slot untuk sitasi
+                        _sitasi_top_k = max(3, int(_candidate_pool_k) // 2)  # proporsional terhadap candidate pool
                         sitasi_dense = retrieve_dense(
-                            cfg_runtime, effective_retrieval_query,
+                            cfg_retrieval,
+                            effective_retrieval_query,
                             diversify=False,
                             max_per_doc=2,
                             candidate_k=_sitasi_top_k * 2,
                             collection="sitasi",
                         )
                         sitasi_sparse = sparse_retrieve_bm25(
-                            cfg_runtime, effective_retrieval_query,
+                            cfg_retrieval,
+                            effective_retrieval_query,
                             top_k=_sitasi_top_k,
                             collection="sitasi",
                         )
                         # RRF fusion untuk sitasi
                         sitasi_fused = rrf_fusion(
-                            sitasi_dense, sitasi_sparse,
-                            k=_rrf_k, top_k=_sitasi_top_k,
+                            sitasi_dense,
+                            sitasi_sparse,
+                            k=_rrf_k,
+                            top_k=_sitasi_top_k,
                         )
                         # Merge: dedupe by chunk_id, narasi tetap prioritas slot pertama
                         existing_ids = {n.chunk_id for n in nodes}
                         sitasi_new = [n for n in sitasi_fused if n.chunk_id not in existing_ids]
 
-                        # V3.0b: minimum floor narasi ≥60% dari top_k agar konteks konseptual
-                        # tidak terlalu terkorbankan saat citation routing aktif
-                        _narasi_floor = max(1, int(top_k_ui * 0.6))
-                        _sitasi_cap   = int(top_k_ui) - _narasi_floor
+                        # V3.0b: minimum floor narasi ≥60% dari candidate pool
+                        # agar konteks konseptual tetap dominan sebelum rerank
+                        _narasi_floor = max(1, int(_candidate_pool_k * 0.6))
+                        _sitasi_cap   = int(_candidate_pool_k) - _narasi_floor
                         sitasi_new    = sitasi_new[:_sitasi_cap]   # terapkan cap sitasi
 
-                        narasi_keep   = int(top_k_ui) - len(sitasi_new)
-                        nodes = nodes[:narasi_keep] + sitasi_new
+                        narasi_keep   = int(_candidate_pool_k) - len(sitasi_new)
+                        nodes         = nodes[:narasi_keep] + sitasi_new
 
                         # HYBRID: n.score = RRF score → lebih besar = lebih relevan
                         nodes = sorted(
-                            nodes[:int(top_k_ui)],
+                            nodes[:int(_candidate_pool_k)],
                             key=lambda n: float(n.score),
                             reverse=True,
                         )
@@ -1516,7 +2718,7 @@ def main() -> None:
                     # ── Jalur Dense Murni (V1.0 / V1.5 behaviour — tidak berubah) ──
                     retrieval_mode = "dense"  # normalisasi agar konsisten di log
                     nodes = retrieve_dense(
-                        cfg_runtime,
+                        cfg_retrieval,
                         effective_retrieval_query,
                         diversify=diversify,
                         max_per_doc=int(max_per_doc),
@@ -1531,30 +2733,31 @@ def main() -> None:
                     )
                     _citation_intent_query_d = retrieval_query_before_self_query or query
                     if _has_sitasi_d and is_citation_query(_citation_intent_query_d):
-                        _sitasi_top_k_d = max(3, int(top_k_ui) // 2)
+                        _sitasi_top_k_d = max(3, int(_candidate_pool_k) // 2)
                         sitasi_nodes_d = retrieve_dense(
-                            cfg_runtime,
+                            cfg_retrieval,
                             effective_retrieval_query,
                             diversify=False,
                             max_per_doc=2,
                             candidate_k=_sitasi_top_k_d * 2,
                             collection="sitasi",
                         )
+
                         # Merge: dedupe by chunk_id, narasi tetap prioritas
                         existing_ids_d = {n.chunk_id for n in nodes}
                         sitasi_new_d = [n for n in sitasi_nodes_d if n.chunk_id not in existing_ids_d]
 
-                        # V3.0b: minimum floor narasi ≥60% dari top_k
-                        _narasi_floor_d = max(1, int(top_k_ui * 0.6))
-                        _sitasi_cap_d   = int(top_k_ui) - _narasi_floor_d
+                        # V3.0b: minimum floor narasi ≥60% dari candidate pool
+                        _narasi_floor_d = max(1, int(_candidate_pool_k * 0.6))
+                        _sitasi_cap_d   = int(_candidate_pool_k) - _narasi_floor_d
                         sitasi_new_d    = sitasi_new_d[:_sitasi_cap_d]  # terapkan cap sitasi
 
-                        narasi_keep_d   = int(top_k_ui) - len(sitasi_new_d)
-                        nodes = nodes[:narasi_keep_d] + sitasi_new_d
+                        narasi_keep_d   = int(_candidate_pool_k) - len(sitasi_new_d)
+                        nodes           = nodes[:narasi_keep_d] + sitasi_new_d
 
                         # DENSE: n.score = Chroma distance → lebih kecil = lebih relevan
                         nodes = sorted(
-                            nodes[:int(top_k_ui)],
+                            nodes[:int(_candidate_pool_k)],
                             key=lambda n: float(n.score),
                         )
 
@@ -1568,7 +2771,7 @@ def main() -> None:
 
                 # Jika topic_shift terdeteksi, JANGAN bawa metode dari history (hindari carry-over)
                 if topic_shift:
-                    st.session_state["method_doc_map"] = {} # reset method_doc_map agar tidak kontaminasi topik baru
+                    st.session_state["method_doc_map"] = {}  # reset hanya jika benar-benar topic shift
 
                 history_for_methods = [] if topic_shift else history_window
                 target_methods = infer_target_methods(query, history_for_methods)
@@ -1582,7 +2785,7 @@ def main() -> None:
                 if (
                     cov_enabled
                     and len(target_methods) >= min_methods
-                    and (detect_anaphora or detect_multi_target)
+                    and (detect_anaphora or detect_multi_target or detect_compression_followup)
                 ):
                     # ===== steps-aware expansion =====
                     # Jika query adalah steps, cari tambahan PER METODE (bukan hanya yang missing),
@@ -1627,7 +2830,7 @@ def main() -> None:
                     # select nodes yang menjamin coverage per metode
                     nodes, cov_detail = select_nodes_with_coverage(
                         merged,
-                        top_k=int(top_k_ui),
+                        top_k=int(_candidate_pool_k),
                         target_methods=target_methods,
                         max_per_doc=int(max_per_doc) if diversify else 0,
                     )
@@ -1668,7 +2871,9 @@ def main() -> None:
                     "method_bias_added": 0,
                 }
 
-                steps_q_now = is_steps_question(query)
+                steps_q_now = bool(
+                    is_steps_question(query) or detect_compression_followup
+                )
 
                 # --- (A) PRIORITAS 1: explicit doc-focus dari query user ---
                 explicit_doc_focus = extract_doc_focus_from_query(query)  # list[str]
@@ -1744,7 +2949,7 @@ def main() -> None:
                         doc_focus_meta["method_bias_added"] = 0
 
                 # --- (B) PRIORITAS 2: anaphora+steps doc-focus dari method_doc_map (turn sebelumnya) ---
-                elif detect_anaphora and steps_q_now and (not topic_shift):
+                elif (detect_anaphora or detect_compression_followup) and steps_q_now and (not topic_shift):
                     if "method_doc_map" not in st.session_state:
                         st.session_state["method_doc_map"] = {}
 
@@ -1766,30 +2971,51 @@ def main() -> None:
                             nodes,
                             allowed_doc_ids,
                             min_keep=0,
-                            strict=True,  # HARD LOCK juga (biar tidak bocor ke dokumen lain)
+                            strict=True,  # HARD LOCK agar tidak bocor ke dokumen lain
                         )
                         doc_focus_meta.update(dfm)
                         doc_focus_meta["enabled"] = True
-                        doc_focus_meta["mode"] = "anaphora_steps"
+                        doc_focus_meta["mode"] = (
+                            "compression_steps_followup"
+                            if detect_compression_followup and not detect_anaphora
+                            else "anaphora_steps"
+                        )
 
                 # simpan meta doc-focus untuk audit/debug UI
                 st.session_state["last_doc_focus_meta"] = doc_focus_meta
 
-                # contexts untuk LLM (kalau nanti key valid) dan perkaya dengan metadata dokumen
-                contexts = build_contexts_with_meta(nodes)
+                # =========================
+                # V3.0c refinement: dynamic effective top-n
+                # =========================
+                _complex_rerank_query = bool(
+                    detect_multi_target
+                    or steps_q_now
+                    or len(list(dict.fromkeys(target_methods or []))) >= 2
+                )
+
+                _top_n_rerank_effective = int(_top_n_rerank_base)
+                if _reranker_act and _dynamic_top_n and _complex_rerank_query:
+                    _top_n_rerank_effective = int(_top_n_rerank_complex)
+
+                _top_n_rerank_effective = max(1, int(_top_n_rerank_effective))
+
+                if _top_n_rerank_effective != _top_n_rerank_base:
+                    st.write(
+                        f"📈 Dynamic top-n aktif: query kompleks → "
+                        f"Top-{_top_n_rerank_effective} final contexts..."
+                    )
 
                 # =========================
-                # Update method_doc_map (untuk doc-focus lock di turn berikutnya)
+                # Update method_doc_map
+                # (WAJIB menggunakan `nodes` pre-rerank, bukan nodes_for_gen)
                 # =========================
                 if "method_doc_map" not in st.session_state:
                     st.session_state["method_doc_map"] = {}
 
-                # update hanya jika ini BUKAN steps query (karena steps query rawan campur dokumen)
-                if not (is_steps_question(query) or is_steps_question(retrieval_query)):
+                if not is_steps_question(query):
                     if target_methods:
                         md_new: Dict[str, str] = {}
 
-                        # prioritas 1: dari coverage detail (paling stabil)
                         try:
                             if (
                                 isinstance(coverage_meta, dict)
@@ -1804,12 +3030,229 @@ def main() -> None:
                         except Exception:
                             pass
 
-                        # fallback: scan nodes text
                         if not md_new:
                             md_new = build_method_doc_map_from_nodes(nodes, list(target_methods))
 
                         if md_new:
                             st.session_state["method_doc_map"].update(md_new)
+
+                # =========================
+                # V3.0c: Snapshot candidate pool pre-rerank
+                # =========================
+                # Simpan candidate pool di titik ini:
+                # - retrieval
+                # - citation routing
+                # - coverage expansion
+                # - doc-focus
+                #
+                # Setelah titik ini, reranker mengubah subset final untuk generator,
+                # tetapi candidate pool asli tetap disimpan untuk audit & UI before-vs-after.
+                nodes_before_rerank: List[Any] = list(nodes)
+                # ← Final patch T02: simpan hasil rerank mentah sebelum anchor reservation
+                nodes_reranked_pre_anchor: List[Any] = []
+
+                # =========================
+                # V3.0c: Cross-Encoder Reranking (Top-N)
+                # =========================
+                # Titik insersi SETELAH method_doc_map update (yang butuh nodes penuh/pre-rerank)
+                # dan SEBELUM build_contexts_with_meta (yang harus pakai nodes_for_gen).
+                #
+                # ⚠️ PERINGATAN INTEGRASI - JANGAN SORT ULANG nodes_for_gen SETELAH BLOK INI:
+                # n.score menyimpan skor retrieval lama (score_rrf untuk hybrid, distance untuk dense).
+                # Relevansi final pasca-rerank ada di URUTAN nodes_for_gen dan rerank_rank,
+                # BUKAN di n.score. Sort berdasarkan n.score setelah ini akan merusak urutan.
+                nodes_for_gen: List[Any] = list(nodes)   # default: tanpa reranking
+
+                # Lookup map: chunk_id → {rerank_score, rerank_rank}
+                # Dipakai untuk enrichment logging retrieved_nodes (nodes pre-rerank penuh)
+                _rerank_score_map: Dict[str, Any] = {}
+
+                if _reranker_act and nodes:
+                    st.write(f"⚡ Cross-Encoder Reranking ({len(nodes)} kandidat → Top-{_top_n_rerank_effective})...")
+
+                    _reranker_info_runtime: Dict[str, Any] = {}
+                    _reranker_info_post_unload: Dict[str, Any] = {}
+
+                    try:
+                        load_reranker(cfg_runtime)
+                        _reranker_info_runtime = get_reranker_info()
+
+                        if is_reranker_loaded():
+                            nodes_for_gen = rerank_nodes(
+                                # Pakai effective_retrieval_query (query final pasca-self-query)
+                                # agar Cross-Encoder menilai relevansi terhadap query yang sama
+                                # dengan yang dipakai saat retrieval.
+                                effective_retrieval_query,
+                                nodes,
+                                top_n_rerank=_top_n_rerank_effective,
+                            )
+                            reranker_applied = True
+                            nodes_reranked_pre_anchor = list(nodes_for_gen)
+
+                            # Bangun lookup map untuk enrichment log retrieved_nodes
+                            _rerank_score_map = {
+                                str(getattr(n, "chunk_id", "") or ""): {
+                                    "rerank_score": getattr(n, "rerank_score", None),
+                                    "rerank_rank": getattr(n, "rerank_rank", None),
+                                }
+                                for n in nodes_reranked_pre_anchor
+                                if str(getattr(n, "chunk_id", "") or "")
+                            }
+                            st.write(
+                                f"✅ Reranking selesai: Top-{len(nodes_for_gen)} "
+                                f"(device={_reranker_info_runtime.get('resolved_device', '?')}) dikirim ke LLM..."
+                            )
+                        else:
+                            # Model gagal dimuat → graceful skip
+                            nodes_for_gen = list(nodes[:_top_n_rerank_effective])
+                            nodes_reranked_pre_anchor = list(nodes_for_gen)
+                            reranker_applied = False
+                            _rk_err = _reranker_info_runtime.get("error_msg", "unknown error")
+                            st.warning(
+                                f"⚠️ Reranker tidak berhasil dimuat ({_rk_err}) → "
+                                f"graceful skip: Top-{_top_n_rerank_effective} dari retrieval langsung dipakai."
+                            )
+
+                    except Exception as _re_exc:
+                        logger.warning(
+                            f"[V3.0c] Reranker error (non-critical, graceful skip): {_re_exc}"
+                        )
+                        nodes_for_gen = list(nodes[:_top_n_rerank_effective])
+                        nodes_reranked_pre_anchor = list(nodes_for_gen)
+                        reranker_applied = False
+
+                    finally:
+                        # ⚠️ WAJIB: unload SEBELUM LLM dimuat untuk membebaskan VRAM
+                        try:
+                            unload_reranker()
+                        except Exception:
+                            pass
+                        _reranker_info_post_unload = get_reranker_info()
+
+                    # Simpan snapshot info runtime (model/device/fallback yang benar-benar dipakai),
+                    # lalu tambahkan status cleanup setelah unload untuk audit.
+                    reranker_info = dict(_reranker_info_runtime or _reranker_info_post_unload or {})
+                    reranker_info["unloaded_after_use"] = True
+                    reranker_info["loaded_after_unload"] = bool(
+                        _reranker_info_post_unload.get("loaded", False)
+                    )
+
+                else:
+                    # Reranker disabled atau dimatikan di eval
+                    reranker_info = get_reranker_info()
+                    if not _reranker_en:
+                        logger.debug("[V3.0c] Reranker disabled in config → skip")
+                    elif run_mode == "eval" and not _rk_allow_eval:
+                        logger.debug("[V3.0c] Reranker disabled in eval mode → skip")
+
+                # T10 polish:
+                # Normalisasi telemetry reranker agar legacy config tidak membawa
+                # fingerprint palsu, tetapi T06 fail-path tetap jujur.
+                _rk_meta = _build_reranker_telemetry(
+                    cfg=cfg_runtime,
+                    feature_context_enabled=bool(_reranker_act),
+                    reranker_applied=bool(reranker_applied),
+                    reranker_info=reranker_info,
+                    nodes_before_rerank=nodes_before_rerank,
+                    top_n_base=(_top_n_rerank_base if _reranker_act else None),
+                    top_n_effective=(_top_n_rerank_effective if _reranker_act else None),
+                    rerank_anchor_reservation=rerank_anchor_reservation,
+                )
+
+                # =========================
+                # V3.0c: Coverage-preserving rescue after rerank
+                # refinement - deterministic anchor reservation
+                # =========================
+                # Tujuan:
+                # - untuk query comparison / multi-target / steps,
+                #   hasil final pasca-rerank tidak boleh kehilangan representasi metode target
+                # - reranker tetap aktif, tetapi jika salah satu metode hilang,
+                #   inject 1 anchor node terbaik dari candidate pool pre-rerank
+                #
+                # Contoh kasus yang diperbaiki:
+                # pre-rerank berhasil menemukan RAD + PROTOTYPING,
+                # tetapi final top-3 setelah rerank menjadi RAD + RAD + EXTREME_PROGRAMMING.
+                # Pada kondisi ini, PROTOTYPING harus "diselamatkan" kembali ke final contexts.
+                _coverage_detail_map: Dict[str, Any] = {}
+                if (
+                    isinstance(coverage_meta, dict)
+                    and isinstance(coverage_meta.get("detail"), dict)
+                ):
+                    _coverage_detail_map = coverage_meta["detail"].get("coverage") or {}
+
+                _anchor_target_methods = list(dict.fromkeys(target_methods or []))
+                _reserve_method_anchors = bool(
+                    (cfg_runtime.get("reranker") or {}).get("reserve_method_anchors", True)
+                )
+
+                _anchor_should_run = bool(
+                    reranker_applied
+                    and _reserve_method_anchors
+                    and _anchor_target_methods
+                    and (
+                        detect_multi_target
+                        or steps_q_now
+                        or len(_anchor_target_methods) >= 2
+                    )
+                )
+
+                if _anchor_should_run:
+                    nodes_for_gen, rerank_anchor_reservation = build_final_nodes_with_anchor_reservation(
+                        reranked_nodes=nodes_for_gen,
+                        candidate_nodes=nodes_before_rerank,
+                        target_methods=_anchor_target_methods,
+                        coverage_detail=_coverage_detail_map,
+                        final_k=int(_top_n_rerank_effective),
+                        prefer_steps=bool(steps_q_now),
+                        top_n_base=int(_top_n_rerank_base),
+                        top_n_effective=int(_top_n_rerank_effective),
+                        dynamic_top_n=bool(_dynamic_top_n),
+                        complex_query=bool(_complex_rerank_query),
+                    )
+
+                    logger.info(
+                        "[V3.0c][anchor-reservation] reserved=%s anchors=%s modified=%s final_n=%s",
+                        rerank_anchor_reservation.get("reserved_methods"),
+                        rerank_anchor_reservation.get("reserved_anchor_chunk_ids"),
+                        rerank_anchor_reservation.get("modified"),
+                        rerank_anchor_reservation.get("final_n"),
+                    )
+
+                    if rerank_anchor_reservation.get("applied"):
+                        _reserved = ", ".join(rerank_anchor_reservation.get("reserved_methods") or [])
+                        _msg = (
+                            "🛟 Anchor reservation aktif: "
+                            f"metode target [{_reserved}] dijaga tetap hadir di final contexts."
+                        )
+                        if rerank_anchor_reservation.get("modified"):
+                            _msg += " Final set dimodifikasi setelah rerank..."
+                        st.write(_msg)
+
+                # =========================
+                # V3.0c final patch: sync rerank metadata ke final nodes
+                # =========================
+                # Tujuan:
+                # - CTX Mapping final tidak menampilkan None untuk rerank_score/rerank_rank
+                # - Sources pills rerank tetap muncul
+                # - panel After Rerank konsisten dengan retrieval.jsonl
+                _rerank_meta_map = _build_rerank_meta_map(nodes_reranked_pre_anchor)
+                nodes_for_gen = _sync_rerank_metadata_to_final_nodes(
+                    nodes_for_gen,
+                    _rerank_meta_map,
+                )
+
+                # ← UX patch: tandai node reserved anchor agar UI tidak menganggap
+                # rerank_score/rerank_rank=None sebagai bug.
+                nodes_for_gen = _tag_reserved_anchor_nodes(
+                    nodes_for_gen,
+                    rerank_anchor_reservation,
+                )
+
+                # =========================
+                # Contexts (dari nodes_for_gen - apa yang benar-benar dikirim ke LLM)
+                # =========================
+                # ← V3.0c: pakai nodes_for_gen (post-rerank), bukan nodes_before_rerank
+                contexts = build_contexts_with_meta(nodes_for_gen)
 
                 # Tentukan max bullet Bukti dinamis (3 default, bisa naik jadi 5)
                 max_bullets, bullets_meta = decide_max_bullets(
@@ -1819,7 +3262,16 @@ def main() -> None:
                     expanded_max=5,
                 )
 
-                retrieval_stats = compute_retrieval_stats(nodes)
+                # ← V3.0c:
+                # Bedakan secara eksplisit:
+                # - retrieval_stats_pre_rerank = kualitas candidate pool retrieval
+                # - generation_context_stats   = kualitas final contexts yang benar-benar masuk ke LLM
+                retrieval_stats_pre_rerank = compute_retrieval_stats(nodes_before_rerank)
+                generation_context_stats = compute_retrieval_stats(nodes_for_gen)
+
+                # Backward-compatible:
+                # pertahankan retrieval_stats lama mengacu ke final contexts yang dipakai generator, agar consumer lama tidak rusak.
+                retrieval_stats = generation_context_stats
 
                 strategy = retrieval_mode  # "dense" atau "hybrid"
                 if retrieval_query_before_self_query != query:
@@ -1829,6 +3281,8 @@ def main() -> None:
                 # +diverse marker hanya relevan untuk jalur dense murni
                 if diversify and retrieval_mode != "hybrid":
                     strategy = f"{strategy}+diverse"
+                if reranker_applied:
+                    strategy = f"{strategy}+rerank"   # ← V3.0c
 
                 # timestamp per turn
                 ts = datetime.now().isoformat(timespec="seconds")
@@ -1865,9 +3319,24 @@ def main() -> None:
                         "pool_mult": int(pool_mult),
                         "candidate_k": int(candidate_k) if candidate_k is not None else None,
                     },
-                    "retrieval_stats": retrieval_stats,
+                    "retrieval_stats": retrieval_stats,  # Backward-compatible: tetap ada
+                    # ← V3.0c: stats eksplisit pre vs post
+                    "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                    "generation_context_stats": generation_context_stats,
                     "retrieval_confidence": retrieval_stats.get("sim_top1"),
                     "self_query": _self_query_log,   # ← V3.0b
+                    # ← V3.0c: reranker metadata di level record
+                    "reranker_applied":         _rk_meta["applied"],
+                    "reranker_candidate_count": _rk_meta["candidate_count"],  # jumlah node sebelum rerank
+                    "reranker_top_n":           _rk_meta["top_n"],  # effective final top-n
+                    "reranker_top_n_base":      _rk_meta["top_n_base"],
+                    "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                    "reranker_info":            _rk_meta["info"],
+                    "rerank_coverage_rescue":   rerank_coverage_rescue,         # legacy telemetry
+                    "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
+                    # ← V3.0c: retrieved_nodes = SEMUA kandidat pre-rerank (bukan hanya nodes_for_gen)
+                    # sehingga log memperlihatkan: "10 node di-retrieve, 3 lolos rerank, 7 tidak"
+                    # rerank_score/rerank_rank diisi hanya untuk node yang masuk Top-N (dari _rerank_score_map)
                     "retrieved_nodes": [
                         {
                             "doc_id": n.doc_id,
@@ -1882,12 +3351,15 @@ def main() -> None:
                             "score_sparse": n.score_sparse,
                             "rank_dense":   n.rank_dense,
                             "rank_sparse":  n.rank_sparse,
+                            # ← V3.0c: terisi jika node masuk Top-N rerank; None jika tidak
+                            "rerank_score": _rerank_score_map.get(n.chunk_id, {}).get("rerank_score"),
+                            "rerank_rank":  _rerank_score_map.get(n.chunk_id, {}).get("rerank_rank"),
                             "stream":      n.stream,       # (V3.0a; None untuk V1/V2)
                             "bab_label":   n.bab_label,    # (V3.0a; None untuk V1/V2)
                             "metadata": n.metadata,
                             "text": n.text,  # akan di-trim otomatis oleh RunManager.log_retrieval
                         }
-                        for n in nodes
+                        for n in nodes # iterasi nodes PRE-RERANK (penuh)
                     ],
                 }
                 rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
@@ -1900,6 +3372,7 @@ def main() -> None:
                 # Retrieval memakai retrieval_query (hasil rewrite) -> untuk mendapatkan konteks yang tepat.
                 # Tetapi LLM harus menjawab pertanyaan USER (query asli) agar tidak mismatch.
                 user_query = query  # selalu menjawab berdasarkan user_query
+                # ← V3.0c: used_ctx dari nodes_for_gen (yang benar-benar dikirim ke LLM)
                 used_ctx = min(len(contexts), min(int(top_k_ui), 8))  # generate.py memakai hard cap 8
                 generator_error = None
 
@@ -1941,13 +3414,11 @@ def main() -> None:
                     if isinstance(focus_methods, list) and focus_methods:
                         # override gen_targets agar generator tidak melebar ke dokumen lain
                         gen_targets = [m for m in focus_methods if isinstance(m, str) and m]
-
                         # siapkan cov_map minimal untuk steps-aware missing (dipakai di bawah)
                         cov_map = {
                             m: {"found": True, "doc_id": str(method_doc_map.get(m, "") or "")}
                             for m in gen_targets
                         }
-
                         # reset missing_methods baseline; nanti dihitung lagi oleh blok steps-aware
                         missing_methods = []
 
@@ -1967,8 +3438,8 @@ def main() -> None:
                     ctx_methods = detect_methods_in_contexts(contexts)
                     if ctx_methods:
                         # kalau bukan "metode apa saja" (list), ambil 1 metode dominan (top doc) agar tidak melebar
-                        if (not is_method_list_q) and len(ctx_methods) > 1 and nodes:
-                            top_doc = str(getattr(nodes[0], "doc_id", "") or "").lower()
+                        if (not is_method_list_q) and len(ctx_methods) > 1 and nodes_for_gen:
+                            top_doc = str(getattr(nodes_for_gen[0], "doc_id", "") or "").lower()
                             picked = None
                             for m in ctx_methods:
                                 if _docid_hit_for_method(top_doc, m):
@@ -2047,7 +3518,6 @@ def main() -> None:
 
                 bullets_meta = dict(bullets_meta or {})
                 bullets_meta["max_bullets"] = int(max_bullets)
-
                 # enrich bullets_meta untuk logging
                 bullets_meta.update(
                     {
@@ -2088,7 +3558,7 @@ def main() -> None:
                         st.warning(f"LLM error: {type(ex).__name__}: {ex}")
                         answer_raw = "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
                 else:
-                    answer_raw = build_retrieval_only_answer(nodes, max_points=3)
+                    answer_raw = build_retrieval_only_answer(nodes_for_gen, max_points=3)
 
                 # meta generator (dibuat setelah answer_raw final)
                 generator_meta = build_generation_meta(
@@ -2125,7 +3595,8 @@ def main() -> None:
                     "metadata_route": metadata_meta,
                     "contextualize_decision": contextualize_decision,
                     "doc_focus": st.session_state.get("last_doc_focus_meta"),
-                    "used_context_chunk_ids": [n.chunk_id for n in nodes],
+                    # ← V3.0c: chunk IDs yang benar-benar masuk ke LLM (nodes_for_gen)
+                    "used_context_chunk_ids": [n.chunk_id for n in nodes_for_gen],
                     "answer": answer_raw,
                     "strategy": strategy,
                     "diversity": {
@@ -2135,7 +3606,10 @@ def main() -> None:
                         "pool_mult": int(pool_mult),
                         "candidate_k": int(candidate_k) if candidate_k is not None else None,
                     },
-                    "retrieval_stats": retrieval_stats,
+                    "retrieval_stats": retrieval_stats,  # Backward-compatible
+                    # ← V3.0c: stats eksplisit pre vs post
+                    "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                    "generation_context_stats": generation_context_stats,
                     "retrieval_confidence": retrieval_stats.get("sim_top1"),
                     "generator_strategy": generator_strategy_name,
                     "generator_status": generator_status,
@@ -2144,6 +3618,14 @@ def main() -> None:
                     "bullet_policy": bullets_meta,  # berisi methods_detected, anaphora, multi_target, dll
                     "error": generator_error,
                     "self_query": _self_query_log,   # ← V3.0b
+                    # ← V3.0c
+                    "reranker_applied": _rk_meta["applied"],
+                    "reranker_model":   (_rk_meta["info"] or {}).get("model_name"),
+                    "reranker_top_n":   _rk_meta["top_n"],
+                    "reranker_top_n_base": _rk_meta["top_n_base"],
+                    "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                    "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
+                    "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
                 }
                 rm.log_answer(answer_record, include_config_snapshot_per_row=include_cfg)
 
@@ -2194,23 +3676,36 @@ def main() -> None:
                 # persist last result (bersifat tetap hingga query baru dijalankan)
                 st.session_state["last_answer_raw"] = answer_raw  # menyimpan last answer dari copy
                 st.session_state["last_turn_id"] = turn_id
-                st.session_state["last_nodes"] = nodes  # menyimpan last nodes untuk
+                # ← V3.0c:
+                # last_nodes                = final contexts yang benar-benar dipakai LLM
+                # last_nodes_before_rerank  = candidate pool pre-rerank untuk UI before-vs-after
+                st.session_state["last_nodes"] = nodes_for_gen
+                st.session_state["last_nodes_before_rerank"] = nodes_before_rerank
                 st.session_state["last_strategy"] = strategy
                 st.session_state["last_retrieval_mode"] = retrieval_mode 
+                # ← V3.0c: simpan stats eksplisit untuk current/latest render
+                st.session_state["last_retrieval_stats_pre_rerank"] = retrieval_stats_pre_rerank
+                st.session_state["last_generation_context_stats"] = generation_context_stats
                 st.session_state["_scroll_answer"] = True
                 st.session_state["last_user_query"] = query
                 st.session_state["last_retrieval_query"] = effective_retrieval_query
-
                 # tandai bahwa konfigurasi UI saat ini sudah dipakai untuk hasil terakhir
                 st.session_state["last_applied_ui_cfg"] = current_ui_cfg.copy()
                 st.session_state["last_history_used"] = history_used
                 st.session_state["last_contextualized"] = bool(retrieval_query != query)
+                st.session_state["last_reranker_applied"] = _rk_meta["applied"]  # ← V3.0c
+                st.session_state["last_reranker_info"] = _rk_meta["info"]        # ← V3.0c
+                st.session_state["last_rerank_anchor_reservation"] = _rk_meta["anchor_reservation"]
 
                 # simpan full render data untuk turn viewer
                 if "turn_data" not in st.session_state:
                     st.session_state["turn_data"] = {}
                 st.session_state["turn_data"][turn_id] = {
-                    "nodes": nodes,
+                    # ← V3.0c:
+                    # nodes                = final contexts yang benar-benar dipakai LLM
+                    # nodes_before_rerank  = candidate pool pre-rerank
+                    "nodes": nodes_for_gen,
+                    "nodes_before_rerank": nodes_before_rerank,
                     "answer_raw": answer_raw,
                     "user_query": query,
                     "retrieval_query": effective_retrieval_query,
@@ -2219,6 +3714,17 @@ def main() -> None:
                     "contextualized": bool(retrieval_query_before_self_query != query),
                     "retrieval_mode": retrieval_mode,
                     "self_query_filter_applied": bool(_self_query_filter is not None),  # ← V3.0b
+                    "reranker_applied": _rk_meta["applied"],  # ← V3.0c
+                    # ← V3.0c: disiapkan untuk app_ui_render.py
+                    "reranker_candidate_count": _rk_meta["candidate_count"],
+                    "reranker_top_n": _rk_meta["top_n"],
+                    "reranker_top_n_base": _rk_meta["top_n_base"],
+                    "reranker_top_n_effective": _rk_meta["top_n_effective"],
+                    "retrieval_stats_pre_rerank": retrieval_stats_pre_rerank,
+                    "generation_context_stats": generation_context_stats,
+                    "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
+                    "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
+                    "reranker_info": _rk_meta["info"],
                 }
 
             _proc_status.update(label="💡 Finished!", state="complete", expanded=False)
@@ -2249,20 +3755,22 @@ def main() -> None:
         st.write("Turns (Session):", _sb_turn_str)
         st.write("Memory Used:", _sb_mem_str)
         st.write("Contextualized:", _sb_ctx_str)
+        # ← V3.0c: tampilkan status reranker di turn status
+        _sb_rk = (
+            _tds[_sid].get("reranker_applied")
+            if _is_hist_sb
+            else st.session_state.get("last_reranker_applied", False)
+        )
+        if _sb_rk is not None:
+            st.write("Reranker:", "☑️ Applied" if _sb_rk else "❌ Not Applied")
         # Baris tambahan: hanya muncul saat user sedang melihat turn historis
         if _is_hist_sb:
             st.markdown(
-                f'<div style="'
-                f"background:rgba(37,99,235,0.08);"
-                f"border-left:3px solid #3b82f6;"
-                f"border-radius:0 0.3rem 0.3rem 0;"
-                f"padding:0.3rem 0.6rem;"
-                f"margin-top:0.35rem;"
-                f'">'
+                f'<div style="background:rgba(37,99,235,0.08);border-left:3px solid #3b82f6;'
+                f'border-radius:0 0.3rem 0.3rem 0;padding:0.3rem 0.6rem;margin-top:0.35rem;">'
                 f'<span style="color:#93c5fd;font-size:0.8rem;">👁️ Viewing:</span>'
-                f'<span style="color:#60a5fa;font-weight:700;font-size:0.8rem;'
-                f'margin-left:0.4rem;">Chat-Turn {_sid}</span>'
-                f'</div>',
+                f'<span style="color:#60a5fa;font-weight:700;font-size:0.8rem;margin-left:0.4rem;">'
+                f'Chat-Turn {_sid}</span></div>',
                 unsafe_allow_html=True,
             )
 
@@ -2508,23 +4016,40 @@ def main() -> None:
             _viewing_id is not None and _viewing_id in _turn_data_store
         )
 
+        # CATATAN V3.0c:
+        # - nodes                = contexts final pasca-rerank (yang benar-benar dipakai LLM/UI utama)
+        # - nodes_before_rerank  = candidate pool pre-rerank (untuk audit & future UI before-vs-after)
+        # - retrieval_stats_pre_rerank_render / generation_context_stats_render
+        #   sudah disiapkan di sini agar app_ui_render.py nanti bisa menampilkan ringkasan impact reranker tanpa perlu menghitung ulang dari nol.
         if _is_viewing_history:
             _td = _turn_data_store[_viewing_id]
+            # final contexts yang benar-benar dipakai LLM
             nodes: List[Any] = _td.get("nodes") or []
+            # candidate pool pre-rerank (untuk future UI before-vs-after)
+            nodes_before_rerank: List[Any] = _td.get("nodes_before_rerank") or []
             answer_raw: str = _td.get("answer_raw", "")
             turn_id = int(_viewing_id or 0)
             uq = _td.get("user_query", "")
             rq = _td.get("retrieval_query", "")
             last_strategy = _td.get("strategy", "")
             retrieval_mode_render = str(_td.get("retrieval_mode", "dense"))
+            # ← V3.0c: stats eksplisit, disiapkan untuk render future enhancement
+            retrieval_stats_pre_rerank_render = _td.get("retrieval_stats_pre_rerank")
+            generation_context_stats_render = _td.get("generation_context_stats")
         else:
+            # final contexts yang benar-benar dipakai LLM
             nodes = st.session_state.get("last_nodes") or []
+            # candidate pool pre-rerank (untuk future UI before-vs-after)
+            nodes_before_rerank = st.session_state.get("last_nodes_before_rerank") or []
             answer_raw = st.session_state.get("last_answer_raw", "")
             turn_id = st.session_state.get("last_turn_id", 0)
             uq = st.session_state.get("last_user_query", "")
             rq = st.session_state.get("last_retrieval_query", "")
             last_strategy = st.session_state.get("last_strategy", "")
             retrieval_mode_render = str(st.session_state.get("last_retrieval_mode", "dense"))
+            # ← V3.0c: stats eksplisit, disiapkan untuk render future enhancement
+            retrieval_stats_pre_rerank_render = st.session_state.get("last_retrieval_stats_pre_rerank")
+            generation_context_stats_render = st.session_state.get("last_generation_context_stats")
 
         jawaban, bukti = parse_answer(answer_raw)
         global_not_found = is_global_not_found_answer(answer_raw)
@@ -2540,6 +4065,36 @@ def main() -> None:
                 st.rerun()
 
         render_processing_box(uq, rq)
+
+        # ← V3.0c: ringkasan before-vs-after rerank (deskriptif, bukan evaluatif)
+        _reranker_applied_render = (
+            _td.get("reranker_applied")
+            if _is_viewing_history
+            else st.session_state.get("last_reranker_applied", False)
+        )
+        _reranker_candidate_count_render = (
+            _td.get("reranker_candidate_count")
+            if _is_viewing_history
+            else 0
+        )
+        _reranker_top_n_render = (
+            _td.get("reranker_top_n")
+            if _is_viewing_history
+            else None
+        )
+
+        if not _is_viewing_history:
+            if bool(st.session_state.get("last_reranker_applied", False)):
+                _reranker_candidate_count_render = len(nodes_before_rerank) if nodes_before_rerank else 0
+                _reranker_top_n_render = len(nodes) if nodes else None
+
+        render_rerank_summary_box(
+            reranker_applied=bool(_reranker_applied_render),
+            candidate_count=_reranker_candidate_count_render,
+            top_n=_reranker_top_n_render,
+            retrieval_stats_pre_rerank=retrieval_stats_pre_rerank_render,
+            generation_context_stats=generation_context_stats_render,
+        )
 
         # Answer section — styled card
         h1, h2 = st.columns([0.88, 0.12])
@@ -2557,6 +4112,27 @@ def main() -> None:
 
         # Evidence section — styled card
         render_bukti_section(bukti)
+
+        # ← V3.0c UI enrichment: before vs after rerank (debug / audit)
+        _anchor_meta_render = (
+            _td.get("rerank_anchor_reservation")
+            if _is_viewing_history
+            else st.session_state.get("last_rerank_anchor_reservation")
+        )
+
+        _rk_cfg_render = cfg.get("reranker") or {}
+        _show_before_after_panel = bool(_rk_cfg_render.get("show_before_after_panel", True))
+        _before_after_max_pre_rows = int(_rk_cfg_render.get("before_after_ui_max_pre_rows", 6))
+
+        if _show_before_after_panel:
+            render_rerank_before_after_panel(
+                reranker_applied=bool(_reranker_applied_render),
+                nodes_before_rerank=nodes_before_rerank,
+                nodes_after_rerank=nodes,
+                retrieval_mode=retrieval_mode_render,
+                anchor_meta=_anchor_meta_render,
+                max_pre_rows=_before_after_max_pre_rows,
+            )
 
         # Auto-scroll after submit
         if st.session_state.get("_scroll_answer"):
@@ -2586,33 +4162,7 @@ def main() -> None:
                 if not show_debug:
                     highlight_terms = []
                 else:
-                    ctx_rows = []
-                    for i, n in enumerate(nodes, start=1):
-                        source_file = n.metadata.get("source_file", "")
-                        page = n.metadata.get("page", "?")
-                        row: Dict[str, Any] = {
-                            "CTX": f"CTX {i}",
-                            "stream":    n.stream    or "—",   
-                            "bab_label": n.bab_label or "—",   
-                            "doc_id": n.doc_id,
-                            "page": page,
-                            "source_file": source_file,
-                            "chunk_id": n.chunk_id,
-                        }
-                        if retrieval_mode_render == "hybrid":
-                            row["score_rrf"]    = round(float(n.score), 6)
-                            row["score_dense"]  = (
-                                round(float(n.score_dense), 4) if n.score_dense is not None else None
-                            )
-                            row["score_sparse"] = (
-                                round(float(n.score_sparse), 4) if n.score_sparse is not None else None
-                            )
-                            row["rank_dense"]   = n.rank_dense
-                            row["rank_sparse"]  = n.rank_sparse
-                        else:
-                            row["sim"]  = round(dist_to_sim(float(n.score)), 4)
-                            row["dist"] = round(float(n.score), 4)
-                        ctx_rows.append(row)
+                    ctx_rows = build_ctx_rows(nodes, retrieval_mode_render)
                     render_ctx_mapping_table(ctx_rows)
 
                     # Highlight terms (manual override). Jika kosong -> auto dari query terakhir
@@ -2624,10 +4174,8 @@ def main() -> None:
 
                     last_query = st.session_state.get("last_submitted_query", "")
                     query_terms = extract_terms_from_query(last_query)
-
                     ctx1_text = nodes[0].text if nodes else ""
                     ctx_terms = extract_terms_from_text(ctx1_text, max_terms=6)
-
                     combined = []
                     seen = set()
                     for t in query_terms + ctx_terms:
@@ -2640,33 +4188,7 @@ def main() -> None:
                     highlight_terms = manual_terms if manual_terms else combined[:8]
 
             else:
-                ctx_rows = []
-                for i, n in enumerate(nodes, start=1):
-                    source_file = n.metadata.get("source_file", "")
-                    page = n.metadata.get("page", "?")
-                    row: Dict[str, Any] = {
-                        "CTX": f"CTX {i}",
-                        "stream":    n.stream    or "—",   
-                        "bab_label": n.bab_label or "—",
-                        "doc_id": n.doc_id,
-                        "page": page,
-                        "source_file": source_file,
-                        "chunk_id": n.chunk_id,
-                    }
-                    if retrieval_mode_render == "hybrid":
-                        row["score_rrf"]    = round(float(n.score), 6)
-                        row["score_dense"]  = (
-                            round(float(n.score_dense), 4) if n.score_dense is not None else None
-                        )
-                        row["score_sparse"] = (
-                            round(float(n.score_sparse), 4) if n.score_sparse is not None else None
-                        )
-                        row["rank_dense"]   = n.rank_dense
-                        row["rank_sparse"]  = n.rank_sparse
-                    else:
-                        row["sim"]  = round(dist_to_sim(float(n.score)), 4)
-                        row["dist"] = round(float(n.score), 4)
-                    ctx_rows.append(row)
+                ctx_rows = build_ctx_rows(nodes, retrieval_mode_render)
                 render_ctx_mapping_table(ctx_rows)
 
                 # Highlight terms (manual override). Jika kosong -> auto dari query terakhir
@@ -2678,10 +4200,8 @@ def main() -> None:
 
                 last_query = st.session_state.get("last_submitted_query", "")
                 query_terms = extract_terms_from_query(last_query)
-
                 ctx1_text = nodes[0].text if nodes else ""
                 ctx_terms = extract_terms_from_text(ctx1_text, max_terms=6)
-
                 combined = []
                 seen = set()
                 for t in query_terms + ctx_terms:
@@ -2732,6 +4252,12 @@ def main() -> None:
                 preview = (n.text or "").strip().replace("\n", " ")
                 preview = preview[:260] + ("..." if len(preview) > 260 else "")
 
+                # ← V3.0c: siapkan string rerank untuk title expander
+                _rk_str = (
+                    f" | rk={n.rerank_score:.4f} [#{n.rerank_rank}]"
+                    if n.rerank_score is not None else ""
+                )
+
                 # ── Hitung skor tampilan (mode-aware) ──
                 dist = 0.0  # inisialisasi untuk type-checker
                 sim  = 0.0
@@ -2750,8 +4276,10 @@ def main() -> None:
 
                     _d_str     = f"sim = {_d_sim:.3f}" if _d_sim   is not None else "dense = —"
                     _s_str     = f"bm25 = {_s_bm25:.2f}" if _s_bm25 is not None else "sparse = —"
+                    # ← V3.0c: tambahkan _rk_str ke title hybrid
                     title = (
-                        f"{_badge} {n.doc_id} | rrf = {_rrf_sc:.5f} | {_d_str} | {_s_str} | {source_file} p.{page}"
+                        f"{_badge} {n.doc_id} | rrf = {_rrf_sc:.5f} | {_d_str} | {_s_str}"
+                        f"{_rk_str} | {source_file} p.{page}"
                     )
                 else:
                     _rrf_sc = None
@@ -2761,10 +4289,11 @@ def main() -> None:
                     dist    = float(n.score)
                     sim     = dist_to_sim(dist)
                     _badge  = sim_color_badge(sim)
+                    # ← V3.0c: tambahkan _rk_str ke title dense
                     title   = (
-                        f"{_badge} {n.doc_id} | sim = {sim:.4f} | dist = {dist:.4f} | {source_file} p.{page}"
+                        f"{_badge} {n.doc_id} | sim = {sim:.4f} | dist = {dist:.4f}"
+                        f"{_rk_str} | {source_file} p.{page}"
                     )
-
                 with st.expander(title):
                     # ── Score pills (mode-aware) - delegasi ke app_ui_render ──
                     if retrieval_mode_render == "hybrid":
@@ -2777,9 +4306,22 @@ def main() -> None:
                             rank_sparse=n.rank_sparse,
                             ctx_label=f"CTX {i}",
                             stream=n.stream,
+                            rerank_score=n.rerank_score,   # ← V3.0c
+                            rerank_rank=n.rerank_rank,     # ← V3.0c
+                            is_reserved_anchor=bool(getattr(n, "is_reserved_anchor", False)),
+                            reserved_for_method=getattr(n, "reserved_for_method", None),
                         )
                     else:
-                        render_source_score_pills(sim, dist, ctx_label=f"CTX {i}", stream=n.stream)
+                        render_source_score_pills(
+                            sim,
+                            dist,
+                            ctx_label=f"CTX {i}",
+                            stream=n.stream,
+                            rerank_score=n.rerank_score,   # ← V3.0c
+                            rerank_rank=n.rerank_rank,     # ← V3.0c
+                            is_reserved_anchor=bool(getattr(n, "is_reserved_anchor", False)),
+                            reserved_for_method=getattr(n, "reserved_for_method", None),
+                        )
 
                     st.caption(f"Preview: {preview}")
 

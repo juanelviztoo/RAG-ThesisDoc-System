@@ -1,7 +1,7 @@
 # RAG ThesisDoc System
 **Retrieval-Augmented Generation (RAG) untuk Dokumen Skripsi/TA**  
 
-> **Status Terkini:** V3.0b (**DONE ✅ / siap release-tag `v3.0b-selfquery`**) di branch `dev`. `main` saat ini masih mereferensikan V3.0a (`v3.0a-structured`) sampai merge + tag release dilakukan. Fokus pengembangan berikutnya adalah V3.0c.
+> **Status Terkini:** V3.0c (**DONE ✅ / RELEASED ✅ / tag `v3.0c-rerank`**) di branch `main` dan sudah tersinkron kembali ke `dev`. V3.0c sudah selesai difinalisasi secara code, dokumentasi, validasi, dan git strategy. Fokus pengembangan berikutnya adalah **V3.0d** (Post-Hoc Verification).
 
 ---
 
@@ -11,26 +11,28 @@
 - **V2.0 (DONE ✅)** — `v2.0-hybrid`: Hybrid Retrieval (BM25+Sastrawi Sparse + Dense Vector + RRF Fusion) + UI Hybrid Score Display
 - **V3.0a (DONE ✅)** — `v3.0a-structured`: Structure-Aware PDF Parsing + Dual Stream (Narasi vs Sitasi) + Dual ChromaDB Collection + Citation Routing
 - **V3.0b (DONE ✅)** — `v3.0b-selfquery`: Metadata Self-Querying Filtering (Tahun, Prodi, Penulis) + Stable JSONL Self-Query Logging + Pre-check Zero-Result Fallback + Metadata Exact-Match Answer Guard + Metadata Router Natural-Language Alias Resolution
-- **V3.0c (NEXT 🔄)** — Cross-Encoder Reranking (Top-10 → Top-3)
-- **V3.0d (PLANNED)** — Post-Hoc Verification (Confidence Scoring + label Hijau/Merah)
+- **V3.0c (DONE ✅)** — `v3.0c-rerank`: Cross-Encoder Reranking (`BAAI/bge-reranker-base`) + Sequential Loading + Dynamic Top-N + Anchor Reservation + Before-vs-After Audit UI + Generation Hardening + Multi-turn Stabilization + Backward-Compatibility Polish
+- **V3.0d (NEXT 🔄)** — Post-Hoc Verification (Confidence Scoring + label Hijau/Merah)
 
 **Pemetaan Ablation Study:**
 | Skenario | Versi | Tag | Keterangan |
 |----------|-------|-----|------------|
 | A | V1.0 | `v1.0-naive` | Naive Dense RAG |
 | B | V2.0 | `v2.0-hybrid` | Hybrid RAG (BM25+Sastrawi+RRF) |
-| C | V3.0d | *(planned)* | Proposed Method (Full Pipeline) |
+| C | V3.0c | `v3.0c-rerank` | Proposed Method tahap aktif (Retrieval + Self-Query + Rerank + Audit UI) |
 
 ---
 
 ## Summary
 Repo ini berisi prototipe sistem **Question Answering** pada kumpulan PDF skripsi/TA.
 
-Versi **V3.0b** membangun di atas V3.0a dengan dua fondasi utama:
+Versi **V3.0c** membangun di atas V3.0b dengan empat fondasi utama:
 1. **Structure-aware dual-stream retrieval** dari V3.0a (narasi vs sitasi, dual collection, citation routing)
-2. **Metadata Self-Querying Filtering** pada primary retrieval narasi untuk mempersempit kandidat dokumen berdasarkan metadata terstruktur yang diekstrak dari query user
+2. **Metadata Self-Querying Filtering** dari V3.0b pada primary retrieval narasi
+3. **Cross-Encoder Reranking** di atas candidate pool retrieval untuk mempertajam final contexts sebelum generation
+4. **Generation + multi-turn hardening** agar query comparison/steps/follow-up singkat lebih grounded, stabil, dan mudah diaudit
 
-Fitur inti yang telah tersedia hingga **V3.0b**:
+Fitur inti yang telah tersedia hingga **V3.0c**:
 - **Structure-Aware PDF Parsing**: deteksi bab (BAB I–V, Daftar Pustaka, Lampiran) via regex + filename routing — setiap chunk "tahu posisinya" dalam hierarki akademik
 - **Dual Stream**: dokumen dipecah menjadi dua aliran — narasi (BAB I–V) dan sitasi (Daftar Pustaka) — masing-masing diindeks ke ChromaDB collection terpisah
 - **Citation Routing**: sistem mendeteksi otomatis apakah query menanyakan konten (→ narasi) atau referensi/pustaka (→ sitasi), lalu merge hasilnya
@@ -41,12 +43,23 @@ Fitur inti yang telah tersedia hingga **V3.0b**:
 - **Graceful Zero-Result Fallback (V3.0b)**: jika metadata filter valid tetapi pre-check menunjukkan 0 hasil, sistem otomatis fallback ke retrieval penuh tanpa crash
 - **Stable Self-Query Logging (V3.0b)**: field `self_query` kini diisi secara konsisten di `retrieval.jsonl` dan `answers.jsonl` pada semua jalur (normal retrieval, metadata-routed, disabled path, fallback path)
 - **Answer Guard untuk Exact Metadata Match (V3.0b)**: jika metadata eksplisit diminta user tetapi exact match tidak ditemukan, sistem memaksa jawaban `not_found` agar tidak menghasilkan false positive
-- **Metadata Routing (page count intent)**: pertanyaan seperti *"berapa halaman dokumen X?"* dijawab langsung dari `doc_catalog.json`; pada V3.0b, resolver juga mendukung alias natural-language seperti `"E-Ticketing"`
+- **Metadata Routing (page count intent)**: pertanyaan seperti *"berapa halaman dokumen X?"* dijawab langsung dari `doc_catalog.json`; resolver mendukung alias natural-language seperti `"E-Ticketing"`
+- **Cross-Encoder Reranking (V3.0c)**:
+  - model: `BAAI/bge-reranker-base`
+  - candidate pool default: Top-10
+  - final contexts: Top-3 untuk query biasa, adaptif ke Top-5 untuk query kompleks
+  - **Sequential Loading wajib**: load reranker → rerank → unload → load LLM → generate
+- **Dynamic Top-N (V3.0c)**: query comparison / multi-target / steps dapat memakai `top_n_rerank_complex = 5`
+- **Anchor Reservation (V3.0c)**: final set boleh dimodifikasi pasca-rerank secara sadar-konteks agar metode target tidak hilang dari final contexts
+- **Before vs After Audit UI (V3.0c)**: panel audit memperlihatkan candidate pool pre-rerank, final contexts post-rerank, source snapshot, rerank rank/score, dan anchor reservation
+- **Generation Hardening (V3.0c)**: comparison/steps answer dibuat lebih grounded, lebih jujur pada coverage asimetris, dan lebih faithful terhadap final contexts
+- **Multi-turn Stabilization (V3.0c)**: follow-up singkat seperti *"Bisa lebih ringkas lagi langkah utamanya?"* dapat diperlakukan sebagai kelanjutan konteks, bukan topic shift palsu
+- **Regression / Backward-Compatibility Polish (V3.0c)**: config legacy (`v1_5.yaml`, `v2.yaml`) tetap sehat tanpa fingerprint reranker palsu di UI/log
 - Dense retrieval (Chroma + embeddings) dengan diversity retrieval
 - Multi-turn memory (sliding window, topic shift detection)
 - Query contextualization (rewrite sebelum retrieval)
 - Generator (LLM) opsional (Groq/OpenAI/Ollama) dengan output guardrails lengkap
-- UI Streamlit demo-ready (turn viewer, history expander, styled sections, hybrid score display, stream pill)
+- UI Streamlit demo-ready (turn viewer, history expander, styled sections, hybrid score display, stream pill, rerank audit panel)
 - Coverage retrieval per-metode (untuk pertanyaan multi-target)
 - Logging lengkap untuk audit (manifest + retrieval.jsonl + answers.jsonl + app.log)
 - PDF Viewer berbasis gambar + **highlight keyword** (auto/manual)
@@ -370,45 +383,201 @@ Metadata router (`page_count`) tetap digunakan seperti di V1.5, tetapi V3.0b men
 - Filter `prodi` dan `penulis` belum seandal `tahun`, terutama ketika metadata dataset belum cukup bersih atau konsisten
 - Filter `penulis` sudah dapat diekstrak, tetapi exact-match retrieval untuk metadata penulis masih dicatat sebagai ruang pengembangan lanjutan
 
-#### Arsitektur Modul (V3.0b)
+---
+
+### [V3.0c — Cross-Encoder Reranking + Generation Hardening + Multi-turn Stabilization]
+
+#### Cross-Encoder Reranking
+V3.0c menambahkan tahap **Cross-Encoder reranking** di antara retrieval dan generation:
+- Model: `BAAI/bge-reranker-base`
+- Candidate pool default: **Top-10**
+- Final contexts default:
+  - **Top-3** untuk query biasa
+  - **Top-5** untuk query comparison / multi-target / steps
+- Lifecycle model diisolasi di modul baru `src/rag/reranker.py`
+- Public API utama:
+  - `load_reranker(...)`
+  - `unload_reranker()`
+  - `is_reranker_loaded()`
+  - `rerank(...)`
+  - `get_reranker_info()`
+
+#### Sequential Loading (WAJIB)
+Karena keterbatasan VRAM 4GB:
+- Cross-Encoder dan LLM **tidak boleh aktif bersamaan**
+- Urutan pipeline final:
+  1. retrieval (dense / hybrid)
+  2. candidate pool
+  3. `load_reranker()`
+  4. rerank
+  5. `unload_reranker()`
+  6. load/gunakan LLM
+  7. generation
+
+#### Dynamic Top-N
+Awalnya V3.0c memakai `Top-3` statis. Setelah validasi T02, diperkenalkan heuristik:
+- `top_n_rerank = 3` → base
+- `top_n_rerank_complex = 5` → efektif untuk query:
+  - comparison
+  - steps/tahapan
+  - multi-target
+  - query kompleks lain yang relevan
+
+Tujuan:
+- memberi ruang final contexts yang lebih lebar
+- mengurangi risiko hilangnya satu metode target
+- menjaga query biasa tetap ringkas
+
+#### Anchor Reservation
+Pada query comparison, hasil rerank murni bisa tetap "mengalahkan" salah satu metode target walaupun candidate pool sebenarnya sudah mengandung chunk yang benar.
+
+Karena itu V3.0c menambahkan **anchor reservation**:
+- final set boleh dimodifikasi **secara eksplisit dan sadar konteks**
+- sistem menjaga agar minimal satu anchor terbaik untuk tiap metode target tetap hadir
+- perilaku ini terdokumentasi di UI dan log, bukan sort ulang tersembunyi
+
+#### Generation Hardening
+Selama validasi, bottleneck berpindah dari retrieval ke generation. Karena itu V3.0c juga mempatch `generate_utils.py` agar:
+- jawaban comparison / steps / multi-target lebih grounded
+- generator lebih jujur ketika coverage antar-metode asimetris
+- fallback generik berkurang
+- format Bukti lebih faithful terhadap final contexts
+- separation retrieval audit vs answer synthesis lebih tegas
+
+#### Multi-turn Stabilization (T08/T09)
+V3.0c memperbaiki kasus follow-up singkat seperti:
+- *"Bisa lebih ringkas lagi langkah utamanya?"*
+
+Patch yang ditambahkan:
+- deteksi `compression_followup`
+- contextualization heuristik khusus `steps_summary`
+- pengecualian topic-shift untuk compression follow-up
+- carry-forward doc focus / method context
+- replay historis tetap sinkron untuk turn-turn yang sudah direrank
+
+#### UI/UX Enhancement (V3.0c)
+Lapisan audit UI yang ditambahkan:
+- **Rerank summary box**
+- **Before vs After Rerank panel**
+- **Source snapshot** yang lebih rapi dan mudah dipindai
+- **CTX Mapping** dengan field:
+  - `rerank_score`
+  - `rerank_rank`
+  - `anchor_reserve`
+- **Score pills** baru:
+  - rerank pill
+  - anchor badge
+- penjelasan jujur bahwa:
+  - `rerank_score` adalah heuristic UI-only
+  - nilai `None` bisa valid untuk reserved anchor
+
+#### Logging & Telemetry (V3.0c)
+Field baru di `retrieval.jsonl`:
+- `reranker_applied`
+- `reranker_candidate_count`
+- `reranker_top_n`
+- `reranker_top_n_base`
+- `reranker_top_n_effective`
+- `reranker_info`
+- `rerank_anchor_reservation`
+- `retrieval_stats_pre_rerank`
+- `generation_context_stats`
+
+Field baru di `answers.jsonl`:
+- `reranker_applied`
+- `reranker_model`
+- `reranker_top_n`
+- `reranker_top_n_base`
+- `reranker_top_n_effective`
+- `rerank_anchor_reservation`
+- `generation_context_stats`
+
+#### Graceful Skip / Fail Path
+Jika reranker gagal load:
+- pipeline **tidak crash**
+- warning UI muncul
+- sistem lanjut memakai top-N fallback
+- log tetap jujur (`reranker_applied=false`, `load_failed=true`, `error_msg` terisi)
+
+#### Regression / Backward-Compatibility Polish
+Pada akhir V3.0c, jalur legacy dipolish agar:
+- config `v1_5.yaml` dan `v2.yaml` tetap sehat
+- UI legacy tidak memaksakan kolom rerank yang tidak relevan
+- telemetry reranker di run legacy menjadi **disabled-clean**
+- history viewer dan latest render tidak membawa jejak reranker palsu
+
+#### Ringkasan hasil validasi V3.0c
+- **T01** — smoke test dasar rerank → PASS
+- **T02** — comparison query RAD vs Prototyping → PASS substantif / PASS bersyarat
+- **T03** — citation routing + rerank → PASS
+- **T04** — metadata routing path → PASS
+- **T05** — self-query zero-result guard tidak rusak → PASS
+- **T06** — graceful skip reranker fail path → PASS
+- **T07** — dense mode + rerank → PASS
+- **T08** — multi-turn anaphora + steps → PASS (setelah patch)
+- **T09** — history viewer / turn replay → PASS
+- **T10-A** — regression legacy dense (`v1_5.yaml`) → clean PASS
+- **T10-B** — regression legacy dense/hybrid(`v2.yaml`) → clean PASS
+
+#### Known Limitation Notes (non-blocking)
+- metadata filter dari V3.0b masih belum end-to-end pada seluruh hybrid path
+- dynamic Top-N masih heuristik, belum berbasis evaluasi kuantitatif formal
+- anchor reservation membuat final set tidak sepenuhnya pure rerank
+- beberapa snippet/bukti masih bisa tampak rough atau clipped
+- query citation tertentu masih bisa menghasilkan jawaban yang narasi-heavy
+
+#### Arsitektur Modul (V3.0c)
 ```
 src/
-├── app_streamlit.py          ← UI utama (hybrid/dense, citation routing, self-query integration, metadata exact-match guard)
-├── app_ui_render.py          ← Render & display helpers (stream pill, legend CTX, hybrid score pills)
+├── app_streamlit.py          ← UI utama (hybrid/dense, citation routing, self-query integration, reranker integration, generation orchestration, multi-turn stabilization, metadata exact-match guard)
+├── app_ui_render.py          ← Render & display helpers (stream pill, legend CTX, hybrid score pills, rerank summary box, before/after audit panel, source snapshot, rerank gating)
 ├── rag/
-│   ├── pdf_parser.py         ← Structure-aware parsing (regex + filename routing)
-│   ├── chunking.py           ← Dual strategy chunking (narasi + sitasi)
-│   ├── method_detection.py   ← Single source of truth: deteksi metode/query + is_citation_query + is_steps_question (diperketat)
-│   ├── self_query.py         ← BARU V3.0b: LLM → JSON metadata filter + semantic_query + pre-check helper
-│   ├── generate.py           ← Thin re-export wrapper 3 fungsi publik
-│   ├── generate_utils.py     ← Semua implementasi generate + guardrails (~2800 baris)
+│   ├── pdf_parser.py         ← Structure-aware parsing (regex + filename routing) - single source of truth
+│   ├── chunking.py           ← Dual strategy chunking (narasi + sitasi) - single source of truth
+│   ├── method_detection.py   ← Single source of truth query/method detection + is_citation_query + is_steps_question
+│   ├── self_query.py         ← Metadata self-querying module (V3.0b) - LLM → JSON metadata filter + semantic_query + pre-check helper
+│   ├── reranker.py           ← BARU V3.0c: Cross-Encoder reranking lifecycle (load / rerank / unload / status info)
+│   ├── generate.py           ← Thin re-export wrapper
+│   ├── generate_utils.py     ← Semua implementasi generate + guardrails + comparison/steps/multi-target hardening
 │   ├── ingest.py             ← PDF ingestion → dual stream → dual ChromaDB collection + doc_catalog
-│   ├── retrieve_dense.py     ← Dense retrieval + collection-aware + where_filter + stream/bab_label
-│   ├── retrieve_sparse.py    ← BM25+Sastrawi sparse retrieval + collection-aware + stream/bab_label
+│   ├── retrieve_dense.py     ← Dense retrieval + where_filter + stream/bab_label
+│   ├── retrieve_sparse.py    ← BM25+Sastrawi sparse + collection-aware + stream/bab_label
 │   ├── fusion_rrf.py         ← RRF fusion: List[RetrievedNode] → List[RetrievedNode] + propagate stream/bab_label
-│   └── metadata_router.py    ← Metadata intent router (page_count aktif V1.5) + natural-language alias resolution
+│   └── metadata_router.py    ← Metadata intent router (page_count) + natural-language alias resolution
 └── core/
-    ├── config.py, run_manager.py
-    ├── schemas.py             ← RetrievedNode (+ stream + bab_label fields V3.0a)
-    ├── ui_utils.py            ← Generic Streamlit widgets
+    ├── config.py
+    ├── run_manager.py
+    ├── schemas.py            ← RetrievedNode (+ stream + bab_label + rerank_score + rerank_rank)
+    ├── ui_utils.py           ← Generic Streamlit widgets
     └── cleanup_runs.py
-configs/  → base.yaml, v1.yaml, v1_5.yaml, v2.yaml, v3.yaml
+configs/  → base.yaml, v1.yaml, v1_5.yaml, v2.yaml, v3.yaml, v3_dense_test.yaml, v3_rerank_fail.yaml
 ```
 
-**Dependency Graph Modul V3.0b:**
+**Dependency Graph Modul V3.0c:**
 ```
-pdf_parser.py      ← ingest.py (parsing PDF per-stream)
-chunking.py        ← ingest.py (chunking per-stream)
-self_query.py      ← app_streamlit.py (LLM metadata extraction → semantic_query + filters)
-retrieve_dense.py  ← app_streamlit.py (narasi + sitasi + where_filter, collection-aware)
-retrieve_sparse.py ← app_streamlit.py (narasi + sitasi, collection-aware)
-fusion_rrf.py      ← app_streamlit.py (gabungkan dense + sparse, propagate stream/bab_label)
-                        ↑
-                   schemas.RetrievedNode (shared output type, + stream + bab_label)
- 
+pdf_parser.py        ← ingest.py (parsing PDF per-stream)
+chunking.py          ← ingest.py (chunking per-stream)
+
+self_query.py        ← app_streamlit.py (LLM metadata extraction → semantic_query + filters)
+retrieve_dense.py    ← app_streamlit.py (narasi + sitasi + where_filter, collection-aware)
+retrieve_sparse.py   ← app_streamlit.py (narasi + sitasi, collection-aware)
+fusion_rrf.py        ← app_streamlit.py (gabungkan dense + sparse, propagate stream/bab_label)
+metadata_router.py   ← app_streamlit.py (page_count intent + natural-language alias resolution)
+method_detection.py  ← app_streamlit.py / pdf_parser.py (single source of truth query/type detection)
+
+reranker.py          ← app_streamlit.py
+generate_utils.py    ← generate.py / app_streamlit.py
+app_ui_render.py     ← app_streamlit.py
+
+schemas.RetrievedNode
+    ↑
+    ├── retrieve_dense.py
+    ├── retrieve_sparse.py
+    ├── fusion_rrf.py
+    ├── reranker.py
+    └── app_streamlit.py
+
 _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.py — DRY)
-metadata_router.py  ← app_streamlit.py (page_count intent + natural-language alias resolution)
-method_detection.py ← app_streamlit.py / pdf_parser.py (single source of truth query/type detection)
 ```
 
 ---
@@ -438,8 +607,8 @@ method_detection.py ← app_streamlit.py / pdf_parser.py (single source of truth
 
 ## Struktur Repo
 - `src/`
-  - `app_streamlit.py` : UI Streamlit utama (mode-aware: hybrid/dense, citation routing, self-query integration, metadata exact-match guard)
-  - `app_ui_render.py` : Render & display helpers (V1.5+, hybrid score pills V2.0, stream pill V3.0a, legend CTX V3.0b)
+  - `app_streamlit.py` : UI Streamlit utama (mode-aware: hybrid/dense, citation routing, self-query integration, reranker integration, multi-turn stabilization, metadata exact-match guard)
+  - `app_ui_render.py` : Render & display helpers (V1.5+, hybrid score pills V2.0, stream pill V3.0a, legend CTX V3.0b, rerank audit UI V3.0c)
   - `rag/`
     - `pdf_parser.py` : **[BARU V3.0a]** structure-aware PDF parsing (regex + filename routing, dual stream)
     - `chunking.py` : **[BARU V3.0a]** dual strategy chunking (structure-aware narasi + citation-aware sitasi)
@@ -448,14 +617,15 @@ method_detection.py ← app_streamlit.py / pdf_parser.py (single source of truth
     - `retrieve_sparse.py` : BM25+Sastrawi sparse retrieval + index caching + collection-aware (V2.0+)
     - `fusion_rrf.py` : RRF fusion dense+sparse → `List[RetrievedNode]` + propagate `stream`/`bab_label` (V3.0a)
     - `self_query.py` : **[BARU V3.0b]** self-query metadata filtering (LLM → JSON → validasi → where_filter + semantic_query)
+    - `reranker.py` : **[BARU V3.0c]** Cross-Encoder reranking lifecycle (load / rerank / unload / info)
     - `generate.py` : thin re-export wrapper public API
-    - `generate_utils.py` : semua implementasi generate + guardrails
+    - `generate_utils.py` : semua implementasi generate + guardrails + comparison/steps hardening (V3.0c)
     - `method_detection.py` : deteksi metode & query type (single source of truth, `is_steps_question` diperketat V3.0a)
     - `metadata_router.py` : metadata intent routing (page_count) + natural-language alias resolution untuk nama dokumen
   - `core/`
     - `config.py` : load config YAML (deep merge base + override)
     - `run_manager.py` : run_id + manifest + logging JSONL
-    - `schemas.py` : dataclass schema (RetrievedNode + field hybrid V2.0 + `stream`/`bab_label` V3.0a)
+    - `schemas.py` : dataclass schema (RetrievedNode + field hybrid V2.0 + `stream`/`bab_label` V3.0a + `rerank_score`/`rerank_rank` V3.0c)
     - `ui_utils.py` : download buttons, PDF viewer+highlight, clipboard, dll
     - `cleanup_runs.py` : cleanup runs utility (manual)
   - `evaluation/` : script pondasi evaluasi (RAGAS, dsb.)
@@ -501,7 +671,7 @@ Gunakan `.env` lokal (jangan commit API key). Contoh variabel:
 ### 1.) Ingest / Index (offline)
 Pastikan PDF diletakkan di `data_raw/`, lalu jalankan:
 
-**V3.0a (Dual Stream — Direkomendasikan):**
+**V3.0c / V3.x (Dual Stream + Self-Query + Rerank — Direkomendasikan):**
 ```bash
 # Fresh ingest V3.0a — WAJIB pakai --reset untuk pertama kali
 # (menghapus collection lama dan membangun dual collection baru)
@@ -556,7 +726,7 @@ Di sidebar UI, tersedia toggle **Mode**:
 | `configs/v1.yaml` | dense | `skripsi_structured_narasi` | Skenario A — Naive Dense RAG |
 | `configs/v1_5.yaml` | dense | `skripsi_structured_narasi` | V1.5 dengan memory (bukan skenario ablation) |
 | `configs/v2.yaml` | **hybrid** | `skripsi_structured_narasi` | **Skenario B — Hybrid RAG** |
-| `configs/v3.yaml` | **hybrid** | narasi + sitasi (dual) | **Skenario C — Proposed Method (V3.0b)** |
+| `configs/v3.yaml` | **hybrid + rerank** | narasi + sitasi (dual) | **Tahap aktif Proposed Method (V3.0c)** — retrieval + self-query + rerank + audit UI |
 
 ---
 
@@ -611,7 +781,7 @@ memory:
   window: 4
 ```
 
-Key penting di `v3.yaml` (V3.0b — Dual Collection + Metadata Self-Querying):
+Key penting di `v3.yaml` (V3.0c — Dual Collection + Metadata Self-Querying + Cross-Encoder Reranking):
 ```yaml
 index:
   collections:
@@ -654,12 +824,28 @@ self_query:
   max_filter_fields: 2
   llm_temperature: 0.0
   llm_max_tokens: 256
+
+reranker:
+  enabled: true
+  model_name: "BAAI/bge-reranker-base"
+  candidate_k: 10
+  top_n_rerank: 3
+  dynamic_top_n: true
+  top_n_rerank_complex: 5
+  reserve_method_anchors: true
+  show_before_after_panel: true
+  before_after_ui_max_pre_rows: 10
+  device: "auto"
+  min_vram_mb: 800
+  allow_in_eval: true
 ```
 
-> **Catatan V3.0b:**  
-> - `metadata_routing` diaktifkan di `v3.yaml` untuk mempertahankan jalur page-count intent pada pipeline terbaru  
-> - `self_query` hanya diterapkan pada primary dense retrieval narasi  
-> - `v1.yaml` dan `v2.yaml` dipertahankan sebagai baseline historis; fitur V3.0b tidak dipaksakan aktif di config versi lama
+> **Catatan V3.0c:**  
+> - `metadata_routing` tetap aktif di `v3.yaml` untuk mempertahankan jalur page-count intent pada pipeline terbaru  
+> - `self_query` tetap hanya diterapkan pada primary dense retrieval narasi  
+> - `reranker.allow_in_eval=true` dipilih karena reranking adalah bagian inti proposed method yang perlu diukur pada Skenario C  
+> - `before_after_ui_max_pre_rows` dipolish menjadi `10` agar konsisten dengan candidate pool yang diuji  
+> - `v1.yaml`, `v1_5.yaml`, dan `v2.yaml` dipertahankan sebagai baseline historis; fitur V3.0c tidak dipaksakan aktif di config versi lama
 
 ---
 
@@ -683,7 +869,7 @@ Utility: `src/core/cleanup_runs.py`
 ### Git Strategy
 - Kerja harian dilakukan di branch `dev`
 - Push ke `main` + beri tag hanya saat satu versi dinyatakan final
-- Tag convention: `v{versi}-{codename}` (contoh: `v1.0-naive`, `v1.5-memory`, `v2.0-hybrid`, `v3.0a-structured`)
+- Tag convention: `v{versi}-{codename}` (contoh: `v1.0-naive`, `v1.5-memory`, `v2.0-hybrid`, `v3.0a-structured`, `v3.0b-selfquery`, `v3.0c-rerank`, dst...)
 
 ### JSONL Schema Consistency
 Field di `retrieval.jsonl` dan `answers.jsonl` tidak boleh berubah antar run dalam satu versi — ablation study bergantung pada konsistensi ini. Jika ada field baru, pastikan diisi di **semua jalur** (normal retrieval, metadata-routed, citation-routed).
@@ -726,6 +912,34 @@ Tambahan perilaku V3.0b:
   - `metadata_router`
   - `self_query_guard`
 
+Field V3.0c yang ditambahkan ke `retrieval.jsonl`:
+- `reranker_applied`
+- `reranker_candidate_count`
+- `reranker_top_n`
+- `reranker_top_n_base`
+- `reranker_top_n_effective`
+- `reranker_info`
+- `rerank_anchor_reservation`
+- `retrieval_stats_pre_rerank`
+- `generation_context_stats`
+
+Field V3.0c yang ditambahkan ke `answers.jsonl`:
+- `reranker_applied`
+- `reranker_model`
+- `reranker_top_n`
+- `reranker_top_n_base`
+- `reranker_top_n_effective`
+- `rerank_anchor_reservation`
+- `generation_context_stats`
+
+Field V3.0c pada `RetrievedNode`:
+- `rerank_score`
+- `rerank_rank`
+
+Catatan:
+- `rerank_score` adalah heuristic UI-only, bukan confidence score
+- `None` pada `rerank_score` / `rerank_rank` dapat valid, misalnya pada reserved anchor
+
 ### Prinsip Modifikasi (V1.5+)
 - Logika deteksi metode/query → selalu edit di `method_detection.py`
 - Logika render/display UI → selalu edit di `app_ui_render.py`
@@ -760,9 +974,20 @@ Tambahan perilaku V3.0b:
 - Untuk query metadata eksplisit yang gagal exact-match (`precheck_no_results`), answer layer harus tetap jujur dan tidak boleh membuat klaim positif berdasarkan retrieval fallback umum
 - Perbaikan metadata router → selalu edit di `metadata_router.py`; jangan memindahkan logic alias resolution ke `app_streamlit.py`
 
+### Prinsip Modifikasi Tambahan (V3.0c)
+- Lifecycle Cross-Encoder → selalu edit di `reranker.py`
+- Integrasi rerank ke pipeline utama → selalu edit di `app_streamlit.py`
+- Render before/after panel, snapshot, dan kolom rerank → selalu edit di `app_ui_render.py`
+- Patch synthesis comparison/steps/multi-target → fokuskan di `generate_utils.py`
+- `+rerank` pada `strategy` hanya boleh muncul jika `reranker_applied=True`
+- `rerank_score` adalah **heuristic UI-only**, bukan confidence score
+- `None` pada `rerank_score` / `rerank_rank` bisa valid untuk reserved anchor
+- Jika config legacy dipakai, UI/log legacy harus tetap **bersih** dan tidak membawa fingerprint reranker palsu
+
 ### Constraint Hardware (VRAM 4GB)
-- V2.0–V3.0a: BM25 berjalan di CPU, tidak ada tambahan beban VRAM
+- V2.0–V3.0b: BM25 berjalan di CPU, tidak ada tambahan beban VRAM signifikan dari sparse leg
 - V3.0c ke atas: Sequential Loading wajib — Cross-Encoder dan LLM tidak boleh dimuat bersamaan
   - Urutan: load Cross-Encoder → rerank → **unload** → load LLM → generate
+- Device strategy reranker: `device="auto"`, `min_vram_mb=800`; jika CUDA tidak aman/tidak tersedia, fallback CPU adalah perilaku yang valid
 
 ---
