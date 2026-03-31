@@ -22,6 +22,13 @@ class RetrievedNode:
     #             Diisi dari metadata["bab_label"] saat retrieve, None untuk V1/V2
     stream:    Optional[str] = None
     bab_label: Optional[str] = None
+    # ── V3.0c ─────────────────────────────────────────────────────────────────
+    # rerank_score : skor dari Cross-Encoder (makin tinggi = makin relevan)
+    #                None jika reranking tidak diterapkan / graceful skip
+    # rerank_rank  : posisi setelah reranking (1 = paling relevan)
+    #                None jika reranking tidak diterapkan / graceful skip
+    rerank_score: Optional[float] = None
+    rerank_rank:  Optional[int]   = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

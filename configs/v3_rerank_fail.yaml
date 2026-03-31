@@ -75,7 +75,7 @@ reranker:
 
   # Model Cross-Encoder dari sentence-transformers
   # BAAI/bge-reranker-base: ~270MB, multilingual, cukup untuk skripsi Indo+Inggris
-  model_name: "BAAI/bge-reranker-base"
+  model_name: "BAAI/does-not-exist-reranker"
 
   # Jumlah kandidat yang diambil dari retrieval sebelum reranking.
   # Retrieval mengambil candidate_k node → Cross-Encoder scoring → ambil top_n_rerank.
