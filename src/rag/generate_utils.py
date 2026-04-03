@@ -3664,6 +3664,486 @@ def build_generation_meta(
     return meta
 
 
+# ============================================================================
+# V3.0d — Post-Hoc Verification (Grounding Gate v1)
+# ----------------------------------------------------------------------------
+# Prinsip:
+# - explainable
+# - rule-based
+# - answer-layer only
+# - tidak memakai rerank_score sebagai confidence
+# - semantic helper hanya hook opsional (belum dipakai di Phase 1A)
+# ============================================================================
+
+_VERIFICATION_SCORE_NAME = "heuristic_support_score"
+
+# Cue untuk menandai jawaban yang tampak supported, tetapi coverage-nya
+# parsial / asimetris / berhati-hati.
+# Penting untuk kasus seperti T02:
+# "RAD disebut, tetapi urutan tahapannya tidak ditampilkan eksplisit."
+_VERIFICATION_CAUTION_PATTERNS = [
+    r"tidak\s+menampilkan[^.\n]{0,80}eksplisit",
+    r"tidak\s+dijelaskan[^.\n]{0,80}eksplisit",
+    r"tidak\s+disebutkan[^.\n]{0,80}eksplisit",
+    r"hanya\s+menyebut",
+    r"belum\s+menjelaskan",
+    r"coverage\s+masih\s+parsial",
+    r"parsial",
+    r"asimetris",
+]
+
+
+def _verification_stub(
+    *,
+    enabled: bool,
+    method: str,
+    semantic_helper_enabled: bool,
+    skipped_reason: Optional[str],
+    explanation: str,
+    used_ctx: int,
+) -> Dict[str, Any]:
+    """
+    Shape object verification yang STABIL untuk semua jalur skipped/N/A.
+    Dipakai agar schema answers.jsonl nantinya konsisten di semua path.
+    """
+    return {
+        "enabled": bool(enabled),
+        "applied": False,
+        "method": method,
+        "label": "skipped",
+        "badge_text": "Verification N/A",
+        "explanation": explanation,
+        "score": None,
+        "score_name": _VERIFICATION_SCORE_NAME,
+        "skipped_reason": skipped_reason,
+        "signals": {
+            "supported_heuristic": False,
+            "format_ok": False,
+            "bukti_ok": False,
+            "citations_present": False,
+            "citations_in_range": False,
+            "grounding_ok": False,
+            "answer_grounding_ok": False,
+            "partial_not_found": False,
+            "coverage_caution": False,
+        },
+        "evidence_summary": {
+            "used_ctx": int(max(0, used_ctx)),
+            "bullet_total": 0,
+            "bullet_with_citation": 0,
+            "bullet_valid_citation": 0,
+            "bullet_grounded": 0,
+            "citation_ratio": 0.0,
+            "grounded_ratio": 0.0,
+            "cited_ctx_nums": [],
+            "cited_chunk_ids": [],
+        },
+        "semantic_helper": {
+            "enabled": bool(semantic_helper_enabled),
+            "used": False,
+            "score": None,
+            "label": None,
+        },
+    }
+
+
+def _valid_ctx_nums(nums: List[int], used_ctx: int) -> List[int]:
+    """
+    Filter + dedupe nomor CTX agar tetap berada pada rentang valid [1..used_ctx].
+    """
+    out: List[int] = []
+    upper = int(max(0, used_ctx))
+    for n in nums or []:
+        try:
+            i = int(n)
+        except Exception:
+            continue
+        if 1 <= i <= upper and i not in out:
+            out.append(i)
+    return out
+
+
+def _ctx_nums_to_chunk_ids(
+    ctx_nums: List[int],
+    used_context_chunk_ids: Optional[List[str]],
+) -> List[str]:
+    """
+    Mapping CTX n -> chunk_id final context yang benar-benar dikirim ke generator.
+    Asumsi urutan used_context_chunk_ids selaras dengan urutan contexts / [CTX n].
+    """
+    ids = used_context_chunk_ids or []
+    out: List[str] = []
+
+    for n in ctx_nums or []:
+        if 1 <= int(n) <= len(ids):
+            cid = str(ids[int(n) - 1] or "").strip()
+            if cid and cid not in out:
+                out.append(cid)
+
+    return out
+
+
+def _has_coverage_caution(answer_text: str) -> bool:
+    """
+    True jika isi Jawaban mengandung cue bahwa coverage jawaban bersifat
+    parsial / asimetris / hati-hati.
+    """
+    head = (_extract_jawaban_text(answer_text) or "").lower()
+    if not head:
+        return False
+
+    return any(
+        re.search(pat, head, flags=re.IGNORECASE)
+        for pat in _VERIFICATION_CAUTION_PATTERNS
+    )
+
+
+def _summarize_bukti_support(
+    *,
+    answer_text: str,
+    contexts: List[str],
+    used_ctx: int,
+    used_context_chunk_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Ringkasan level-bukti:
+    - berapa bullet ada
+    - berapa bullet punya sitasi
+    - berapa sitasi valid
+    - berapa bullet grounded
+    - CTX mana saja yang benar-benar dirujuk
+    - chunk_id mana saja yang terlibat
+
+    Tujuan:
+    - explainable
+    - ringan untuk logging
+    - tidak menyimpan detail per-bullet berlebihan
+    """
+    bullets = _extract_bukti_lines(answer_text)
+    bullet_total = len(bullets)
+
+    bullet_with_citation = 0
+    bullet_valid_citation = 0
+    bullet_grounded = 0
+
+    cited_ctx_nums: List[int] = []
+    cited_chunk_ids: List[str] = []
+
+    for bullet in bullets:
+        raw_ctx_nums = _extract_ctx_nums(bullet)
+        valid_ctx_nums = _valid_ctx_nums(raw_ctx_nums, used_ctx)
+
+        has_citation = len(raw_ctx_nums) > 0
+        citation_valid = bool(raw_ctx_nums) and all(
+            1 <= int(n) <= int(max(0, used_ctx))
+            for n in raw_ctx_nums
+        )
+        grounded = _bullet_grounded(bullet, contexts, used_ctx) if citation_valid else False
+
+        if has_citation:
+            bullet_with_citation += 1
+        if citation_valid:
+            bullet_valid_citation += 1
+        if grounded:
+            bullet_grounded += 1
+
+        for n in valid_ctx_nums:
+            if n not in cited_ctx_nums:
+                cited_ctx_nums.append(n)
+
+        for cid in _ctx_nums_to_chunk_ids(valid_ctx_nums, used_context_chunk_ids):
+            if cid not in cited_chunk_ids:
+                cited_chunk_ids.append(cid)
+
+    citation_ratio = (
+        round(float(bullet_valid_citation / bullet_total), 6)
+        if bullet_total > 0
+        else 0.0
+    )
+    grounded_ratio = (
+        round(float(bullet_grounded / bullet_total), 6)
+        if bullet_total > 0
+        else 0.0
+    )
+
+    return {
+        "used_ctx": int(max(0, used_ctx)),
+        "bullet_total": int(bullet_total),
+        "bullet_with_citation": int(bullet_with_citation),
+        "bullet_valid_citation": int(bullet_valid_citation),
+        "bullet_grounded": int(bullet_grounded),
+        "citation_ratio": float(citation_ratio),
+        "grounded_ratio": float(grounded_ratio),
+        "cited_ctx_nums": cited_ctx_nums,
+        "cited_chunk_ids": cited_chunk_ids,
+    }
+
+
+def _compute_verification_score(
+    *,
+    generator_meta: Dict[str, Any],
+    evidence_summary: Dict[str, Any],
+    coverage_caution: bool,
+) -> float:
+    """
+    Score numerik OPSIONAL / diagnostic only.
+    BUKAN confidence score.
+    BUKAN calibrated probability.
+
+    Label utama tetap diputuskan oleh RULES, bukan angka ini.
+    """
+    gm = generator_meta or {}
+    ev = evidence_summary or {}
+
+    score = 0.0
+    score += 0.10 if bool(gm.get("format_ok")) else 0.0
+    score += 0.10 if bool(gm.get("bukti_ok")) else 0.0
+    score += 0.15 if bool(gm.get("citations_present")) else 0.0
+    score += 0.15 if bool(gm.get("citations_in_range")) else 0.0
+    score += 0.20 * float(ev.get("citation_ratio", 0.0) or 0.0)
+    score += 0.20 * float(ev.get("grounded_ratio", 0.0) or 0.0)
+    score += 0.10 if bool(gm.get("answer_grounding_ok")) else 0.0
+
+    score = max(0.0, min(score, 1.0))
+
+    # Jika coverage memang hati-hati/parsial, cap agar tidak terlihat "terlalu tinggi".
+    if coverage_caution or bool(gm.get("partial_not_found")):
+        score = min(score, 0.79)
+
+    return round(float(score), 6)
+
+
+def _verification_badge_text(label: str) -> str:
+    mapping = {
+        "verified": "Verified",
+        "partial": "Partially Verified",
+        "low": "Low Verification",
+        "not_found": "Verification N/A",
+        "skipped": "Verification N/A",
+    }
+    return mapping.get(str(label or "").strip().lower(), "Verification N/A")
+
+
+def _verification_explanation(
+    *,
+    label: str,
+    generator_meta: Dict[str, Any],
+    evidence_summary: Dict[str, Any],
+    coverage_caution: bool,
+    skipped_reason: Optional[str] = None,
+) -> str:
+    """
+    Explanation singkat yang nanti aman ditampilkan di UI.
+    """
+    gm = generator_meta or {}
+    ev = evidence_summary or {}
+
+    if label == "skipped":
+        if skipped_reason == "disabled_in_config":
+            return "Verification dinonaktifkan pada config aktif."
+        if skipped_reason == "metadata_route_skipped":
+            return "Verification tidak diterapkan pada jalur metadata routing."
+        return "Verification tidak diterapkan pada jalur ini."
+
+    if label == "not_found":
+        return (
+            "Jawaban berada pada jalur canonical not_found; verification "
+            "tidak diberi label positif atau negatif."
+        )
+
+    if label == "verified":
+        return "Bukti tersitasi valid dan klaim utama terdukung oleh CTX final."
+
+    if label == "partial":
+        if coverage_caution or bool(gm.get("partial_not_found")):
+            return "Dukungan konteks ada, tetapi coverage jawaban masih parsial atau asimetris."
+        if not bool(gm.get("answer_grounding_ok")):
+            return "Bukti tersedia, tetapi grounding bagian Jawaban masih parsial."
+        return "Jawaban memiliki dukungan konteks, tetapi belum cukup kuat untuk label verified."
+
+    # LOW
+    if not bool(gm.get("format_ok")) or not bool(gm.get("bukti_ok")):
+        return "Format jawaban atau bagian Bukti belum cukup valid untuk verification yang kuat."
+    if int(ev.get("bullet_total", 0) or 0) == 0:
+        return "Bagian Bukti tidak memuat bullet yang cukup untuk diverifikasi."
+    if not bool(gm.get("citations_present")):
+        return "Jawaban belum menyertakan sitasi CTX yang memadai."
+    if not bool(gm.get("citations_in_range")):
+        return "Sebagian sitasi CTX berada di luar rentang konteks yang valid."
+    if float(ev.get("grounded_ratio", 0.0) or 0.0) <= 0.0:
+        return "Bukti tidak terdukung kuat oleh CTX final yang dirujuk."
+    return "Grounding jawaban terhadap CTX final masih lemah."
+
+
+def build_verification_meta(
+    *,
+    question: str,
+    contexts: List[str],
+    answer_text: str,
+    used_ctx: int,
+    used_context_chunk_ids: Optional[List[str]] = None,
+    generator_meta: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    metadata_route_handled: bool = False,
+) -> Dict[str, Any]:
+    """
+    Public API V3.0d untuk post-hoc verification.
+
+    Fase ini SENGAJA:
+    - rule-based
+    - explainable
+    - bekerja pada answer layer
+    - tidak menggunakan rerank_score sebagai confidence
+    - semantic helper hanya hook (belum dipakai di Phase 1A)
+
+    Output sengaja stabil agar nanti bisa langsung dipakai di:
+    - answers.jsonl
+    - session_state / turn_data
+    - UI badge (Phase 2)
+    """
+    cfg_eff = cfg or {}
+
+    enabled = bool(_get_cfg(cfg_eff, ["verification", "enabled"], False))
+    method = str(
+        _get_cfg(cfg_eff, ["verification", "method"], "grounding_gate_v1")
+        or "grounding_gate_v1"
+    )
+    skip_on_metadata_route = bool(
+        _get_cfg(cfg_eff, ["verification", "skip_on_metadata_route"], True)
+    )
+    semantic_helper_enabled = bool(
+        _get_cfg(cfg_eff, ["verification", "semantic_helper_enabled"], False)
+    )
+
+    used_ctx_eff = int(max(0, min(int(used_ctx or 0), len(contexts or []))))
+
+    # ── Disabled path (legacy-safe) ─────────────────────────────────────────
+    if not enabled:
+        return _verification_stub(
+            enabled=False,
+            method=method,
+            semantic_helper_enabled=semantic_helper_enabled,
+            skipped_reason="disabled_in_config",
+            explanation="Verification dinonaktifkan pada config aktif.",
+            used_ctx=used_ctx_eff,
+        )
+
+    # ── Metadata route path = N/A / skipped ─────────────────────────────────
+    if metadata_route_handled and skip_on_metadata_route:
+        return _verification_stub(
+            enabled=True,
+            method=method,
+            semantic_helper_enabled=semantic_helper_enabled,
+            skipped_reason="metadata_route_skipped",
+            explanation="Verification tidak diterapkan pada jalur metadata routing.",
+            used_ctx=used_ctx_eff,
+        )
+
+    # Jika caller belum memberi generator_meta, bangun fallback minimal di sini.
+    gm = generator_meta or build_generation_meta(
+        question=question,
+        contexts=contexts,
+        answer_text=answer_text,
+        used_ctx=used_ctx_eff,
+        max_bullets=3,
+    )
+
+    evidence_summary = _summarize_bukti_support(
+        answer_text=answer_text,
+        contexts=contexts,
+        used_ctx=used_ctx_eff,
+        used_context_chunk_ids=used_context_chunk_ids,
+    )
+    coverage_caution = _has_coverage_caution(answer_text)
+
+    status = str(gm.get("status", "") or "").strip().lower()
+    label = "low"
+    score: Optional[float] = None
+
+    # ────────────────────────────────────────────────────────────────────────
+    # RULE-BASED LABEL DECISION
+    # ────────────────────────────────────────────────────────────────────────
+    if status == "not_found":
+        label = "not_found"
+
+    elif (not bool(gm.get("format_ok"))) or (not bool(gm.get("bukti_ok"))):
+        label = "low"
+
+    elif used_ctx_eff > 0 and (
+        (not bool(gm.get("citations_present")))
+        or (not bool(gm.get("citations_in_range")))
+    ):
+        label = "low"
+
+    elif int(evidence_summary.get("bullet_total", 0) or 0) <= 0:
+        label = "low"
+
+    elif (
+        float(evidence_summary.get("grounded_ratio", 0.0) or 0.0) >= 0.999999
+        and bool(gm.get("answer_grounding_ok"))
+        and (not coverage_caution)
+        and (not bool(gm.get("partial_not_found")))
+    ):
+        label = "verified"
+
+    elif (
+        float(evidence_summary.get("grounded_ratio", 0.0) or 0.0) >= 0.5
+        and (
+            bool(gm.get("answer_grounding_ok"))
+            or bool(gm.get("citations_in_range"))
+            or bool(gm.get("supported_heuristic"))
+        )
+    ):
+        label = "partial"
+
+    else:
+        label = "low"
+
+    # Score hanya untuk non-skipped & non-not_found.
+    if label not in {"skipped", "not_found"}:
+        score = _compute_verification_score(
+            generator_meta=gm,
+            evidence_summary=evidence_summary,
+            coverage_caution=coverage_caution,
+        )
+
+    return {
+        "enabled": True,
+        "applied": True,
+        "method": method,
+        "label": label,
+        "badge_text": _verification_badge_text(label),
+        "explanation": _verification_explanation(
+            label=label,
+            generator_meta=gm,
+            evidence_summary=evidence_summary,
+            coverage_caution=coverage_caution,
+            skipped_reason=None,
+        ),
+        "score": score,
+        "score_name": _VERIFICATION_SCORE_NAME,
+        "skipped_reason": None,
+        "signals": {
+            "supported_heuristic": bool(gm.get("supported_heuristic")),
+            "format_ok": bool(gm.get("format_ok")),
+            "bukti_ok": bool(gm.get("bukti_ok")),
+            "citations_present": bool(gm.get("citations_present")),
+            "citations_in_range": bool(gm.get("citations_in_range")),
+            "grounding_ok": bool(gm.get("grounding_ok")),
+            "answer_grounding_ok": bool(gm.get("answer_grounding_ok")),
+            "partial_not_found": bool(gm.get("partial_not_found")),
+            "coverage_caution": bool(coverage_caution),
+        },
+        "evidence_summary": evidence_summary,
+        "semantic_helper": {
+            "enabled": bool(semantic_helper_enabled),
+            "used": False,
+            "score": None,
+            "label": None,
+        },
+    }
+
+
 def _format_history_pairs(history_pairs: Sequence[Dict[str, Any]], max_chars: int = 1200) -> str:
     """
     history_pairs: list item seperti {"turn_id":..., "query":..., "answer_preview":...}

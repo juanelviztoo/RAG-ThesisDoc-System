@@ -129,3 +129,27 @@ reranker:
   #         bagian inti proposed method yang justru harus diukur kontribusinya di RAGAS.
   # false = matikan reranking saat eval.
   allow_in_eval: true
+
+# ── V3.0d: Post-Hoc Verification ────────────────────────────────────────────
+verification:
+  # Aktif HANYA pada jalur proposed method V3.x
+  enabled: true
+
+  # Core verification layer:
+  # explainable, rule-based, berjalan setelah generation selesai.
+  method: "grounding_gate_v1"
+
+  # Persiapan Phase 2 (UI render)
+  show_badge: true
+  show_explanation: true
+  show_signal_chips: true
+
+  # Tetap OFF untuk user-facing default.
+  # Jika nanti ingin audit angka di mode debug/eval, baru bisa dihidupkan.
+  show_numeric_debug: false
+
+  # Metadata-routed path dianggap N/A, bukan Low Verification.
+  skip_on_metadata_route: true
+
+  # Semantic helper disiapkan sebagai hook sekunder, belum dipakai di patch ini.
+  semantic_helper_enabled: false

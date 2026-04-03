@@ -48,3 +48,59 @@ llm:
   max_tokens: 512
   timeout: 60
   max_retries: 2
+
+# ── Evaluation / RAGAS (Phase 4B.2) ────────────────────────────────────────
+evaluation:
+  ragas:
+    # Default tetap konservatif dan stabil untuk evaluator.
+    batch_size: 1
+
+  llm_override:
+    # false  -> evaluator mengikuti cfg["llm"] / env runtime lama
+    # true   -> evaluator memakai override khusus di bawah ini
+    enabled: true
+
+    # Provider evaluator default:
+    # groq | openai | ollama
+    provider: "groq"
+
+    # Model evaluator.
+    # Kosongkan jika ingin memakai fallback provider default.
+    model: "llama-3.1-8b-instant"
+
+    # Evaluator biasanya lebih stabil jika temperature = 0.0
+    temperature: 0.0
+
+    # Lebih longgar daripada runtime default agar metric RAGAS tidak mudah terpotong
+    max_tokens: 1024
+    timeout: 120
+    max_retries: 4
+
+    # Khusus Ollama
+    ollama_base_url: "http://localhost:11434"
+
+# ── V3.0d: Post-Hoc Verification (Grounding Gate v1) ───────────────────────
+verification:
+  # Default global = OFF.
+  # Legacy config (v1/v1_5/v2) tetap membaca shape config ini secara aman,
+  # tetapi verification tidak aktif kecuali dioverride oleh config versi V3.0d.
+  enabled: false
+
+  # Metode utama V3.0d:
+  # Grounding Gate v1 = rule-based, explainable, post-hoc verification.
+  method: "grounding_gate_v1"
+
+  # Opsi UI disiapkan dari sekarang agar Phase 2 tinggal merender.
+  show_badge: true
+  show_explanation: true
+  show_signal_chips: true
+
+  # Angka numerik hanya untuk debug/eval, bukan untuk badge utama user-facing.
+  show_numeric_debug: false
+
+  # Metadata-routed path (mis. page count) tidak ikut diverifikasi.
+  skip_on_metadata_route: true
+
+  # Hook future-work / Phase lanjutan:
+  # semantic helper disiapkan, tetapi Phase 1A belum memakainya.
+  semantic_helper_enabled: false

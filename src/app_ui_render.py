@@ -17,6 +17,7 @@ Diimpor oleh app_streamlit.py:
         sim_color_badge, render_ctx_mapping_table,
         render_source_score_pills, render_hybrid_source_score_pills,
         render_rerank_summary_box, build_ctx_rows, render_rerank_before_after_panel,
+        render_verification_box,
     )
 
 Tidak mengimpor dari app_streamlit.py (mencegah circular import).
@@ -485,6 +486,285 @@ def render_processing_box(user_q: str, retrieval_q: str) -> None:
 """,
         unsafe_allow_html=True,
     )
+
+
+# =========================
+# V3.0d — Verification UI
+# =========================
+
+def _verification_palette(label: str) -> Dict[str, str]:
+    """
+    Palette warna untuk verification badge/box.
+    Label utama:
+    - verified
+    - partial
+    - low
+    - not_found / skipped -> netral
+    """
+    key = str(label or "").strip().lower()
+
+    if key == "verified":
+        return {
+            "border": "#10b981",
+            "bg": "linear-gradient(90deg, rgba(16,185,129,0.10), rgba(16,185,129,0.03))",
+            "title": "#6ee7b7",
+            "badge_bg": "#064e3b",
+            "badge_fg": "#d1fae5",
+            "chip_bg": "#052e26",
+            "chip_fg": "#a7f3d0",
+            "chip_bd": "#10b98155",
+        }
+
+    if key == "partial":
+        return {
+            "border": "#f59e0b",
+            "bg": "linear-gradient(90deg, rgba(245,158,11,0.11), rgba(245,158,11,0.03))",
+            "title": "#fcd34d",
+            "badge_bg": "#4a2f00",
+            "badge_fg": "#fef3c7",
+            "chip_bg": "#3a2803",
+            "chip_fg": "#fde68a",
+            "chip_bd": "#f59e0b55",
+        }
+
+    if key == "low":
+        return {
+            "border": "#ef4444",
+            "bg": "linear-gradient(90deg, rgba(239,68,68,0.11), rgba(239,68,68,0.03))",
+            "title": "#fca5a5",
+            "badge_bg": "#4c1111",
+            "badge_fg": "#fee2e2",
+            "chip_bg": "#3b1212",
+            "chip_fg": "#fecaca",
+            "chip_bd": "#ef444455",
+        }
+
+    # not_found / skipped / unknown -> neutral
+    return {
+        "border": "#64748b",
+        "bg": "linear-gradient(90deg, rgba(100,116,139,0.12), rgba(100,116,139,0.04))",
+        "title": "#cbd5e1",
+        "badge_bg": "#1e293b",
+        "badge_fg": "#e2e8f0",
+        "chip_bg": "#0f172a",
+        "chip_fg": "#cbd5e1",
+        "chip_bd": "#64748b55",
+    }
+
+
+def _verification_chip(text: str, *, bg: str, fg: str, bd: str) -> str:
+    safe = html.escape(str(text or "").strip())
+    return (
+        f'<span style="display:inline-block;'
+        f'padding:0.18rem 0.55rem;'
+        f'border-radius:999px;'
+        f'font-size:0.76rem;'
+        f'font-weight:700;'
+        f'background:{bg};'
+        f'color:{fg};'
+        f'border:1px solid {bd};'
+        f'white-space:nowrap;">{safe}</span>'
+    )
+
+
+def _verification_icon(label: str, skipped_reason: Optional[str] = None) -> str:
+    """
+    Sinkronkan ikon dengan semantik label verification.
+    """
+    key = str(label or "").strip().lower()
+    sr = str(skipped_reason or "").strip().lower()
+
+    if key == "verified":
+        return "✅"
+    if key == "partial":
+        return "⚠️"
+    if key == "low":
+        return "📛"
+
+    # Semua jalur N/A / netral
+    # - metadata_route_skipped
+    # - not_found
+    # - skipped lain
+    if key in {"not_found", "skipped"} or sr == "metadata_route_skipped":
+        return "🔘"
+
+    return "🔘"
+
+
+def render_verification_box(verification: Optional[Dict[str, Any]]) -> None:
+    """
+    Render verification box di answer area.
+
+    Aturan:
+    - legacy disabled-clean (enabled=false + disabled_in_config) -> TIDAK dirender
+    - metadata_route skipped -> tetap dirender sebagai N/A (netral)
+    - label utama:
+        verified / partial / low / not_found / skipped
+    """
+    v = verification if isinstance(verification, dict) else {}
+    if not v:
+        return
+
+    enabled = bool(v.get("enabled", False))
+    applied = bool(v.get("applied", False))
+    label = str(v.get("label", "") or "").strip().lower()
+    skipped_reason = str(v.get("skipped_reason", "") or "").strip()
+
+    # Legacy / config lama: jangan tampilkan box sama sekali
+    if (not enabled) and skipped_reason == "disabled_in_config":
+        return
+    if label == "skipped" and skipped_reason == "disabled_in_config":
+        return
+
+    badge_text = str(v.get("badge_text", "") or "Verification N/A").strip()
+    explanation = str(v.get("explanation", "") or "").strip()
+
+    icon = _verification_icon(label, skipped_reason)
+
+    signals = v.get("signals") or {}
+    if not isinstance(signals, dict):
+        signals = {}
+
+    ev = v.get("evidence_summary") or {}
+    if not isinstance(ev, dict):
+        ev = {}
+
+    pal = _verification_palette(label)
+
+    chips: List[str] = []
+
+    # chips utama untuk jalur verification normal
+    if applied and label in {"verified", "partial", "low"}:
+        if bool(signals.get("citations_present")):
+            chips.append(
+                _verification_chip(
+                    "Sitasi ✓",
+                    bg=pal["chip_bg"],
+                    fg=pal["chip_fg"],
+                    bd=pal["chip_bd"],
+                )
+            )
+        if bool(signals.get("citations_in_range")):
+            chips.append(
+                _verification_chip(
+                    "Range ✓",
+                    bg=pal["chip_bg"],
+                    fg=pal["chip_fg"],
+                    bd=pal["chip_bd"],
+                )
+            )
+
+        bullet_total = int(ev.get("bullet_total", 0) or 0)
+        bullet_grounded = int(ev.get("bullet_grounded", 0) or 0)
+        if bullet_total > 0:
+            chips.append(
+                _verification_chip(
+                    f"Bukti {bullet_grounded}/{bullet_total}",
+                    bg=pal["chip_bg"],
+                    fg=pal["chip_fg"],
+                    bd=pal["chip_bd"],
+                )
+            )
+
+        if bool(signals.get("answer_grounding_ok")):
+            chips.append(
+                _verification_chip(
+                    "Jawaban grounded ✓",
+                    bg=pal["chip_bg"],
+                    fg=pal["chip_fg"],
+                    bd=pal["chip_bd"],
+                )
+            )
+
+        if bool(signals.get("coverage_caution")):
+            chips.append(
+                _verification_chip(
+                    "Coverage hati-hati",
+                    bg="#3f2a00",
+                    fg="#fde68a",
+                    bd="#f59e0b55",
+                )
+            )
+
+    elif skipped_reason == "metadata_route_skipped":
+        chips.append(
+            _verification_chip(
+                "Metadata route",
+                bg=pal["chip_bg"],
+                fg=pal["chip_fg"],
+                bd=pal["chip_bd"],
+            )
+        )
+    elif label == "not_found":
+        chips.append(
+            _verification_chip(
+                "Canonical not_found",
+                bg=pal["chip_bg"],
+                fg=pal["chip_fg"],
+                bd=pal["chip_bd"],
+            )
+        )
+
+    chips_html = " ".join(chips)
+
+    explain_html = ""
+    if explanation:
+        explain_html = (
+            f'<div style="margin-top:0.35rem;color:#e5e7eb;line-height:1.45;">'
+            f"{html.escape(explanation)}"
+            f"</div>"
+        )
+
+    chips_block = ""
+    if chips_html:
+        chips_block = (
+            f'<div style="margin-top:0.5rem;display:flex;gap:0.4rem;flex-wrap:wrap;">'
+            f"{chips_html}"
+            f"</div>"
+        )
+
+    st.markdown(
+        f"""
+<div style="
+  background:{pal["bg"]};
+  border:1px solid {pal["border"]}55;
+  border-left:4px solid {pal["border"]};
+  padding:0.7rem 1rem;
+  border-radius:0.7rem;
+  margin:0.35rem 0 1rem 0;
+">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem;flex-wrap:wrap;">
+    <div style="
+      display:flex;
+      align-items:center;
+      gap:0.58rem;
+      font-weight:800;
+      color:{pal["title"]};
+      font-size:0.96rem;
+    ">
+      <span style="font-size:0.95rem; line-height:1;">{icon}</span>
+      <span>Post-Hoc Verification</span>
+    </div>
+    <div style="
+      background:{pal["badge_bg"]};
+      color:{pal["badge_fg"]};
+      border:1px solid {pal["border"]}55;
+      padding:0.18rem 0.62rem;
+      border-radius:999px;
+      font-size:0.76rem;
+      font-weight:800;
+      white-space:nowrap;
+    ">
+      {html.escape(badge_text)}
+    </div>
+  </div>
+  {explain_html}
+  {chips_block}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
 
 # =========================
 # Styled section headers & answer cards
@@ -1651,6 +1931,136 @@ def _source_snapshot_lines(
     return lines
 
 
+def _extract_reserved_methods(anchor_meta: Optional[Dict[str, Any]]) -> List[str]:
+    """
+    Ambil reserved methods secara robust.
+    Fallback ke keys reserved_anchor_chunk_ids jika reserved_methods kosong.
+    Hal ini penting agar UI tetap bisa merender info banner walau shape metadata
+    sedikit bergeser atau incomplete saat replay/render tertentu.
+    """
+    meta = anchor_meta if isinstance(anchor_meta, dict) else {}
+
+    methods = [
+        str(x).strip()
+        for x in (meta.get("reserved_methods") or [])
+        if str(x).strip()
+    ]
+
+    if not methods:
+        reserved_map = meta.get("reserved_anchor_chunk_ids") or {}
+        if isinstance(reserved_map, dict):
+            methods = [
+                str(k).strip()
+                for k in reserved_map.keys()
+                if str(k).strip()
+            ]
+
+    return list(dict.fromkeys(methods))
+
+
+def _infer_anchor_meta_from_nodes(nodes: List[Any]) -> Dict[str, Any]:
+    """
+    Fallback UI-only:
+    Jika anchor_meta kosong/tidak sinkron, infer dari final nodes
+    yang sudah bertanda is_reserved_anchor / reserved_for_method.
+
+    Hal ini penting karena tabel/source snapshot bisa sudah tahu anchor,
+    sementara banner lama hanya membaca anchor_meta.
+    """
+    reserved_methods: List[str] = []
+    reserved_anchor_chunk_ids: Dict[str, str] = {}
+
+    for n in nodes or []:
+        is_anchor = bool(getattr(n, "is_reserved_anchor", False))
+        method = str(getattr(n, "reserved_for_method", "") or "").strip()
+        cid = str(getattr(n, "chunk_id", "") or "").strip()
+
+        if not is_anchor or not method:
+            continue
+
+        if method not in reserved_methods:
+            reserved_methods.append(method)
+
+        if cid and method not in reserved_anchor_chunk_ids:
+            reserved_anchor_chunk_ids[method] = cid
+
+    return {
+        "applied": bool(reserved_methods),
+        "modified": False,   # UI fallback tidak mengklaim modified jika meta asli tidak tersedia
+        "reserved_methods": reserved_methods,
+        "reserved_anchor_chunk_ids": reserved_anchor_chunk_ids,
+        "_ui_inferred": True,
+    }
+
+
+def render_anchor_reservation_notice(anchor_meta: Optional[Dict[str, Any]]) -> None:
+    """
+    Banner stabil untuk anchor reservation di before-vs-after panel.
+    Sengaja memakai komponen Streamlit biasa (container + markdown + caption),
+    bukan full raw HTML block, agar lebih tahan terhadap issue render di expander.
+    """
+    meta = anchor_meta if isinstance(anchor_meta, dict) else {}
+    reserved_methods = _extract_reserved_methods(meta)
+    if not reserved_methods:
+        return
+
+    modified = bool(meta.get("modified", False))
+    inferred = bool(meta.get("_ui_inferred", False))
+    reserved_txt = ", ".join(reserved_methods)
+
+    if modified:
+        status_txt = "Final set dimodifikasi setelah rerank."
+    elif inferred:
+        status_txt = "Anchor terdeteksi dari final contexts (fallback UI inference)."
+    else:
+        status_txt = "Anchor tervalidasi pada final contexts."
+
+    st.markdown(
+        f"""
+<div style="
+  background:linear-gradient(90deg, rgba(139,92,246,0.14), rgba(139,92,246,0.05));
+  border:1px solid rgba(139,92,246,0.35);
+  border-left:4px solid #8b5cf6;
+  padding:0.78rem 0.95rem;
+  border-radius:0.78rem;
+  margin:0 0 0.9rem 0;
+">
+  <div style="
+    display:flex;
+    align-items:center;
+    gap:0.55rem;
+    color:#f5d0fe;
+    font-weight:800;
+    font-size:0.98rem;
+    margin-bottom:0.28rem;
+  ">
+    <span style="font-size:1rem; line-height:1;">🛟</span>
+    <span>Anchor Reservation AKTIF</span>
+  </div>
+
+  <div style="
+    color:#f8fafc;
+    line-height:1.5;
+    font-size:0.92rem;
+    margin-left:1.55rem;
+  ">
+    metode target <b>{html.escape(reserved_txt)}</b> dijaga tetap hadir di final contexts.
+  </div>
+
+  <div style="
+    margin-top:0.38rem;
+    margin-left:1.55rem;
+    color:#ddd6fe;
+    font-size:0.80rem;
+  ">
+    {html.escape(status_txt)}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 def render_rerank_before_after_panel(
     *,
     reranker_applied: bool,
@@ -1684,31 +2094,25 @@ def render_rerank_before_after_panel(
     )
 
     anchor_meta = anchor_meta if isinstance(anchor_meta, dict) else {}
-    reserved_methods = anchor_meta.get("reserved_methods") or []
-    modified = bool(anchor_meta.get("modified", False))
+    reserved_methods = _extract_reserved_methods(anchor_meta)
+
+    # Fallback:
+    # jika anchor_meta kosong/tidak sinkron, tetapi final nodes sudah bertanda anchor,
+    # infer meta dari nodes_after_rerank agar banner tetap muncul.
+    effective_anchor_meta = anchor_meta
+    if not reserved_methods:
+        inferred_anchor_meta = _infer_anchor_meta_from_nodes(nodes_after_rerank)
+        inferred_methods = _extract_reserved_methods(inferred_anchor_meta)
+        if inferred_methods:
+            effective_anchor_meta = inferred_anchor_meta
+            reserved_methods = inferred_methods
 
     with st.expander("🧮 Before vs After Rerank (Debug / Audit)", expanded=False):
+        # ← V3.0d / UI fix:
+        # render banner anchor reservation dengan helper yang lebih stabil.
+        # Menutup bug minor bahwa banner kadang tidak muncul meski anchor reservation sebenarnya aktif.
         if reserved_methods:
-            reserved_txt = ", ".join(str(x) for x in reserved_methods)
-            status_txt = "FINAL SET DIMODIFIKASI" if modified else "ANCHOR TERVALIDASI"
-            st.markdown(
-                f"""
-<div style="
-  background:rgba(139,92,246,0.08);
-  border:1px solid #7c3aed55;
-  border-left:4px solid #8b5cf6;
-  padding:0.55rem 0.85rem;
-  border-radius:0.55rem;
-  margin:0 0 0.8rem 0;
-  color:#ddd6fe;
-  font-size:0.82rem;
-">
-  <b>Anchor Reservation:</b> {html.escape(reserved_txt)} ·
-  <span style="color:#c4b5fd;">{html.escape(status_txt)}</span>
-</div>
-""",
-                unsafe_allow_html=True,
-            )
+            render_anchor_reservation_notice(effective_anchor_meta)
 
         st.caption(
             "**Catatan:** jika suatu final context masuk melalui *anchor reservation* "

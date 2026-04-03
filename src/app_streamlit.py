@@ -34,6 +34,7 @@ from src.app_ui_render import (
     render_rerank_summary_box,
     render_source_score_pills,
     render_sources_header,
+    render_verification_box,
     render_viewing_banner,
     sim_color_badge,
 )
@@ -49,7 +50,12 @@ from src.core.ui_utils import (
     scroll_to_anchor,
 )
 from src.rag.fusion_rrf import rrf_fusion
-from src.rag.generate import build_generation_meta, contextualize_question, generate_answer
+from src.rag.generate import (
+    build_generation_meta,
+    build_verification_meta,
+    contextualize_question,
+    generate_answer,
+)
 from src.rag.metadata_router import maybe_route_metadata_query
 from src.rag.method_detection import (
     METHOD_PATTERNS as _METHOD_PATTERNS,
@@ -233,6 +239,7 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["last_nodes"] = None
     st.session_state["last_nodes_before_rerank"] = None   # ← V3.0c: candidate pool pre-rerank
     st.session_state["last_answer_raw"] = None
+    st.session_state["last_verification"] = None          # ← V3.0d: post-hoc verification result
     # ← V3.0c: stats eksplisit
     st.session_state["last_retrieval_stats_pre_rerank"] = None
     st.session_state["last_generation_context_stats"] = None
@@ -2402,6 +2409,18 @@ def main() -> None:
                         "answer_grounding_ok": True,
                     }
 
+                    # ← V3.0d: metadata-routed path = Verification N/A / skipped
+                    verification_meta = build_verification_meta(
+                        question=query,
+                        contexts=[],
+                        answer_text=answer_raw,
+                        used_ctx=0,
+                        used_context_chunk_ids=[],
+                        generator_meta=generator_meta,
+                        cfg=cfg_runtime,
+                        metadata_route_handled=True,
+                    )
+
                     answer_record = {
                         "run_id": rm.run_id,
                         "turn_id": turn_id,
@@ -2440,6 +2459,7 @@ def main() -> None:
                         "generator_strategy": "metadata_router",
                         "generator_status": "metadata",
                         "generator_meta": generator_meta,
+                        "verification": verification_meta,  # ← V3.0d
                         "max_bullets": 1,
                         "bullet_policy": {},
                         "error": None,
@@ -2478,6 +2498,7 @@ def main() -> None:
 
                     # set last result untuk UI
                     st.session_state["last_answer_raw"] = answer_raw
+                    st.session_state["last_verification"] = verification_meta   # ← V3.0d
                     st.session_state["last_turn_id"] = turn_id
                     st.session_state["last_nodes"] = []                 # final contexts
                     st.session_state["last_nodes_before_rerank"] = []   # candidate pool pre-rerank
@@ -2522,7 +2543,8 @@ def main() -> None:
                         "generation_context_stats": generation_context_stats,
                         "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
                         "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
-                        "reranker_info": _rk_meta["info"], 
+                        "reranker_info": _rk_meta["info"],
+                        "verification": verification_meta,  # ← V3.0d
                     }
 
             if not metadata_routed:
@@ -3569,6 +3591,19 @@ def main() -> None:
                     max_bullets=max_bullets,
                 )
 
+                # ← V3.0d: post-hoc verification dibangun di answer layer
+                # dan bekerja terhadap final contexts + answer final.
+                verification_meta = build_verification_meta(
+                    question=query,
+                    contexts=contexts,
+                    answer_text=answer_raw,
+                    used_ctx=used_ctx,
+                    used_context_chunk_ids=[n.chunk_id for n in nodes_for_gen],
+                    generator_meta=generator_meta,
+                    cfg=cfg_runtime,
+                    metadata_route_handled=bool(metadata_meta.get("handled")),
+                )
+
                 generator_status = generator_meta.get("status", "unknown")
                 jawaban, bukti = parse_answer(answer_raw)
 
@@ -3614,6 +3649,7 @@ def main() -> None:
                     "generator_strategy": generator_strategy_name,
                     "generator_status": generator_status,
                     "generator_meta": generator_meta,
+                    "verification": verification_meta,  # ← V3.0d
                     "max_bullets": int(max_bullets),
                     "bullet_policy": bullets_meta,  # berisi methods_detected, anaphora, multi_target, dll
                     "error": generator_error,
@@ -3675,6 +3711,7 @@ def main() -> None:
 
                 # persist last result (bersifat tetap hingga query baru dijalankan)
                 st.session_state["last_answer_raw"] = answer_raw  # menyimpan last answer dari copy
+                st.session_state["last_verification"] = verification_meta  # ← V3.0d
                 st.session_state["last_turn_id"] = turn_id
                 # ← V3.0c:
                 # last_nodes                = final contexts yang benar-benar dipakai LLM
@@ -3725,6 +3762,7 @@ def main() -> None:
                     "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
                     "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
                     "reranker_info": _rk_meta["info"],
+                    "verification": verification_meta,  # ← V3.0d
                 }
 
             _proc_status.update(label="💡 Finished!", state="complete", expanded=False)
@@ -4095,6 +4133,18 @@ def main() -> None:
             retrieval_stats_pre_rerank=retrieval_stats_pre_rerank_render,
             generation_context_stats=generation_context_stats_render,
         )
+
+        # ← V3.0d Phase 2A + 2C:
+        # render verification box di answer layer.
+        # - latest turn  : ambil dari session_state["last_verification"]
+        # - history replay: ambil dari turn_data[turn_id]["verification"]
+        _verification_render = (
+            (_td.get("verification") if isinstance(_td, dict) else None)
+            if _is_viewing_history
+            else st.session_state.get("last_verification")
+        )
+
+        render_verification_box(_verification_render)
 
         # Answer section — styled card
         h1, h2 = st.columns([0.88, 0.12])
