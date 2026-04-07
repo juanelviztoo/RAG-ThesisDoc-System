@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html as _html_mod
 import os
 import re
@@ -34,6 +35,7 @@ from src.app_ui_render import (
     render_rerank_summary_box,
     render_source_score_pills,
     render_sources_header,
+    render_verification_box,
     render_viewing_banner,
     sim_color_badge,
 )
@@ -49,12 +51,22 @@ from src.core.ui_utils import (
     scroll_to_anchor,
 )
 from src.rag.fusion_rrf import rrf_fusion
-from src.rag.generate import build_generation_meta, contextualize_question, generate_answer
-from src.rag.metadata_router import maybe_route_metadata_query
+from src.rag.generate import (
+    build_generation_meta,
+    build_verification_meta,
+    contextualize_question,
+    generate_answer,
+)
+from src.rag.metadata_router import (
+    load_doc_catalog,
+    load_docmeta_sidecar,
+    maybe_route_metadata_query,
+)
 from src.rag.method_detection import (
     METHOD_PATTERNS as _METHOD_PATTERNS,
 )
 from src.rag.method_detection import (
+    build_intent_plan,
     detect_methods_in_contexts,
     detect_methods_in_text,
     has_steps_signal,
@@ -212,8 +224,1431 @@ def apply_doc_focus_filter(
 
 
 # =========================
+# Ownership-aware document aggregation (Tahap 2)
+# =========================
+
+_OWNER_PREFERRED_BABS = {"BAB_I", "BAB_III", "BAB_IV", "BAB_V"}
+_LITERATURE_BABS = {"BAB_II", "DAFTAR_PUSTAKA"}
+
+_OWNER_CUE_PATTERNS: List[str] = [
+    r"\bpenelitian\s+ini\s+(?:menggunakan|memakai|menerapkan)\b",
+    r"\bdalam\s+penelitian\s+ini\b",
+    r"\bpengembangan\s+sistem\s+(?:ini\s+)?(?:menggunakan|memakai|menerapkan)\b",
+    r"\bsistem\s+ini\s+(?:dikembangkan|dibangun|menggunakan)\b",
+    r"\bmetode\b.{0,60}\bdigunakan\s+dalam\s+penelitian\s+ini\b",
+    r"\bmetode\b.{0,60}\bdigunakan\s+karena\b",
+    r"\bpenulis\s+(?:menggunakan|menerapkan)\b",
+]
+
+_RELATED_WORK_PATTERNS: List[str] = [
+    r"\bpenelitian\s+terdahulu\b",
+    r"\bstudi\s+terdahulu\b",
+    r"\bpenelitian\s+sebelumnya\b",
+    r"\bberdasarkan\s+penelitian\s+sebelumnya\b",
+    r"\bhasil\s+penelitian\s+sebelumnya\b",
+    r"\btinjauan\s+pustaka\b",
+    r"\blandasan\s+teori\b",
+    r"\bperbedaan\s+skripsi\b",
+    r"\bno\s+penulis\b",
+    r"\bjudul\b.*\btahun\b",
+    r"\bstudi\s+kasus\b",
+]
+
+
+def _node_source_file(n: Any) -> str:
+    return str((getattr(n, "metadata", {}) or {}).get("source_file", "") or "")
+
+
+def _node_bab_label(n: Any) -> str:
+    return str(
+        getattr(n, "bab_label", None)
+        or (getattr(n, "metadata", {}) or {}).get("bab_label", "")
+        or "UNKNOWN"
+    ).strip()
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _short_snippet(text: str, max_chars: int = 280) -> str:
+    t = _normalize_ws(text)
+    if len(t) <= int(max_chars):
+        return t
+    return t[: int(max_chars)].rstrip() + "..."
+
+
+def _text_mentions_method(text: str, method: str) -> bool:
+    pats = _METHOD_PATTERNS.get(method, [])
+    hay = _normalize_ws(text).lower()
+    return any(re.search(p, hay, flags=re.IGNORECASE) for p in pats)
+
+
+def _has_owner_cue(text: str) -> bool:
+    t = _normalize_ws(text).lower()
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in _OWNER_CUE_PATTERNS)
+
+
+def _looks_like_related_work_context(text: str, bab_label: str) -> bool:
+    t = _normalize_ws(text).lower()
+    if str(bab_label or "").upper() in _LITERATURE_BABS:
+        return True
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in _RELATED_WORK_PATTERNS)
+
+
+@st.cache_data(show_spinner=False)
+def _load_doc_catalog_cached(persist_dir_str: str, filename: str) -> Tuple[Dict[str, Any], str]:
+    catalog, catalog_path = load_doc_catalog(Path(persist_dir_str), filename=filename)
+    return catalog, str(catalog_path)
+
+
+@st.cache_data(show_spinner=False)
+def _load_docmeta_sidecar_cached(
+    persist_dir_str: str,
+    filename: str,
+) -> Tuple[Dict[str, Any], str]:
+    sidecar, sidecar_path = load_docmeta_sidecar(
+        Path(persist_dir_str),
+        filename=filename,
+    )
+    return sidecar, str(sidecar_path)
+
+
+def _get_doc_catalog_entry(catalog: Dict[str, Any], doc_id: str, source_file: str) -> Dict[str, Any]:
+    if not isinstance(catalog, dict):
+        return {}
+    if doc_id in catalog and isinstance(catalog.get(doc_id), dict):
+        return dict(catalog[doc_id])
+
+    sf = (source_file or "").strip().lower()
+    sf_stem = sf[:-4] if sf.endswith(".pdf") else sf
+    for v in catalog.values():
+        if not isinstance(v, dict):
+            continue
+        cand = str(v.get("source_file", "") or "").strip().lower()
+        cand_stem = cand[:-4] if cand.endswith(".pdf") else cand
+        if sf and (sf == cand or sf_stem == cand_stem):
+            return dict(v)
+    return {}
+
+
+def _get_docmeta_sidecar_entry(
+    sidecar: Dict[str, Any],
+    doc_id: str,
+    source_file: str,
+) -> Dict[str, Any]:
+    if not isinstance(sidecar, dict):
+        return {}
+
+    if doc_id in sidecar and isinstance(sidecar.get(doc_id), dict):
+        return dict(sidecar[doc_id])
+
+    sf = (source_file or "").strip().lower()
+    sf_stem = sf[:-4] if sf.endswith(".pdf") else sf
+
+    for v in sidecar.values():
+        if not isinstance(v, dict):
+            continue
+        cand = str(v.get("source_file", "") or "").strip().lower()
+        cand_stem = cand[:-4] if cand.endswith(".pdf") else cand
+        if sf and (sf == cand or sf_stem == cand_stem):
+            return dict(v)
+
+    return {}
+
+
+def _resolve_safe_doc_display_meta(
+    *,
+    catalog_entry: Dict[str, Any],
+    sidecar_entry: Dict[str, Any],
+    source_file: str,
+    doc_id: str,
+) -> Dict[str, Any]:
+    if sidecar_entry:
+        title_display = str(sidecar_entry.get("title_safe", "") or "").strip() or _safe_display_title(
+            catalog_entry,
+            source_file=source_file,
+            doc_id=doc_id,
+        )
+        author_display = str(sidecar_entry.get("author_safe", "") or "").strip() or str((catalog_entry or {}).get("penulis", "") or "").strip() or "-"
+        year_display = str(sidecar_entry.get("year_safe", "") or "").strip() or "-"
+        title_source = str(sidecar_entry.get("title_source", "") or "sidecar").strip() or "sidecar"
+        title_quality = str(sidecar_entry.get("title_quality", "") or "unknown").strip() or "unknown"
+        title_reasons = list(sidecar_entry.get("title_reasons") or [])
+        return {
+            "title_display": title_display,
+            "author_display": author_display,
+            "year_display": year_display,
+            "title_source": title_source,
+            "title_quality": title_quality,
+            "title_reasons": title_reasons,
+        }
+
+    # fallback legacy-runtime jika sidecar belum tersedia
+    title_display = _safe_display_title(
+        catalog_entry,
+        source_file=source_file,
+        doc_id=doc_id,
+    )
+    author_display = str((catalog_entry or {}).get("penulis", "") or "").strip() or "-"
+    year_val = (catalog_entry or {}).get("tahun", None)
+    year_display = str(int(year_val)) if isinstance(year_val, int) and year_val > 0 else "-"
+
+    raw_title = str((catalog_entry or {}).get("judul", "") or "").strip()
+    title_source = "catalog_raw" if raw_title and title_display == raw_title else "runtime_fallback"
+    title_quality = "fallback" if title_source != "catalog_raw" else "unknown"
+
+    return {
+        "title_display": title_display,
+        "author_display": author_display,
+        "year_display": year_display,
+        "title_source": title_source,
+        "title_quality": title_quality,
+        "title_reasons": [],
+    }
+
+
+def _safe_display_title(entry: Dict[str, Any], *, source_file: str, doc_id: str) -> str:
+    title = str((entry or {}).get("judul", "") or "").strip()
+    if not title:
+        return source_file or doc_id
+
+    tl = title.lower()
+    research_keywords = [
+        "sistem", "rancang", "bangun", "aplikasi", "pengembangan",
+        "monitoring", "e-learning", "learning", "ticketing", "informasi",
+        "presensi", "face", "recognition", "website", "penerapan", "perancangan",
+        "skripsi", "tugas akhir", "berbasis", "web", "mobile",
+    ]
+
+    suspicious = False
+
+    if tl.startswith("puji syukur"):
+        suspicious = True
+    elif len(title) < 20:
+        suspicious = True
+    elif re.match(r"^\s*\d+\.\s+", title):
+        suspicious = True
+    elif title.count(",") >= 4:
+        suspicious = True
+    elif re.search(r"\b(no\s+penulis|hasil\s+penelitian|perbedaan\s+skripsi|penelitian\s+terdahulu|studi\s+terdahulu)\b", tl):
+        suspicious = True
+    elif ("institut teknologi sumatera" in tl or "jurusan" in tl or "produksi dan industri" in tl) and not any(k in tl for k in research_keywords):
+        suspicious = True
+
+    if suspicious:
+        sf = str(source_file or "").strip()
+        stem = sf[:-4] if sf.lower().endswith(".pdf") else sf
+        stem = stem.strip()
+        return stem or doc_id
+
+    return title
+
+
+def _node_has_rerank_payload(n: Any) -> bool:
+    return (
+        getattr(n, "rerank_score", None) is not None
+        or getattr(n, "rerank_rank", None) is not None
+        or bool(getattr(n, "is_reserved_anchor", False))
+        or bool(getattr(n, "reserved_for_method", None))
+    )
+
+
+def _pick_nodes_by_chunk_ids(
+    preferred_nodes: List[Any],
+    fallback_nodes: List[Any],
+    chunk_ids: List[str],
+) -> List[Any]:
+    """
+    Ambil node berdasarkan urutan chunk_ids, tetapi jika ada beberapa object dengan
+    chunk_id yang sama, prioritaskan object yang membawa payload rerank / anchor lebih lengkap.
+
+    Tujuan patch final:
+    - final contexts UI/history tidak memakai salinan node "kosong"
+    - object kanonik hasil rerank tetap diprioritaskan
+    """
+    pool: Dict[str, Any] = {}
+
+    def _should_replace(old_node: Any, new_node: Any) -> bool:
+        if old_node is None:
+            return True
+
+        old_has = _node_has_rerank_payload(old_node)
+        new_has = _node_has_rerank_payload(new_node)
+
+        # Jika node baru punya payload rerank lebih kaya, pakai node baru.
+        if (not old_has) and new_has:
+            return True
+
+        # Jika sama-sama tidak / sama-sama iya, pertahankan node lama
+        # agar urutan preferensi caller tetap dihormati.
+        return False
+
+    for n in list(preferred_nodes or []) + list(fallback_nodes or []):
+        cid = str(getattr(n, "chunk_id", "") or "").strip()
+        if not cid:
+            continue
+
+        if cid not in pool or _should_replace(pool.get(cid), n):
+            pool[cid] = n
+
+    return [pool[cid] for cid in chunk_ids if cid in pool]
+
+
+def build_owner_aware_doc_aggregation(
+    nodes: List[Any],
+    *,
+    cfg: Dict[str, Any],
+    target_method: str,
+    max_docs: int = 5,
+    max_evidence_chars: int = 280,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    index_cfg = cfg.get("index", {}) or {}
+    persist_dir = str(index_cfg.get("persist_dir", "") or "").strip()
+
+    md_cfg = cfg.get("metadata_routing", {}) or {}
+    catalog_filename = str(md_cfg.get("doc_catalog_filename", "doc_catalog.json"))
+
+    docmeta_cfg = cfg.get("docmeta", {}) or {}
+    sidecar_enabled = bool(docmeta_cfg.get("enabled", True))
+    sidecar_filename = str(docmeta_cfg.get("sidecar_filename", "docmeta_sidecar.json") or "docmeta_sidecar.json").strip()
+
+    catalog: Dict[str, Any] = {}
+    catalog_path = ""
+    sidecar: Dict[str, Any] = {}
+    sidecar_path = ""
+
+    if persist_dir:
+        catalog, catalog_path = _load_doc_catalog_cached(persist_dir, catalog_filename)
+        if sidecar_enabled:
+            sidecar, sidecar_path = _load_docmeta_sidecar_cached(persist_dir, sidecar_filename)
+
+    grouped: Dict[str, List[Any]] = {}
+    for n in nodes or []:
+        did = _node_doc_id(n)
+        grouped.setdefault(did, []).append(n)
+
+    summaries: List[Dict[str, Any]] = []
+    for doc_id, doc_nodes in grouped.items():
+        source_file = _node_source_file(doc_nodes[0])
+        docid_hit = bool(_docid_hit_for_method(doc_id, target_method))
+
+        strong_owner_nodes: List[Any] = []
+        weak_owner_nodes: List[Any] = []
+        mention_only_nodes: List[Any] = []
+        neutral_method_nodes: List[Any] = []
+
+        for n in doc_nodes:
+            text = _node_text(n)
+            bab_label = _node_bab_label(n).upper()
+            mentions = _text_mentions_method(text, target_method)
+            if not mentions:
+                continue
+
+            related = _looks_like_related_work_context(text, bab_label)
+            owner_cue = _has_owner_cue(text)
+
+            if owner_cue and (not related):
+                strong_owner_nodes.append(n)
+            elif (bab_label in _OWNER_PREFERRED_BABS) and (not related):
+                weak_owner_nodes.append(n)
+            elif related or (bab_label in _LITERATURE_BABS):
+                mention_only_nodes.append(n)
+            else:
+                neutral_method_nodes.append(n)
+
+        owner_score = 0
+        owner_score += 4 if docid_hit else 0
+        owner_score += 3 * len(strong_owner_nodes)
+        owner_score += 1 * len(weak_owner_nodes)
+        owner_score += 1 * len(neutral_method_nodes)
+        owner_score -= 2 * len(mention_only_nodes)
+
+        accepted_reasons: List[str] = []
+        if docid_hit:
+            accepted_reasons.append("doc_id_hint")
+        if strong_owner_nodes:
+            accepted_reasons.append("strong_owner_phrase")
+        if weak_owner_nodes:
+            accepted_reasons.append("preferred_bab_context")
+        if neutral_method_nodes and not mention_only_nodes:
+            accepted_reasons.append("direct_method_mention")
+
+        accepted = False
+        if docid_hit or strong_owner_nodes:
+            accepted = True
+        elif weak_owner_nodes and owner_score >= 2:
+            accepted = True
+        elif neutral_method_nodes and owner_score >= 2 and len(mention_only_nodes) == 0:
+            accepted = True
+
+        rep_node = None
+        for bucket in (strong_owner_nodes, weak_owner_nodes, neutral_method_nodes, mention_only_nodes, doc_nodes):
+            if bucket:
+                rep_node = bucket[0]
+                break
+
+        secondary_node = None
+        for bucket in (strong_owner_nodes[1:], weak_owner_nodes[1:], neutral_method_nodes[1:], doc_nodes[1:]):
+            if bucket:
+                secondary_node = bucket[0]
+                break
+
+        catalog_entry = _get_doc_catalog_entry(catalog, doc_id, source_file)
+        sidecar_entry = _get_docmeta_sidecar_entry(sidecar, doc_id, source_file)
+
+        display_meta = _resolve_safe_doc_display_meta(
+            catalog_entry=catalog_entry,
+            sidecar_entry=sidecar_entry,
+            source_file=source_file,
+            doc_id=doc_id,
+        )
+
+        title_display = display_meta["title_display"]
+        author_display = display_meta["author_display"]
+        year_display = display_meta["year_display"]
+        title_source = display_meta["title_source"]
+        title_quality = display_meta["title_quality"]
+        title_reasons = display_meta["title_reasons"]
+
+        summaries.append({
+            "doc_id": doc_id,
+            "source_file": source_file or doc_id,
+            "title_display": title_display,
+            "author_display": author_display,
+            "year_display": year_display,
+            "title_source": title_source,
+            "title_quality": title_quality,
+            "title_reasons": title_reasons,
+            "docid_hit": bool(docid_hit),
+            "owner_score": int(owner_score),
+            "accepted": bool(accepted),
+            "accepted_reasons": accepted_reasons,
+            "strong_owner_count": len(strong_owner_nodes),
+            "weak_owner_count": len(weak_owner_nodes),
+            "mention_only_count": len(mention_only_nodes),
+            "neutral_method_count": len(neutral_method_nodes),
+            "representative_chunk_id": str(getattr(rep_node, "chunk_id", "") or ""),
+            "owner_evidence": _short_snippet(_node_text(rep_node) if rep_node else "", max_chars=max_evidence_chars),
+            "secondary_evidence": _short_snippet(_node_text(secondary_node) if secondary_node else "", max_chars=max_evidence_chars),
+            "representative_bab_label": _node_bab_label(rep_node),
+        })
+
+    summaries.sort(key=lambda x: (-int(x.get("owner_score", 0)), str(x.get("doc_id", ""))))
+    accepted_docs = [d for d in summaries if d.get("accepted")]
+    accepted_docs = accepted_docs[: max(1, int(max_docs))]
+
+    meta: Dict[str, Any] = {
+        "enabled": True,
+        "executed": True,
+        "applied": bool(accepted_docs),
+        "target_method": str(target_method),
+        "target_method_label": pretty_method_name(target_method),
+        "catalog_path": catalog_path or None,
+        "candidate_doc_count": int(len(summaries)),
+        "accepted_doc_count": int(len(accepted_docs)),
+        "representative_chunk_ids": [d.get("representative_chunk_id") for d in accepted_docs if d.get("representative_chunk_id")],
+        "candidate_docs": [
+            {
+                "doc_id": d["doc_id"],
+                "source_file": d["source_file"],
+                "owner_score": d["owner_score"],
+                "docid_hit": d["docid_hit"],
+                "strong_owner_count": d["strong_owner_count"],
+                "weak_owner_count": d["weak_owner_count"],
+                "mention_only_count": d["mention_only_count"],
+                "accepted": d["accepted"],
+            }
+            for d in summaries
+        ],
+        "accepted_docs": [
+            {
+                "doc_id": d["doc_id"],
+                "source_file": d["source_file"],
+                "title_display": d["title_display"],
+                "author_display": d["author_display"],
+                "year_display": d["year_display"],
+                "title_source": d["title_source"],
+                "title_quality": d["title_quality"],
+                "title_reasons": d["title_reasons"],
+                "owner_score": d["owner_score"],
+                "accepted_reasons": d["accepted_reasons"],
+            }
+            for d in accepted_docs
+        ],
+        "rejected_docs": [
+            {
+                "doc_id": d["doc_id"],
+                "source_file": d["source_file"],
+                "owner_score": d["owner_score"],
+                "mention_only_count": d["mention_only_count"],
+            }
+            for d in summaries if not d.get("accepted")
+        ],
+        "used_summary_contexts": bool(accepted_docs),
+        "docmeta_sidecar_path": sidecar_path or None,
+    }
+    return accepted_docs, meta
+
+
+def build_doc_aggregation_contexts(
+    doc_summaries: List[Dict[str, Any]],
+    *,
+    target_method: str,
+) -> List[str]:
+    out: List[str] = []
+    method_label = pretty_method_name(target_method)
+    for d in doc_summaries or []:
+        lines = [
+            f"DOC_AGG: {d.get('doc_id', '')} | {d.get('source_file', '')} | owner_method={method_label}",
+            f"TITLE: {d.get('title_display', '-')}",
+            f"AUTHOR: {d.get('author_display', '-')}",
+            f"YEAR: {d.get('year_display', '-')}",
+            f"OWNER_SCORE: {d.get('owner_score', 0)}",
+            f"OWNERSHIP_BASIS: {', '.join(d.get('accepted_reasons') or []) or '-'}",
+            f"OWNER_EVIDENCE: {d.get('owner_evidence', '-') or '-'}",
+        ]
+        if d.get("secondary_evidence"):
+            lines.append(f"ADDITIONAL_EVIDENCE: {d.get('secondary_evidence')}")
+        out.append("\n".join(lines).strip())
+    return out
+
+
+# =========================
+# Method explanation expansion (Tahap 3)
+# =========================
+
+_EXPLANATION_BIAS_PATTERNS: List[str] = [
+    r"\bdigunakan\b",
+    r"\bdigunakan\s+karena\b",
+    r"\balasan\b",
+    r"\bmemungkinkan\b",
+    r"\bkelebihan\b",
+    r"\bkarakteristik\b",
+    r"\bbersifat\b",
+    r"\bincremental\b",
+    r"\bitera(?:si|tif)?\b",
+    r"\btahapan?\b",
+    r"\blangkah(?:-langkah)?\b",
+    r"\bplanning\b",
+    r"\bdesign\b",
+    r"\bcoding\b",
+    r"\btesting\b",
+    r"\bcommunication\b",
+]
+
+
+def build_method_explanation_queries(method: str) -> List[str]:
+    label = pretty_method_name(method)
+    return [
+        f"metode {label} digunakan karena",
+        f"alasan menggunakan {label}",
+        f"karakteristik metode {label}",
+        f"{label} dalam penelitian ini",
+        f"tahapan metode {label}",
+    ]
+
+
+def _explanation_signal_strength(text: str) -> int:
+    t = _normalize_ws(text).lower()
+    if not t:
+        return 0
+
+    score = 0
+    for pat in _EXPLANATION_BIAS_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            score += 1
+    return score
+
+
+def _score_method_explanation_node(
+    n: Any,
+    *,
+    target_method: str,
+    target_doc_id: str,
+) -> int:
+    text = _node_text(n)
+    bab_label = _node_bab_label(n).upper()
+    score = 0
+
+    if str(getattr(n, "doc_id", "") or "").strip() == str(target_doc_id or "").strip():
+        score += 5
+
+    if _node_supports_target_method(n, target_method):
+        score += 4
+
+    if _has_owner_cue(text):
+        score += 3
+
+    if bab_label in _OWNER_PREFERRED_BABS:
+        score += 2
+
+    score += min(_explanation_signal_strength(text), 6)
+
+    if _node_has_strong_steps_signal(n):
+        score += 2
+
+    if _looks_like_related_work_context(text, bab_label):
+        score -= 5
+
+    if bab_label in _LITERATURE_BABS:
+        score -= 3
+
+    return int(score)
+
+
+def _resolve_method_explanation_target_doc_id(
+    *,
+    intent_plan: Dict[str, Any],
+    doc_focus_meta: Optional[Dict[str, Any]],
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+    nodes_for_gen: List[Any],
+    target_method: str,
+) -> str:
+    # 1) explicit doc-lock dari query
+    dfm = doc_focus_meta or {}
+    allowed = [str(x).strip() for x in (dfm.get("allowed_doc_ids") or []) if str(x).strip()]
+    if allowed:
+        return allowed[0]
+
+    # 2) hasil accepted owner doc dari Tahap 2
+    dam = doc_aggregation_meta or {}
+    accepted = dam.get("accepted_docs") or []
+    if accepted and isinstance(accepted, list) and isinstance(accepted[0], dict):
+        doc_id = str(accepted[0].get("doc_id", "") or "").strip()
+        if doc_id:
+            return doc_id
+
+    # 3) kalau final nodes saat ini hanya 1 dokumen
+    doc_ids = list(
+        dict.fromkeys(
+            [
+                str(getattr(n, "doc_id", "") or "").strip()
+                for n in (nodes_for_gen or [])
+                if str(getattr(n, "doc_id", "") or "").strip()
+            ]
+        )
+    )
+    if len(doc_ids) == 1:
+        return doc_ids[0]
+
+    # 4) fallback ke method_doc_map jika tersedia
+    method_doc_map = (dfm.get("method_doc_map") or {}) if isinstance(dfm, dict) else {}
+    if isinstance(method_doc_map, dict):
+        cand = str(method_doc_map.get(target_method, "") or "").strip()
+        if cand:
+            return cand
+
+    return ""
+
+
+def build_method_explanation_expansion(
+    *,
+    cfg: Dict[str, Any],
+    query: str,
+    target_method: str,
+    target_doc_id: str,
+    base_nodes: List[Any],
+    max_queries: int,
+    max_added_nodes: int,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "enabled": True,
+        "executed": False,
+        "applied": False,
+        "target_method": str(target_method),
+        "target_method_label": pretty_method_name(target_method),
+        "target_doc_id": str(target_doc_id or "") or None,
+        "target_doc_source_file": None,
+        "expansion_queries": [],
+        "added_chunk_ids": [],
+        "added_doc_ids": [],
+        "selected_explanation_chunk_ids": [],
+        "selected_context_count": 0,
+        "reason": None,
+    }
+
+    if not target_doc_id:
+        meta["reason"] = "no_target_doc_id"
+        return list(base_nodes or []), meta
+
+    if not target_method:
+        meta["reason"] = "no_target_method"
+        return list(base_nodes or []), meta
+
+    # Base = node final saat ini, tetapi hanya yang masih berada pada target owner doc
+    base = dedupe_nodes_by_chunk_id(list(base_nodes or []))
+    owner_base = [
+        n for n in base
+        if str(getattr(n, "doc_id", "") or "").strip() == target_doc_id
+    ]
+
+    queries = build_method_explanation_queries(target_method)[: max(1, int(max_queries))]
+    meta["expansion_queries"] = queries
+    meta["executed"] = True
+
+    where_filter = {"doc_id": {"$eq": target_doc_id}}
+    pool: List[Any] = list(owner_base)
+
+    # Expansion retrieval sengaja dense + doc-locked,
+    # supaya explanation tidak kabur lintas dokumen.
+    for qx in queries:
+        try:
+            nodes_extra = retrieve_dense(
+                cfg,
+                qx,
+                diversify=False,
+                candidate_k=max(4, int(max_added_nodes)),
+                collection="narasi",
+                where_filter=where_filter,
+            )
+        except Exception:
+            nodes_extra = []
+
+        if nodes_extra:
+            pool.extend(nodes_extra)
+
+    pool = dedupe_nodes_by_chunk_id(pool)
+    if pool:
+        meta["target_doc_source_file"] = _node_source_file(pool[0]) or None
+
+    scored: List[Tuple[int, Any]] = []
+    for n in pool:
+        s = _score_method_explanation_node(
+            n,
+            target_method=target_method,
+            target_doc_id=target_doc_id,
+        )
+        scored.append((s, n))
+
+    scored.sort(key=lambda x: (-(x[0]), float(getattr(x[1], "score", 9999.0))))
+
+    selected: List[Any] = []
+    selected_ids: set = set()
+
+    def _append_first(predicate) -> None:
+        for s, n in scored:
+            cid = str(getattr(n, "chunk_id", "") or "").strip()
+            if not cid or cid in selected_ids:
+                continue
+            if predicate(s, n):
+                selected.append(n)
+                selected_ids.add(cid)
+                return
+
+    # Komposisi ideal:
+    # 1) owner/context node
+    # 2) reason/characteristic node
+    # 3) steps/process node jika ada
+    _append_first(lambda s, n: _has_owner_cue(_node_text(n)))
+    _append_first(lambda s, n: _explanation_signal_strength(_node_text(n)) >= 2)
+    _append_first(lambda s, n: _node_has_strong_steps_signal(n))
+
+    for s, n in scored:
+        cid = str(getattr(n, "chunk_id", "") or "").strip()
+        if not cid or cid in selected_ids:
+            continue
+        if s < 2:
+            continue
+        selected.append(n)
+        selected_ids.add(cid)
+        if len(selected) >= max(3, int(max_added_nodes)):
+            break
+
+    if not selected and owner_base:
+        selected = owner_base[:1]
+
+    meta["selected_explanation_chunk_ids"] = [
+        str(getattr(n, "chunk_id", "") or "") for n in selected
+    ]
+    base_ids = {
+        str(getattr(n, "chunk_id", "") or "") for n in owner_base
+    }
+    meta["added_chunk_ids"] = [
+        cid for cid in meta["selected_explanation_chunk_ids"]
+        if cid and cid not in base_ids
+    ]
+    meta["added_doc_ids"] = list(
+        dict.fromkeys(
+            [
+                str(getattr(n, "doc_id", "") or "")
+                for n in selected
+                if str(getattr(n, "doc_id", "") or "")
+            ]
+        )
+    )
+    meta["selected_context_count"] = len(selected)
+    meta["applied"] = bool(selected)
+    meta["reason"] = (
+        "owner_doc_explanation_expansion"
+        if selected
+        else "no_explanation_nodes_selected"
+    )
+
+    return selected, meta
+
+
+# =========================
+# Single-target steps handler (Tahap 4.1)
+# =========================
+
+_SINGLE_TARGET_STEPS_BIAS_PATTERNS: List[str] = [
+    r"\btahapan?\b",
+    r"\blangkah(?:-langkah)?\b",
+    r"\bmekanisme\b",
+    r"\bpenjabaran\b",
+    r"\balur\b",
+    r"\bprosedur\b",
+    # Tahap 4.1:
+    # sengaja TIDAK lagi memberi boost untuk flowchart/diagram/gambar
+    # karena ini terlalu mudah memancing artefak non-step (DFD, ERD, use case, dst).
+]
+
+_SINGLE_TARGET_STEPS_ARTIFACT_PATTERNS: List[str] = [
+    r"\bdata\s+flow\s+diagram\b",
+    r"\bdfd\b",
+    r"\bentity\s+relationship\s+diagram\b",
+    r"\berd\b",
+    r"\buse\s+case\b",
+    r"\bactivity\s+diagram\b",
+    r"\bsequence\s+diagram\b",
+    r"\bclass\s+diagram\b",
+    r"\bdeployment\s+diagram\b",
+    r"\bcontext\s+diagram\b",
+    r"\bflowmap\b",
+    r"\bmockup\b",
+    r"\brancangan\s+antarmuka\b",
+    r"\bblackbox\b",
+    r"\bwhitebox\b",
+    r"\blaporan\s+magang\b",
+    r"\blogsheet\s+magang\b",
+]
+
+
+def build_single_target_steps_queries(method: str) -> List[str]:
+    label = pretty_method_name(method)
+    return [
+        f"tahapan metode {label} terdiri dari",
+        f"langkah-langkah metode {label} yaitu",
+        f"prosedur {label} dalam penelitian ini",
+        f"alur pengembangan dengan metode {label}",
+        f"tahapan implementasi {label}",
+        f"penjabaran tahapan {label}",
+    ]
+
+
+def _single_target_steps_signal_strength(text: str) -> int:
+    t = _normalize_ws(text).lower()
+    if not t:
+        return 0
+
+    score = 0
+    for pat in _SINGLE_TARGET_STEPS_BIAS_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            score += 1
+
+    score += min(_steps_signal_strength(text), 6)
+    return int(score)
+
+
+def _looks_like_single_target_steps_artifact_text(text: str) -> bool:
+    t = _normalize_ws(text).lower()
+    if not t:
+        return False
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in _SINGLE_TARGET_STEPS_ARTIFACT_PATTERNS)
+
+
+def _filter_valid_single_target_step_items(
+    items: List[str],
+    *,
+    max_items: int,
+) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    for raw in items or []:
+        item = " ".join((raw or "").split()).strip()
+        if not item:
+            continue
+
+        item_norm = item.lower()
+
+        # Drop artefak non-langkah (DFD/ERD/use case/dll)
+        if _looks_like_single_target_steps_artifact_text(item_norm):
+            continue
+
+        # Drop judul "gambar x.x ..." / "tabel x.x ..." yang bukan langkah
+        if re.search(r"^\s*(gambar|tabel)\s+\d+\.\d+\b", item_norm, flags=re.IGNORECASE):
+            continue
+
+        # Drop item yang terlalu pendek / terlalu noise
+        if len(item_norm) < 5:
+            continue
+
+        sig = re.sub(r"\s+", " ", item_norm)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(item)
+
+        if len(out) >= int(max_items):
+            break
+
+    return out
+
+
+def _extract_valid_single_target_steps_from_text(
+    text: str,
+    *,
+    max_items: int,
+) -> List[str]:
+    """
+    Reuse extractor utama dari generate_utils via konteks mentah yang sudah dibawa ke UI context,
+    tetapi tambahkan filter artefak Tahap 4.1 di layer runtime.
+    """
+    # NOTE:
+    # TIDAK memanggil helper private dari generate_utils di sini.
+    # Jadi re-parse ringan secara lokal, konservatif.
+    s = _normalize_ws(text)
+    if not s:
+        return []
+
+    # 1) enumerasi eksplisit
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    enum_items: List[str] = []
+    for ln in lines:
+        if re.match(r"^\s*(\d+[\.\)]|[-•])\s+", ln):
+            item = re.sub(r"^\s*(\d+[\.\)]|[-•])\s+", "", ln).strip()
+            if item:
+                enum_items.append(item)
+
+    if len(enum_items) >= 2:
+        return _filter_valid_single_target_step_items(enum_items, max_items=max_items)
+
+    # 2) connector daftar
+    m = re.search(
+        r"\b(meliputi|terdiri(\s+dari)?|yaitu|antara\s+lain)\b\s*([^\.]{20,280})",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        tail = (m.group(3) or "").strip()
+        parts = [p.strip(" ;:-\n\t") for p in re.split(r",|\bdan\b", tail) if p.strip()]
+        return _filter_valid_single_target_step_items(parts, max_items=max_items)
+
+    return []
+
+
+def _single_target_steps_candidate_doc_ids_from_meta(
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+) -> List[str]:
+    out: List[str] = []
+    dam = doc_aggregation_meta or {}
+
+    for bucket_name in ("accepted_docs", "candidate_docs", "rejected_docs"):
+        bucket = dam.get(bucket_name) or []
+        if not isinstance(bucket, list):
+            continue
+        for item in bucket:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("doc_id", "") or "").strip()
+            if did and did not in out:
+                out.append(did)
+
+    return out
+
+
+def _resolve_single_target_steps_target_doc_id_strict(
+    *,
+    intent_plan: Dict[str, Any],
+    doc_focus_meta: Optional[Dict[str, Any]],
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    """
+    Tahap 4.1:
+    Resolver steps route HARUS lebih ketat dari explanation route.
+
+    Return:
+        (target_doc_id, resolve_status)
+
+    resolve_status:
+        - resolved_explicit_doc_lock
+        - resolved_owner_aggregation
+        - ambiguous_owner_docs
+        - unresolved_owner_doc
+    """
+    dfm = doc_focus_meta or {}
+
+    # 1) explicit doc-lock dari query
+    allowed = [
+        str(x).strip()
+        for x in (dfm.get("allowed_doc_ids") or [])
+        if str(x).strip()
+    ]
+    if allowed:
+        return allowed[0], "resolved_explicit_doc_lock"
+
+    # 2) accepted owner doc dari Tahap 2
+    dam = doc_aggregation_meta or {}
+    accepted = dam.get("accepted_docs") or []
+    accepted_doc_ids = []
+    if isinstance(accepted, list):
+        for item in accepted:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("doc_id", "") or "").strip()
+            if did and did not in accepted_doc_ids:
+                accepted_doc_ids.append(did)
+
+    if len(accepted_doc_ids) == 1:
+        return accepted_doc_ids[0], "resolved_owner_aggregation"
+
+    if len(accepted_doc_ids) > 1:
+        return "", "ambiguous_owner_docs"
+
+    # 3) TIDAK boleh fallback ke single doc_id dari nodes_for_gen / method_doc_map
+    # untuk steps route, karena ini menyebabkan false lock ke dokumen yang salah.
+    return "", "unresolved_owner_doc"
+
+
+def _score_single_target_steps_node(
+    n: Any,
+    *,
+    target_method: str,
+    target_doc_id: str,
+) -> int:
+    text = _node_text(n)
+    bab_label = _node_bab_label(n).upper()
+    score = 0
+
+    if str(getattr(n, "doc_id", "") or "").strip() == str(target_doc_id or "").strip():
+        score += 6
+
+    if _node_supports_target_method(n, target_method):
+        score += 4
+
+    if _node_has_strong_steps_signal(n):
+        score += 7
+
+    if bab_label in {"BAB_III", "BAB_IV", "BAB_V"}:
+        score += 3
+    elif bab_label in _OWNER_PREFERRED_BABS:
+        score += 2
+
+    if _has_owner_cue(text):
+        score += 2
+
+    score += min(_single_target_steps_signal_strength(text), 6)
+
+    # Tahap 4.1: penalti ringan untuk chunk yang tampak seperti artefak diagram/desain
+    if _looks_like_single_target_steps_artifact_text(text):
+        score -= 4
+
+    if _looks_like_related_work_context(text, bab_label):
+        score -= 6
+
+    if bab_label in _LITERATURE_BABS:
+        score -= 4
+
+    return int(score)
+
+
+def build_single_target_steps_expansion(
+    *,
+    cfg: Dict[str, Any],
+    query: str,
+    target_method: str,
+    target_doc_id: str,
+    base_nodes: List[Any],
+    max_queries: int,
+    max_added_nodes: int,
+    max_steps: int = 5,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "enabled": True,
+        "executed": False,
+        "applied": False,
+        "target_method": str(target_method or ""),
+        "target_method_label": pretty_method_name(target_method),
+        "target_doc_id": str(target_doc_id or "") or None,
+        "target_doc_source_file": None,
+        "expansion_queries": [],
+        "added_chunk_ids": [],
+        "added_doc_ids": [],
+        "selected_chunk_ids": [],
+        "selected_context_count": 0,
+        "method_support_ctx_nums": [],
+        "explicit_steps_ctx_nums": [],
+        "extractable_steps_ctx_nums": [],
+        "extractable_steps_count": 0,
+        "artifact_only_ctx_nums": [],
+        "has_method_support": False,
+        "has_explicit_steps": False,        # raw explicit steps signal
+        "has_extractable_steps": False,     # actionable steps setelah filter artefak
+        "ambiguous_candidate_doc_ids": [],
+        "status": None,
+        "reason": None,
+        "max_steps": int(max_steps),
+    }
+
+    if not target_doc_id:
+        meta["status"] = "unresolved_owner_doc"
+        meta["reason"] = "no_target_doc_id"
+        return list(base_nodes or []), meta
+
+    if not target_method:
+        meta["status"] = "method_not_found"
+        meta["reason"] = "no_target_method"
+        return list(base_nodes or []), meta
+
+    base = dedupe_nodes_by_chunk_id(list(base_nodes or []))
+    owner_base = [
+        n for n in base
+        if str(getattr(n, "doc_id", "") or "").strip() == target_doc_id
+    ]
+
+    queries = build_single_target_steps_queries(target_method)[: max(1, int(max_queries))]
+    meta["expansion_queries"] = queries
+    meta["executed"] = True
+
+    where_filter = {"doc_id": {"$eq": target_doc_id}}
+    pool: List[Any] = list(owner_base)
+
+    for qx in queries:
+        try:
+            nodes_extra = retrieve_dense(
+                cfg,
+                qx,
+                diversify=False,
+                candidate_k=max(4, int(max_added_nodes)),
+                collection="narasi",
+                where_filter=where_filter,
+            )
+        except Exception:
+            nodes_extra = []
+
+        if nodes_extra:
+            pool.extend(nodes_extra)
+
+    pool = dedupe_nodes_by_chunk_id(pool)
+
+    if pool:
+        meta["target_doc_source_file"] = _node_source_file(pool[0]) or None
+
+    scored: List[Tuple[int, Any]] = []
+    for n in pool:
+        s = _score_single_target_steps_node(
+            n,
+            target_method=target_method,
+            target_doc_id=target_doc_id,
+        )
+        scored.append((s, n))
+
+    scored.sort(key=lambda x: (-(x[0]), float(getattr(x[1], "score", 9999.0))))
+
+    selected: List[Any] = []
+    selected_ids: set[str] = set()
+
+    def _append_first(predicate) -> None:
+        for s, n in scored:
+            cid = str(getattr(n, "chunk_id", "") or "").strip()
+            if not cid or cid in selected_ids:
+                continue
+            if predicate(s, n):
+                selected.append(n)
+                selected_ids.add(cid)
+                return
+
+    # Komposisi ideal:
+    # 1) owner-supported steps context
+    # 2) steps context lain
+    # 3) owner cue context
+    _append_first(
+        lambda s, n: _node_has_strong_steps_signal(n)
+        and _node_bab_label(n).upper() in {"BAB_III", "BAB_IV", "BAB_V"}
+    )
+    _append_first(lambda s, n: _node_has_strong_steps_signal(n))
+    _append_first(
+        lambda s, n: _node_supports_target_method(n, target_method)
+        and _has_owner_cue(_node_text(n))
+    )
+
+    for s, n in scored:
+        cid = str(getattr(n, "chunk_id", "") or "").strip()
+        if not cid or cid in selected_ids:
+            continue
+        if s < 4:
+            continue
+        selected.append(n)
+        selected_ids.add(cid)
+        if len(selected) >= max(2, int(max_added_nodes)):
+            break
+
+    if not selected and owner_base:
+        selected = owner_base[: max(1, min(len(owner_base), int(max_added_nodes)))]
+
+    meta["selected_chunk_ids"] = [
+        str(getattr(n, "chunk_id", "") or "").strip()
+        for n in selected
+        if str(getattr(n, "chunk_id", "") or "").strip()
+    ]
+
+    base_ids = {
+        str(getattr(n, "chunk_id", "") or "").strip()
+        for n in owner_base
+        if str(getattr(n, "chunk_id", "") or "").strip()
+    }
+    meta["added_chunk_ids"] = [
+        cid for cid in meta["selected_chunk_ids"]
+        if cid and cid not in base_ids
+    ]
+    meta["added_doc_ids"] = list(
+        dict.fromkeys(
+            [
+                str(getattr(n, "doc_id", "") or "").strip()
+                for n in selected
+                if str(getattr(n, "doc_id", "") or "").strip()
+            ]
+        )
+    )
+    meta["selected_context_count"] = len(selected)
+    meta["applied"] = bool(selected)
+
+    method_support_ctx_nums: List[int] = []
+    explicit_steps_ctx_nums: List[int] = []
+    extractable_steps_ctx_nums: List[int] = []
+    artifact_only_ctx_nums: List[int] = []
+
+    extractable_items_merged: List[str] = []
+    seen_extractable: set[str] = set()
+
+    for idx, n in enumerate(selected, start=1):
+        text = _node_text(n)
+
+        if _node_supports_target_method(n, target_method):
+            method_support_ctx_nums.append(idx)
+
+        has_raw_steps_signal = _node_has_strong_steps_signal(n)
+        if has_raw_steps_signal:
+            explicit_steps_ctx_nums.append(idx)
+
+        valid_items = _extract_valid_single_target_steps_from_text(
+            text,
+            max_items=max_steps,
+        )
+
+        if valid_items:
+            extractable_steps_ctx_nums.append(idx)
+
+            for item in valid_items:
+                sig = re.sub(r"\s+", " ", item.strip()).lower()
+                if not sig or sig in seen_extractable:
+                    continue
+                seen_extractable.add(sig)
+                extractable_items_merged.append(item.strip())
+                if len(extractable_items_merged) >= int(max_steps):
+                    break
+        elif has_raw_steps_signal and _looks_like_single_target_steps_artifact_text(text):
+            artifact_only_ctx_nums.append(idx)
+
+    meta["method_support_ctx_nums"] = method_support_ctx_nums
+    meta["explicit_steps_ctx_nums"] = explicit_steps_ctx_nums
+    meta["extractable_steps_ctx_nums"] = extractable_steps_ctx_nums
+    meta["extractable_steps_count"] = int(len(extractable_items_merged))
+    meta["artifact_only_ctx_nums"] = artifact_only_ctx_nums
+    meta["has_method_support"] = bool(method_support_ctx_nums)
+    meta["has_explicit_steps"] = bool(explicit_steps_ctx_nums)
+    meta["has_extractable_steps"] = bool(extractable_steps_ctx_nums)
+
+    if len(extractable_items_merged) >= 2:
+        meta["status"] = "steps_found"
+        meta["reason"] = "owner_doc_extractable_steps"
+    elif method_support_ctx_nums:
+        meta["status"] = "method_confirmed_no_explicit_steps"
+        meta["reason"] = "owner_doc_steps_partial"
+    else:
+        meta["status"] = "method_not_found"
+        meta["reason"] = "no_method_support_in_owner_doc"
+
+    return selected, meta
+
+
+# =========================
+# Method comparison formatter meta (Tahap 5)
+# =========================
+
+def build_method_comparison_meta(
+    nodes: List[Any],
+    *,
+    target_methods: List[str],
+    max_ctx_per_method: int = 2,
+) -> Dict[str, Any]:
+    clean_targets = [str(x).strip() for x in (target_methods or []) if str(x).strip()]
+    clean_targets = list(dict.fromkeys(clean_targets))
+
+    meta: Dict[str, Any] = {
+        "enabled": True,
+        "executed": False,
+        "target_methods": clean_targets,
+        "ctx_map_per_method": {},
+        "per_method_unique_ctx_map": {},
+        "shared_ctx_nums": [],
+        "supported_methods": [],
+        "weak_methods": [],
+        "missing_methods": [],
+        "comparison_status": None,
+        "balanced": False,
+        "selected_context_count": 0,
+        "unique_context_count": 0,
+        "max_ctx_per_method": int(max_ctx_per_method),
+    }
+
+    if len(clean_targets) < 2:
+        meta["comparison_status"] = "noop"
+        return meta
+
+    strong_by_method: Dict[str, List[int]] = {m: [] for m in clean_targets}
+    weak_by_method: Dict[str, List[int]] = {m: [] for m in clean_targets}
+
+    for idx, n in enumerate(nodes or [], start=1):
+        text = _node_text(n)
+        bab_label = _node_bab_label(n).upper()
+
+        for m in clean_targets:
+            if not _text_mentions_method(text, m):
+                continue
+
+            if _looks_like_related_work_context(text, bab_label):
+                weak_by_method[m].append(idx)
+            else:
+                strong_by_method[m].append(idx)
+
+    # Tahap 5.1:
+    # pilih ctx per metode dengan preferensi:
+    # 1) strong unseen
+    # 2) strong
+    # 3) weak unseen
+    # 4) weak
+
+    # Tujuannya agar dua metode tidak terlalu mudah jatuh ke CTX yang sama.
+    ctx_map_per_method: Dict[str, List[int]] = {}
+    global_used: set[int] = set()
+
+    supported_methods: List[str] = []
+    weak_methods: List[str] = []
+    missing_methods: List[str] = []
+
+    def _take_ctx_indices(
+        pool: List[int],
+        chosen: List[int],
+        global_used: set[int],
+        limit: int,
+        *,
+        unseen_only: bool,
+    ) -> None:
+        for idx in pool:
+            if len(chosen) >= int(limit):
+                return
+            if idx in chosen:
+                continue
+            if unseen_only and idx in global_used:
+                continue
+            chosen.append(idx)
+
+    for m in clean_targets:
+        strong_idxs = list(dict.fromkeys(strong_by_method.get(m, [])))
+        weak_idxs = list(dict.fromkeys(weak_by_method.get(m, [])))
+
+        chosen: List[int] = []
+        limit = max(1, int(max_ctx_per_method))
+
+        _take_ctx_indices(strong_idxs, chosen, global_used, limit, unseen_only=True)
+        _take_ctx_indices(strong_idxs, chosen, global_used, limit, unseen_only=False)
+        _take_ctx_indices(weak_idxs, chosen, global_used, limit, unseen_only=True)
+        _take_ctx_indices(weak_idxs, chosen, global_used, limit, unseen_only=False)
+
+        ctx_map_per_method[m] = chosen
+        for idx in chosen:
+            global_used.add(idx)
+
+        if strong_idxs:
+            supported_methods.append(m)
+        elif weak_idxs:
+            weak_methods.append(m)
+        else:
+            missing_methods.append(m)
+
+    selected_ctx_nums: List[int] = []
+    for m in clean_targets:
+        selected_ctx_nums.extend(ctx_map_per_method.get(m, []))
+    selected_ctx_nums = list(dict.fromkeys(selected_ctx_nums))
+
+    # Hitung shared ctx: ctx yang dipakai >1 metode
+    ctx_usage_count: Dict[int, int] = {}
+    for m in clean_targets:
+        for idx in ctx_map_per_method.get(m, []):
+            ctx_usage_count[idx] = ctx_usage_count.get(idx, 0) + 1
+
+    shared_ctx_nums = sorted([idx for idx, cnt in ctx_usage_count.items() if cnt > 1])
+
+    per_method_unique_ctx_map: Dict[str, List[int]] = {}
+    for m in clean_targets:
+        per_method_unique_ctx_map[m] = [
+            idx for idx in ctx_map_per_method.get(m, [])
+            if ctx_usage_count.get(idx, 0) == 1
+        ]
+
+    unique_context_count = len(selected_ctx_nums)
+
+    meta.update(
+        {
+            "executed": True,
+            "ctx_map_per_method": ctx_map_per_method,
+            "per_method_unique_ctx_map": per_method_unique_ctx_map,
+            "shared_ctx_nums": shared_ctx_nums,
+            "supported_methods": supported_methods,
+            "weak_methods": weak_methods,
+            "missing_methods": missing_methods,
+            "selected_context_count": unique_context_count,
+            "unique_context_count": unique_context_count,
+        }
+    )
+
+    # Tahap 5.1:
+    # balanced_comparison HARUS:
+    # - dua metode terdukung kuat
+    # - tanpa weak/missing
+    # - minimal 2 CTX unik secara total
+    # - setiap metode punya minimal 1 CTX unik miliknya sendiri
+    all_have_unique_ctx = all(
+        len(per_method_unique_ctx_map.get(m, [])) >= 1
+        for m in clean_targets[:2]
+    )
+
+    if (
+        len(supported_methods) >= 2
+        and not weak_methods
+        and not missing_methods
+        and unique_context_count >= 2
+        and all_have_unique_ctx
+    ):
+        meta["comparison_status"] = "balanced_comparison"
+        meta["balanced"] = True
+    elif len(supported_methods) + len(weak_methods) >= 2:
+        meta["comparison_status"] = "asymmetric_comparison"
+        meta["balanced"] = False
+    else:
+        meta["comparison_status"] = "insufficient_comparison"
+        meta["balanced"] = False
+
+    return meta
+
+
+# =========================
 # Session / Run lifecycle
 # =========================
+
 def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     """
     1 session Streamlit = 1 run_id (folder runs/<run_id>/).
@@ -233,6 +1668,7 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["last_nodes"] = None
     st.session_state["last_nodes_before_rerank"] = None   # ← V3.0c: candidate pool pre-rerank
     st.session_state["last_answer_raw"] = None
+    st.session_state["last_verification"] = None          # ← V3.0d: post-hoc verification result
     # ← V3.0c: stats eksplisit
     st.session_state["last_retrieval_stats_pre_rerank"] = None
     st.session_state["last_generation_context_stats"] = None
@@ -255,6 +1691,12 @@ def _new_run(cfg: Dict[str, Any], config_path: str) -> Tuple[RunManager, Any]:
     st.session_state["last_reranker_applied"] = False   # ← V3.0c
     st.session_state["last_reranker_info"] = None       # ← V3.0c
     st.session_state["last_rerank_anchor_reservation"] = None  # ← V3.0c
+    st.session_state["last_intent_plan"] = None                # ← V3.0d lanjutan: planner result
+    st.session_state["last_doc_aggregation_meta"] = None       # ← V3.0d lanjutan: ownership-aware doc aggregation
+    st.session_state["last_explanation_expansion_meta"] = None  # ← V3.0d lanjutan: method explanation expansion
+    st.session_state["last_single_target_steps_meta"] = None   # ← V3.0d lanjutan: single-target steps handler
+    st.session_state["last_method_comparison_meta"] = None    # ← V3.0d lanjutan: comparison formatter
+    st.session_state["last_answer_policy_audit_summary"] = None  # ← V3.0d lanjutan: Logging intent_plan & doc_aggregation_meta
     return rm, logger
 
 
@@ -1371,6 +2813,66 @@ def _tag_reserved_anchor_nodes(
     return final_nodes
 
 
+def _finalize_nodes_for_answer_rerank_ui(
+    *,
+    current_nodes: List[Any],
+    canonical_preferred_nodes: List[Any],
+    canonical_fallback_nodes: List[Any],
+    rerank_meta_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    anchor_meta: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    """
+    Final hardening untuk node final yang akan dipakai:
+    - generator
+    - session_state["last_nodes"]
+    - turn_data["nodes"]
+    - CTX Mapping / After Rerank UI
+
+    Prinsip:
+    1) pertahankan urutan current_nodes (karena itu urutan CTX final)
+    2) ganti object dengan versi kanonik jika ada
+    3) sinkronkan ulang rerank_score / rerank_rank
+    4) tag reserved-anchor agar UI jujur
+    """
+    current_nodes = list(current_nodes or [])
+    if not current_nodes:
+        return []
+
+    chunk_ids = [
+        str(getattr(n, "chunk_id", "") or "").strip()
+        for n in current_nodes
+        if str(getattr(n, "chunk_id", "") or "").strip()
+    ]
+    if not chunk_ids:
+        return current_nodes
+
+    final_nodes = _pick_nodes_by_chunk_ids(
+        canonical_preferred_nodes,
+        list(current_nodes or []) + list(canonical_fallback_nodes or []),
+        chunk_ids,
+    )
+
+    final_nodes = _sync_rerank_metadata_to_final_nodes(
+        final_nodes,
+        dict(rerank_meta_map or {}),
+    )
+    final_nodes = _tag_reserved_anchor_nodes(
+        final_nodes,
+        anchor_meta,
+    )
+
+    # Default eksplisit agar UI tidak membawa state lama / stale attrs.
+    for n in final_nodes:
+        if not hasattr(n, "is_reserved_anchor"):
+            n.is_reserved_anchor = False
+        if not hasattr(n, "reserved_for_method"):
+            n.reserved_for_method = None
+        if not hasattr(n, "rerank_display_label"):
+            n.rerank_display_label = None
+
+    return final_nodes
+
+
 # =========================
 # Topic Shift Detection
 # =========================
@@ -1628,6 +3130,60 @@ def _build_metadata_not_found_answer() -> str:
     return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
 
 
+def _single_target_steps_status(meta: Optional[Dict[str, Any]]) -> str:
+    return str((meta or {}).get("status", "") or "").strip().lower()
+
+
+def _should_force_single_target_steps_safe_answer_final(
+    intent_plan: Optional[Dict[str, Any]],
+    steps_meta: Optional[Dict[str, Any]],
+) -> bool:
+    """
+    Final hard guard di answer layer.
+    Dipakai sebagai lapisan pengaman terakhir jika generator masih lolos
+    ke jawaban generik padahal route planner + runtime meta sudah jelas.
+    """
+    primary_intent = str((intent_plan or {}).get("primary_intent", "") or "").strip().lower()
+    if primary_intent != "single_target_steps":
+        return False
+
+    status = _single_target_steps_status(steps_meta)
+    return status in {"ambiguous_owner_docs", "unresolved_owner_doc"}
+
+
+def _build_single_target_steps_safe_answer_final(
+    steps_meta: Optional[Dict[str, Any]],
+) -> str:
+    meta = dict(steps_meta or {})
+    method_label = str(meta.get("target_method_label", "") or meta.get("target_method", "") or "metode").strip() or "metode"
+    status = _single_target_steps_status(meta)
+
+    doc_bits = [
+        str(x).strip()
+        for x in (meta.get("ambiguous_candidate_doc_ids") or [])
+        if str(x).strip()
+    ]
+    doc_text = ", ".join(doc_bits[:3]) if doc_bits else "belum ada dokumen owner tunggal yang terkonfirmasi"
+
+    if status == "ambiguous_owner_docs":
+        return (
+            f"Jawaban: Ada lebih dari satu dokumen kandidat yang menggunakan metode {method_label}, "
+            "sehingga langkah-langkah lengkapnya belum bisa dipastikan untuk satu skripsi target.\n"
+            "Bukti:\n"
+            f"- Kandidat dokumen owner yang terdeteksi: {doc_text}"
+        )
+
+    if status == "unresolved_owner_doc":
+        return (
+            f"Jawaban: Dokumen skripsi target untuk metode {method_label} belum bisa dipastikan secara tunggal, "
+            "sehingga langkah-langkah lengkapnya belum dapat dijabarkan dengan aman.\n"
+            "Bukti:\n"
+            f"- Hasil disambiguasi owner document belum menghasilkan satu dokumen target yang tegas: {doc_text}"
+        )
+
+    return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+
 # =========================
 # Reranker telemetry gating (T10 polish)
 # =========================
@@ -1738,9 +3294,95 @@ def _build_reranker_telemetry(
     }
 
 
+def _deepcopy_log_obj(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+    return copy.deepcopy(obj)
+
+
+def _intent_targets_for_log(intent_plan: Optional[Dict[str, Any]]) -> List[str]:
+    ip = intent_plan or {}
+    out: List[str] = []
+
+    for key in ("target_methods", "comparison_targets"):
+        vals = ip.get(key) or []
+        if not isinstance(vals, list):
+            continue
+        for x in vals:
+            s = str(x or "").strip()
+            if s and s not in out:
+                out.append(s)
+
+    return out
+
+
+def _accepted_doc_ids_from_doc_aggregation(
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+) -> List[str]:
+    dam = doc_aggregation_meta or {}
+    out: List[str] = []
+
+    accepted = dam.get("accepted_docs") or []
+    if not isinstance(accepted, list):
+        return out
+
+    for item in accepted:
+        if not isinstance(item, dict):
+            continue
+        did = str(item.get("doc_id", "") or "").strip()
+        if did and did not in out:
+            out.append(did)
+
+    return out
+
+
+def _build_intent_plan_log(
+    intent_plan: Optional[Dict[str, Any]],
+    *,
+    enabled: bool,
+) -> Optional[Dict[str, Any]]:
+    if not enabled:
+        return None
+    return _deepcopy_log_obj(intent_plan)
+
+
+def _build_doc_aggregation_log(
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+    *,
+    enabled: bool,
+) -> Optional[Dict[str, Any]]:
+    if not enabled:
+        return None
+    return _deepcopy_log_obj(doc_aggregation_meta)
+
+
+def _build_answer_policy_audit_summary(
+    intent_plan: Optional[Dict[str, Any]],
+    doc_aggregation_meta: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ip = intent_plan if isinstance(intent_plan, dict) else {}
+    dam = doc_aggregation_meta if isinstance(doc_aggregation_meta, dict) else {}
+
+    return {
+        "intent_primary": str(ip.get("primary_intent", "") or "") or None,
+        "intent_targets": _intent_targets_for_log(ip),
+        "intent_doc_locked": bool(ip.get("doc_locked", False)),
+        "intent_needs_doc_aggregation": bool(ip.get("needs_doc_aggregation", False)),
+        "intent_needs_explanation_expansion": bool(ip.get("needs_explanation_expansion", False)),
+        "intent_needs_steps_expansion": bool(ip.get("needs_steps_expansion", False)),
+        "doc_aggregation_executed": bool(dam.get("executed", False)),
+        "doc_aggregation_applied": bool(dam.get("applied", False)),
+        "doc_aggregation_target_method": str(dam.get("target_method", "") or "") or None,
+        "doc_aggregation_candidate_doc_count": int(dam.get("candidate_doc_count", 0) or 0),
+        "doc_aggregation_accepted_doc_count": int(dam.get("accepted_doc_count", 0) or 0),
+        "doc_aggregation_trigger_reason": str(dam.get("trigger_reason", "") or "") or None,
+        "doc_aggregation_accepted_doc_ids": _accepted_doc_ids_from_doc_aggregation(dam),
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Sistem RAG Dokumen Skripsi", page_icon="🔍", layout="wide")
-    st.title("🔍 RAG ThesisDoc System - V3.0c")
+    st.title("🔍 RAG ThesisDoc System - V3.0d")
 
     load_dotenv()  # baca .env (lokal)
 
@@ -1971,9 +3613,9 @@ def main() -> None:
 
     # ← V3.0c: banner awal diperbarui
     st.success(
-        f"Now Running on **V3.0c** — **{_retrieval_mode_label}** Retrieval + "
+        f"Now Running on **V3.0d** — **{_retrieval_mode_label}** Retrieval + "
         f"Memory & Contextualization + Structure-Aware Dual Stream + "
-        f"Metadata Self-Querying + **Cross-Encoder Reranking**",
+        f"Metadata Self-Querying + Cross-Encoder Reranking + **Post-Hoc Verification**",
         icon="🚥",
     )
 
@@ -2121,6 +3763,25 @@ def main() -> None:
                 "topic_shift": bool(topic_shift),
                 "compression_followup": bool(detect_compression_followup),
             }
+
+            # ===== V3.0d lanjutan: Intent planner (Tahap 1) =====
+            answer_policy_cfg = cfg_runtime.get("answer_policy", {}) or {}
+            planner_enabled = bool(answer_policy_cfg.get("planner_enabled", True))
+            log_intent_plan = bool(answer_policy_cfg.get("log_intent_plan", True))
+            doc_agg_cfg = cfg_runtime.get("doc_aggregation", {}) or {}
+            log_doc_aggregation_meta = bool(doc_agg_cfg.get("log_meta", True))
+
+            explicit_doc_focus_for_plan = extract_doc_focus_from_query(query)
+            intent_plan: Optional[Dict[str, Any]] = None
+            if planner_enabled:
+                try:
+                    intent_plan = build_intent_plan(
+                        query,
+                        history_window=history_window,
+                        doc_focus=explicit_doc_focus_for_plan,
+                    ).to_dict()
+                except Exception:
+                    intent_plan = None
 
             # ===== Contextualize / rewrite query =====
             # Contextualization akan menulis ulang pertanyaan user agar eksplisit (mis. coreference "itu", "tahapannya").
@@ -2337,6 +3998,19 @@ def main() -> None:
                         rerank_anchor_reservation=None,
                     )
 
+                    intent_plan_log = _build_intent_plan_log(
+                        intent_plan,
+                        enabled=log_intent_plan,
+                    )
+                    doc_aggregation_log = _build_doc_aggregation_log(
+                        None,
+                        enabled=log_doc_aggregation_meta,
+                    )
+                    answer_policy_audit_summary = _build_answer_policy_audit_summary(
+                        intent_plan_log,
+                        doc_aggregation_log,
+                    )
+
                     retrieval_record = {
                         "run_id": rm.run_id,
                         "turn_id": turn_id,
@@ -2388,6 +4062,12 @@ def main() -> None:
                         "reranker_info":            _rk_meta["info"],
                         "rerank_coverage_rescue":   rerank_coverage_rescue,         # legacy telemetry
                         "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
+                        "intent_plan": intent_plan_log,
+                        "doc_aggregation_meta": doc_aggregation_log,
+                        "answer_policy_audit_summary": answer_policy_audit_summary,
+                        "explanation_expansion_meta": None,
+                        "single_target_steps_meta": None,
+                        "method_comparison_meta": None,
                     }
                     rm.log_retrieval(retrieval_record, include_config_snapshot_per_row=include_cfg)
 
@@ -2401,6 +4081,18 @@ def main() -> None:
                         "grounding_ok": True,
                         "answer_grounding_ok": True,
                     }
+
+                    # ← V3.0d: metadata-routed path = Verification N/A / skipped
+                    verification_meta = build_verification_meta(
+                        question=query,
+                        contexts=[],
+                        answer_text=answer_raw,
+                        used_ctx=0,
+                        used_context_chunk_ids=[],
+                        generator_meta=generator_meta,
+                        cfg=cfg_runtime,
+                        metadata_route_handled=True,
+                    )
 
                     answer_record = {
                         "run_id": rm.run_id,
@@ -2440,6 +4132,13 @@ def main() -> None:
                         "generator_strategy": "metadata_router",
                         "generator_status": "metadata",
                         "generator_meta": generator_meta,
+                        "verification": verification_meta,  # ← V3.0d
+                        "intent_plan": intent_plan_log,
+                        "doc_aggregation_meta": doc_aggregation_log,
+                        "answer_policy_audit_summary": answer_policy_audit_summary,
+                        "explanation_expansion_meta": None,
+                        "single_target_steps_meta": None,
+                        "method_comparison_meta": None,
                         "max_bullets": 1,
                         "bullet_policy": {},
                         "error": None,
@@ -2478,6 +4177,13 @@ def main() -> None:
 
                     # set last result untuk UI
                     st.session_state["last_answer_raw"] = answer_raw
+                    st.session_state["last_verification"] = verification_meta   # ← V3.0d
+                    st.session_state["last_intent_plan"] = intent_plan_log
+                    st.session_state["last_doc_aggregation_meta"] = doc_aggregation_log
+                    st.session_state["last_answer_policy_audit_summary"] = answer_policy_audit_summary
+                    st.session_state["last_explanation_expansion_meta"] = None
+                    st.session_state["last_single_target_steps_meta"] = None
+                    st.session_state["last_method_comparison_meta"] = None
                     st.session_state["last_turn_id"] = turn_id
                     st.session_state["last_nodes"] = []                 # final contexts
                     st.session_state["last_nodes_before_rerank"] = []   # candidate pool pre-rerank
@@ -2522,7 +4228,14 @@ def main() -> None:
                         "generation_context_stats": generation_context_stats,
                         "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
                         "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
-                        "reranker_info": _rk_meta["info"], 
+                        "reranker_info": _rk_meta["info"],
+                        "verification": verification_meta,  # ← V3.0d
+                        "intent_plan": intent_plan_log,
+                        "doc_aggregation_meta": doc_aggregation_log,
+                        "answer_policy_audit_summary": answer_policy_audit_summary,
+                        "explanation_expansion_meta": None,
+                        "single_target_steps_meta": None,
+                        "method_comparison_meta": None,
                     }
 
             if not metadata_routed:
@@ -3252,7 +4965,295 @@ def main() -> None:
                 # Contexts (dari nodes_for_gen - apa yang benar-benar dikirim ke LLM)
                 # =========================
                 # ← V3.0c: pakai nodes_for_gen (post-rerank), bukan nodes_before_rerank
+                # Ownership-aware document aggregation (Tahap 2)
+                # Ownership-aware document aggregation (Tahap 2)
+                doc_agg_cfg = cfg_runtime.get("doc_aggregation", {}) or {}
+                doc_agg_enabled = bool(doc_agg_cfg.get("enabled", True))
+                doc_agg_allow_explanation = bool(doc_agg_cfg.get("allow_for_method_explanation", True))
+                doc_agg_max_docs = int(doc_agg_cfg.get("max_docs_for_generation", 5))
+                doc_agg_max_evidence_chars = int(doc_agg_cfg.get("max_evidence_chars", 280))
+
+                doc_aggregation_meta: Dict[str, Any] = {
+                    "enabled": bool(doc_agg_enabled),
+                    "executed": False,
+                    "applied": False,
+                    "target_method": None,
+                    "target_method_label": None,
+                    "catalog_path": None,
+                    "candidate_doc_count": 0,
+                    "accepted_doc_count": 0,
+                    "candidate_docs": [],
+                    "accepted_docs": [],
+                    "rejected_docs": [],
+                    "representative_chunk_ids": [],
+                    "used_summary_contexts": False,
+                    "trigger_reason": None,
+                }
+
                 contexts = build_contexts_with_meta(nodes_for_gen)
+                nodes_for_answer = list(nodes_for_gen)
+
+                _agg_targets = list(
+                    dict.fromkeys(
+                        (intent_plan or {}).get("target_methods") or target_methods or []
+                    )
+                )
+                _agg_primary_intent = str(
+                    (intent_plan or {}).get("primary_intent", "") or ""
+                ).strip().lower()
+                _agg_needs_runtime = bool((intent_plan or {}).get("needs_doc_aggregation"))
+
+                if (
+                    _agg_primary_intent == "method_explanation"
+                    and doc_agg_allow_explanation
+                    and len(_agg_targets) == 1
+                ):
+                    _candidate_doc_ids = {
+                        str(getattr(n, "doc_id", "") or "")
+                        for n in (nodes_before_rerank or [])
+                        if str(getattr(n, "doc_id", "") or "").strip()
+                    }
+                    if len(_candidate_doc_ids) > 1:
+                        _agg_needs_runtime = True
+                        doc_aggregation_meta["trigger_reason"] = "method_explanation_doc_disambiguation"
+
+                if doc_agg_enabled and _agg_needs_runtime and len(_agg_targets) == 1:
+                    _agg_target = str(_agg_targets[0]).strip()
+                    doc_summaries, doc_aggregation_meta = build_owner_aware_doc_aggregation(
+                        nodes_before_rerank or nodes_for_gen,
+                        cfg=cfg_runtime,
+                        target_method=_agg_target,
+                        max_docs=doc_agg_max_docs,
+                        max_evidence_chars=doc_agg_max_evidence_chars,
+                    )
+                    if not doc_aggregation_meta.get("trigger_reason"):
+                        doc_aggregation_meta["trigger_reason"] = (
+                            "intent_needs_doc_aggregation"
+                            if (intent_plan or {}).get("needs_doc_aggregation")
+                            else "method_explanation_doc_disambiguation"
+                        )
+
+                    rep_chunk_ids = list(doc_aggregation_meta.get("representative_chunk_ids") or [])
+                    rep_nodes = _pick_nodes_by_chunk_ids(
+                        nodes_for_gen,
+                        nodes_before_rerank,
+                        rep_chunk_ids,
+                    )
+
+                    if doc_summaries:
+                        contexts = build_doc_aggregation_contexts(
+                            doc_summaries,
+                            target_method=_agg_target,
+                        )
+                        if rep_nodes:
+                            nodes_for_answer = rep_nodes
+
+                # Method explanation route + explanation-biased expansion (Tahap 3)
+                method_expl_cfg = cfg_runtime.get("method_explanation", {}) or {}
+                expl_enabled = bool(method_expl_cfg.get("expansion_enabled", True))
+                expl_max_queries = int(method_expl_cfg.get("max_expansion_queries", 5))
+                expl_max_added_nodes = int(method_expl_cfg.get("max_added_nodes", 4))
+
+                explanation_expansion_meta: Dict[str, Any] = {
+                    "enabled": bool(expl_enabled),
+                    "executed": False,
+                    "applied": False,
+                    "target_method": None,
+                    "target_method_label": None,
+                    "target_doc_id": None,
+                    "target_doc_source_file": None,
+                    "expansion_queries": [],
+                    "added_chunk_ids": [],
+                    "added_doc_ids": [],
+                    "selected_explanation_chunk_ids": [],
+                    "selected_context_count": 0,
+                    "reason": None,
+                }
+
+                if (
+                    expl_enabled
+                    and str((intent_plan or {}).get("primary_intent", "") or "").strip().lower() == "method_explanation"
+                    and bool((intent_plan or {}).get("needs_explanation_expansion", False))
+                    and len(_agg_targets) == 1
+                ):
+                    _expl_target = str(_agg_targets[0]).strip()
+                    _target_doc_id = _resolve_method_explanation_target_doc_id(
+                        intent_plan=dict(intent_plan or {}),
+                        doc_focus_meta=st.session_state.get("last_doc_focus_meta") or {},
+                        doc_aggregation_meta=doc_aggregation_meta,
+                        nodes_for_gen=nodes_for_answer or nodes_for_gen,
+                        target_method=_expl_target,
+                    )
+
+                    selected_expl_nodes, explanation_expansion_meta = build_method_explanation_expansion(
+                        cfg=cfg_runtime,
+                        query=query,
+                        target_method=_expl_target,
+                        target_doc_id=_target_doc_id,
+                        base_nodes=nodes_for_answer or nodes_for_gen,
+                        max_queries=expl_max_queries,
+                        max_added_nodes=expl_max_added_nodes,
+                    )
+
+                    if selected_expl_nodes:
+                        nodes_for_answer = selected_expl_nodes
+                        contexts = build_contexts_with_meta(nodes_for_answer)
+
+                # Single-target steps handler + steps-biased expansion (Tahap 4)
+                steps_cfg = cfg_runtime.get("single_target_steps", {}) or {}
+                steps_enabled = bool(steps_cfg.get("expansion_enabled", True))
+                steps_max_queries = int(steps_cfg.get("max_expansion_queries", 6))
+                steps_max_added_nodes = int(steps_cfg.get("max_added_nodes", 4))
+                steps_max_items = int(steps_cfg.get("max_steps", 5))
+
+                single_target_steps_meta: Dict[str, Any] = {
+                    "enabled": bool(steps_enabled),
+                    "executed": False,
+                    "applied": False,
+                    "target_method": None,
+                    "target_method_label": None,
+                    "target_doc_id": None,
+                    "target_doc_source_file": None,
+                    "expansion_queries": [],
+                    "added_chunk_ids": [],
+                    "added_doc_ids": [],
+                    "selected_chunk_ids": [],
+                    "selected_context_count": 0,
+                    "method_support_ctx_nums": [],
+                    "explicit_steps_ctx_nums": [],
+                    "extractable_steps_ctx_nums": [],
+                    "extractable_steps_count": 0,
+                    "artifact_only_ctx_nums": [],
+                    "has_method_support": False,
+                    "has_explicit_steps": False,
+                    "has_extractable_steps": False,
+                    "ambiguous_candidate_doc_ids": [],
+                    "status": None,
+                    "reason": None,
+                    "max_steps": int(steps_max_items),
+                }
+
+                if (
+                    steps_enabled
+                    and str((intent_plan or {}).get("primary_intent", "") or "").strip().lower() == "single_target_steps"
+                    and len(_agg_targets) == 1
+                ):
+                    _steps_target = str(_agg_targets[0]).strip()
+                    _doc_focus_meta = st.session_state.get("last_doc_focus_meta") or {}
+
+                    _target_doc_id, _resolve_status = _resolve_single_target_steps_target_doc_id_strict(
+                        intent_plan=dict(intent_plan or {}),
+                        doc_focus_meta=_doc_focus_meta,
+                        doc_aggregation_meta=doc_aggregation_meta,
+                    )
+
+                    if _resolve_status == "ambiguous_owner_docs":
+                        single_target_steps_meta.update(
+                            {
+                                "executed": True,
+                                "target_method": _steps_target,
+                                "target_method_label": pretty_method_name(_steps_target),
+                                "status": "ambiguous_owner_docs",
+                                "reason": "multiple_owner_docs_after_aggregation",
+                                "ambiguous_candidate_doc_ids": _single_target_steps_candidate_doc_ids_from_meta(
+                                    doc_aggregation_meta
+                                ),
+                            }
+                        )
+
+                    elif _resolve_status == "unresolved_owner_doc":
+                        single_target_steps_meta.update(
+                            {
+                                "executed": True,
+                                "target_method": _steps_target,
+                                "target_method_label": pretty_method_name(_steps_target),
+                                "status": "unresolved_owner_doc",
+                                "reason": "no_single_owner_doc_resolved",
+                                "ambiguous_candidate_doc_ids": _single_target_steps_candidate_doc_ids_from_meta(
+                                    doc_aggregation_meta
+                                ),
+                            }
+                        )
+
+                    else:
+                        selected_step_nodes, single_target_steps_meta = build_single_target_steps_expansion(
+                            cfg=cfg_runtime,
+                            query=query,
+                            target_method=_steps_target,
+                            target_doc_id=_target_doc_id,
+                            base_nodes=nodes_for_answer or nodes_for_gen,
+                            max_queries=steps_max_queries,
+                            max_added_nodes=steps_max_added_nodes,
+                            max_steps=steps_max_items,
+                        )
+
+                        # Penting:
+                        # walau status akhirnya partial, contexts tetap harus diganti ke selected_step_nodes
+                        # agar CTX index di meta sinkron dengan contexts final untuk generator.
+                        if selected_step_nodes:
+                            nodes_for_answer = selected_step_nodes
+                            contexts = build_contexts_with_meta(nodes_for_answer)
+
+                # Method comparison formatter meta (Tahap 5)
+                cmp_cfg = cfg_runtime.get("comparison_formatter", {}) or {}
+                cmp_enabled = bool(cmp_cfg.get("enabled", True))
+                cmp_max_ctx_per_method = int(cmp_cfg.get("max_ctx_per_method", 2))
+
+                method_comparison_meta: Dict[str, Any] = {
+                    "enabled": bool(cmp_enabled),
+                    "executed": False,
+                    "target_methods": [],
+                    "ctx_map_per_method": {},
+                    "supported_methods": [],
+                    "weak_methods": [],
+                    "missing_methods": [],
+                    "comparison_status": None,
+                    "balanced": False,
+                    "selected_context_count": 0,
+                    "max_ctx_per_method": int(cmp_max_ctx_per_method),
+                }
+
+                if (
+                    cmp_enabled
+                    and str((intent_plan or {}).get("primary_intent", "") or "").strip().lower() == "method_comparison"
+                    and len(_agg_targets) >= 2
+                ):
+                    method_comparison_meta = build_method_comparison_meta(
+                        nodes_for_answer or nodes_for_gen,
+                        target_methods=list(_agg_targets),
+                        max_ctx_per_method=cmp_max_ctx_per_method,
+                    )
+
+                # ─────────────────────────────────────────────────────────────
+                # Final patch: sinkronisasi metadata rerank ke final contexts/UI
+                # ─────────────────────────────────────────────────────────────
+                # nodes_for_answer pada titik ini bisa sudah diganti oleh:
+                # - doc aggregation representative nodes
+                # - explanation expansion
+                # - single-target steps expansion
+                #
+                # Karena beberapa jalur tersebut dapat membawa salinan node baru
+                # (chunk_id sama, object berbeda), maka saya lakukan final pass
+                # untuk:
+                # 1) rehydrate object final dari pool kanonik
+                # 2) sync ulang rerank_score/rerank_rank
+                # 3) tag reserved anchor untuk UI audit
+                _rerank_meta_map_for_final_ui: Dict[str, Dict[str, Any]] = {
+                    str(k): dict(v)
+                    for k, v in (_rerank_score_map or {}).items()
+                    if isinstance(v, dict)
+                }
+
+                nodes_for_answer = _finalize_nodes_for_answer_rerank_ui(
+                    current_nodes=nodes_for_answer or nodes_for_gen,
+                    canonical_preferred_nodes=nodes_reranked_pre_anchor or nodes_for_gen,
+                    canonical_fallback_nodes=nodes_before_rerank or [],
+                    rerank_meta_map=_rerank_meta_map_for_final_ui,
+                    anchor_meta=rerank_anchor_reservation,
+                )
+
+                # contexts HARUS dibangun ulang dari node final yang sudah disinkronkan
+                contexts = build_contexts_with_meta(nodes_for_answer)
 
                 # Tentukan max bullet Bukti dinamis (3 default, bisa naik jadi 5)
                 max_bullets, bullets_meta = decide_max_bullets(
@@ -3267,7 +5268,7 @@ def main() -> None:
                 # - retrieval_stats_pre_rerank = kualitas candidate pool retrieval
                 # - generation_context_stats   = kualitas final contexts yang benar-benar masuk ke LLM
                 retrieval_stats_pre_rerank = compute_retrieval_stats(nodes_before_rerank)
-                generation_context_stats = compute_retrieval_stats(nodes_for_gen)
+                generation_context_stats = compute_retrieval_stats(nodes_for_answer)
 
                 # Backward-compatible:
                 # pertahankan retrieval_stats lama mengacu ke final contexts yang dipakai generator, agar consumer lama tidak rusak.
@@ -3385,6 +5386,24 @@ def main() -> None:
                 # target_methods untuk generator:
                 # - prioritas: dari coverage detail (paling reliable)
                 # - fallback: target_methods dari infer_target_methods
+                final_intent_plan = dict(intent_plan or {})
+                _dfm_for_plan = st.session_state.get("last_doc_focus_meta") or {}
+                if isinstance(_dfm_for_plan, dict) and _dfm_for_plan.get("locked"):
+                    final_intent_plan["doc_locked"] = True
+                    final_intent_plan["allowed_doc_ids"] = list(
+                        dict.fromkeys(
+                            [
+                                str(x).strip()
+                                for x in (
+                                    _dfm_for_plan.get("allowed_doc_ids")
+                                    or _dfm_for_plan.get("doc_ids")
+                                    or []
+                                )
+                                if str(x).strip()
+                            ]
+                        )
+                    )
+
                 gen_targets: List[str] = []
                 missing_methods: List[str] = []
                 cov_map: Dict[str, Any] = {}  # supaya selalu terdefinisi
@@ -3404,6 +5423,11 @@ def main() -> None:
                         ]
                 else:
                     gen_targets = list(target_methods or [])
+
+                if (not gen_targets) and isinstance(final_intent_plan, dict):
+                    tm_plan = final_intent_plan.get("target_methods") or []
+                    if isinstance(tm_plan, list):
+                        gen_targets = [m for m in tm_plan if isinstance(m, str) and m]
 
                 # ===== Doc-focus lock: kunci target generator ke metode yang dilock =====
                 dfm = st.session_state.get("last_doc_focus_meta") or {}
@@ -3430,6 +5454,10 @@ def main() -> None:
                 is_method_list_q = bool(
                     re.search(r"\bmetode\b.*\bapa\s+saja\b|\bmetode\s+apa\s+saja\b", q_low)
                 )
+
+                if isinstance(final_intent_plan, dict):
+                    if bool(final_intent_plan.get("is_steps_query")):
+                        is_steps_q = True
 
                 # ===== fallback gen_targets untuk pertanyaan METODE (single-target) =====
                 # kasus: "metode pengembangan apa yang digunakan?" -> detect_multi_target False -> infer_target_methods bisa kosong
@@ -3489,10 +5517,22 @@ def main() -> None:
                                 except Exception:
                                     pass
 
-                        # dianggap missing jika:
+                        single_target_steps_route = (
+                            str((final_intent_plan or {}).get("primary_intent", "") or "").strip().lower()
+                            == "single_target_steps"
+                        )
+
+                        # Untuk single-target steps:
+                        # - TIDAK boleh dianggap missing hanya karena langkah eksplisit belum muncul.
+                        # - baru dianggap missing jika memang tidak ada konteks yang mendukung metode tsb.
+                        if not ctx_for_m:
+                            steps_missing.append(m)
+                            continue
+
+                        # Untuk multi-target steps:
                         # - tidak ada konteks yang jelas untuk metode tsb, ATAU
                         # - ada konteks tapi tidak ada sinyal tahapan eksplisit
-                        if (not ctx_for_m) or (not any(has_steps_signal(x) for x in ctx_for_m)):
+                        if (not single_target_steps_route) and (not any(has_steps_signal(x) for x in ctx_for_m)):
                             steps_missing.append(m)
 
                     # gabungkan: missing dari coverage + missing dari steps-signal (unique, urut stabil)
@@ -3518,6 +5558,7 @@ def main() -> None:
 
                 bullets_meta = dict(bullets_meta or {})
                 bullets_meta["max_bullets"] = int(max_bullets)
+                bullets_meta["answer_policy_route"] = (final_intent_plan or {}).get("primary_intent")
                 # enrich bullets_meta untuk logging
                 bullets_meta.update(
                     {
@@ -3530,6 +5571,9 @@ def main() -> None:
                         "is_method_list_q": bool(is_method_list_q),
                     }
                 )
+
+                if isinstance(single_target_steps_meta, dict) and single_target_steps_meta.get("executed"):
+                    bullets_meta["single_target_steps_status"] = single_target_steps_meta.get("status")
 
                 generator_strategy_name = "llm" if use_llm else "retrieval_only"
                 _force_metadata_not_found = _should_force_metadata_not_found_answer(_self_query_log)
@@ -3551,6 +5595,9 @@ def main() -> None:
                             force_per_method=force_per_method,
                             per_method_bullets=per_method_bullets,
                             max_total_bullets=max_total_bullets,
+                            intent_plan=final_intent_plan,
+                            single_target_steps_meta=single_target_steps_meta,
+                            method_comparison_meta=method_comparison_meta,
                         )
                     except Exception as ex:
                         logger.exception("LLM call failed")
@@ -3558,7 +5605,20 @@ def main() -> None:
                         st.warning(f"LLM error: {type(ex).__name__}: {ex}")
                         answer_raw = "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
                 else:
-                    answer_raw = build_retrieval_only_answer(nodes_for_gen, max_points=3)
+                    answer_raw = build_retrieval_only_answer(nodes_for_answer, max_points=3)
+
+                # Tahap 4.3 (final hardening):
+                # Jika route planner + runtime meta sudah menyatakan single_target_steps
+                # dalam status ambiguity/unresolved, answer layer HARUS memaksa safe answer.
+                # ini adalah lapisan pengaman terakhir, analog dengan self_query_guard.
+                if _should_force_single_target_steps_safe_answer_final(
+                    final_intent_plan,
+                    single_target_steps_meta,
+                ):
+                    answer_raw = _build_single_target_steps_safe_answer_final(
+                        single_target_steps_meta
+                    )
+                    generator_strategy_name = "single_target_steps_guard"
 
                 # meta generator (dibuat setelah answer_raw final)
                 generator_meta = build_generation_meta(
@@ -3567,6 +5627,30 @@ def main() -> None:
                     answer_text=answer_raw,
                     used_ctx=used_ctx,
                     max_bullets=max_bullets,
+                )
+
+                # ← V3.0d: post-hoc verification dibangun di answer layer
+                # dan bekerja terhadap final contexts + answer final.
+                verification_meta = build_verification_meta(
+                    question=query,
+                    contexts=contexts,
+                    answer_text=answer_raw,
+                    used_ctx=used_ctx,
+                    used_context_chunk_ids=[n.chunk_id for n in nodes_for_answer],
+                    generator_meta=generator_meta,
+                    cfg=cfg_runtime,
+                    metadata_route_handled=bool(metadata_meta.get("handled")),
+                )
+
+                intent_plan_log = final_intent_plan if log_intent_plan else None
+                doc_aggregation_log = (
+                    copy.deepcopy(doc_aggregation_meta)
+                    if log_doc_aggregation_meta
+                    else None
+                )
+                answer_policy_audit_summary = _build_answer_policy_audit_summary(
+                    intent_plan_log,
+                    doc_aggregation_log,
                 )
 
                 generator_status = generator_meta.get("status", "unknown")
@@ -3595,8 +5679,15 @@ def main() -> None:
                     "metadata_route": metadata_meta,
                     "contextualize_decision": contextualize_decision,
                     "doc_focus": st.session_state.get("last_doc_focus_meta"),
+                    "intent_plan": intent_plan_log,
+                    "answer_policy_route": (final_intent_plan or {}).get("primary_intent"),
+                    "doc_aggregation_meta": doc_aggregation_log,
+                    "answer_policy_audit_summary": answer_policy_audit_summary,
+                    "explanation_expansion_meta": explanation_expansion_meta,
+                    "single_target_steps_meta": single_target_steps_meta,
+                    "method_comparison_meta": method_comparison_meta,
                     # ← V3.0c: chunk IDs yang benar-benar masuk ke LLM (nodes_for_gen)
-                    "used_context_chunk_ids": [n.chunk_id for n in nodes_for_gen],
+                    "used_context_chunk_ids": [n.chunk_id for n in nodes_for_answer],
                     "answer": answer_raw,
                     "strategy": strategy,
                     "diversity": {
@@ -3614,6 +5705,7 @@ def main() -> None:
                     "generator_strategy": generator_strategy_name,
                     "generator_status": generator_status,
                     "generator_meta": generator_meta,
+                    "verification": verification_meta,  # ← V3.0d
                     "max_bullets": int(max_bullets),
                     "bullet_policy": bullets_meta,  # berisi methods_detected, anaphora, multi_target, dll
                     "error": generator_error,
@@ -3675,11 +5767,18 @@ def main() -> None:
 
                 # persist last result (bersifat tetap hingga query baru dijalankan)
                 st.session_state["last_answer_raw"] = answer_raw  # menyimpan last answer dari copy
+                st.session_state["last_verification"] = verification_meta  # ← V3.0d
+                st.session_state["last_intent_plan"] = intent_plan_log
+                st.session_state["last_doc_aggregation_meta"] = doc_aggregation_log
+                st.session_state["last_answer_policy_audit_summary"] = answer_policy_audit_summary
+                st.session_state["last_explanation_expansion_meta"] = explanation_expansion_meta
+                st.session_state["last_single_target_steps_meta"] = single_target_steps_meta
+                st.session_state["last_method_comparison_meta"] = method_comparison_meta
                 st.session_state["last_turn_id"] = turn_id
                 # ← V3.0c:
                 # last_nodes                = final contexts yang benar-benar dipakai LLM
                 # last_nodes_before_rerank  = candidate pool pre-rerank untuk UI before-vs-after
-                st.session_state["last_nodes"] = nodes_for_gen
+                st.session_state["last_nodes"] = nodes_for_answer
                 st.session_state["last_nodes_before_rerank"] = nodes_before_rerank
                 st.session_state["last_strategy"] = strategy
                 st.session_state["last_retrieval_mode"] = retrieval_mode 
@@ -3704,7 +5803,7 @@ def main() -> None:
                     # ← V3.0c:
                     # nodes                = final contexts yang benar-benar dipakai LLM
                     # nodes_before_rerank  = candidate pool pre-rerank
-                    "nodes": nodes_for_gen,
+                    "nodes": nodes_for_answer,
                     "nodes_before_rerank": nodes_before_rerank,
                     "answer_raw": answer_raw,
                     "user_query": query,
@@ -3725,6 +5824,13 @@ def main() -> None:
                     "rerank_coverage_rescue": rerank_coverage_rescue,           # legacy telemetry
                     "rerank_anchor_reservation": _rk_meta["anchor_reservation"],
                     "reranker_info": _rk_meta["info"],
+                    "verification": verification_meta,  # ← V3.0d
+                    "intent_plan": intent_plan_log,
+                    "doc_aggregation_meta": doc_aggregation_log,
+                    "answer_policy_audit_summary": answer_policy_audit_summary,
+                    "explanation_expansion_meta": explanation_expansion_meta,
+                    "single_target_steps_meta": single_target_steps_meta,
+                    "method_comparison_meta": method_comparison_meta,
                 }
 
             _proc_status.update(label="💡 Finished!", state="complete", expanded=False)
@@ -4095,6 +6201,18 @@ def main() -> None:
             retrieval_stats_pre_rerank=retrieval_stats_pre_rerank_render,
             generation_context_stats=generation_context_stats_render,
         )
+
+        # ← V3.0d Phase 2A + 2C:
+        # render verification box di answer layer.
+        # - latest turn  : ambil dari session_state["last_verification"]
+        # - history replay: ambil dari turn_data[turn_id]["verification"]
+        _verification_render = (
+            (_td.get("verification") if isinstance(_td, dict) else None)
+            if _is_viewing_history
+            else st.session_state.get("last_verification")
+        )
+
+        render_verification_box(_verification_render)
 
         # Answer section — styled card
         h1, h2 = st.columns([0.88, 0.12])

@@ -93,6 +93,129 @@ def _get_collection_names(cfg: Dict[str, Any]) -> Tuple[str, str]:
     return narasi, sitasi
 
 
+_DOCMETA_RESEARCH_KEYWORDS: List[str] = [
+    "sistem", "rancang", "bangun", "aplikasi", "pengembangan",
+    "monitoring", "e-learning", "learning", "ticketing", "informasi",
+    "presensi", "face", "recognition", "website", "penerapan", "perancangan",
+    "skripsi", "tugas akhir", "berbasis", "web", "mobile",
+]
+
+_DOCMETA_SUSPICIOUS_TITLE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"^\s*\d+\.\s+"),  # contoh: "8. Keluarga Stressed Out ..."
+    re.compile(r"\bno\s+penulis\b", re.I),
+    re.compile(r"\bhasil\s+penelitian\b", re.I),
+    re.compile(r"\bperbedaan\s+skripsi\b", re.I),
+    re.compile(r"\bjudul\b.*\btahun\b", re.I),
+    re.compile(r"\bpenelitian\s+terdahulu\b", re.I),
+    re.compile(r"\bstudi\s+terdahulu\b", re.I),
+]
+
+
+def _normalize_docmeta_text(s: Any) -> str:
+    return " ".join(str(s or "").split()).strip()
+
+
+def _humanize_source_file_title(source_file: str, doc_id: str) -> str:
+    """
+    Fallback konservatif:
+    - prioritaskan stem source_file
+    - jika kosong, fallback ke doc_id
+    - JANGAN mencoba 'mengarang' judul skripsi penuh
+    """
+    sf = str(source_file or "").strip()
+    stem = sf[:-4] if sf.lower().endswith(".pdf") else sf
+    stem = stem.strip()
+    if stem:
+        return stem
+    return str(doc_id or "").strip() or "-"
+
+
+def _is_suspicious_doc_title(title: str) -> Tuple[bool, List[str]]:
+    t = _normalize_docmeta_text(title)
+    tl = t.lower()
+    reasons: List[str] = []
+
+    if not t:
+        reasons.append("empty_title")
+
+    if tl.startswith("puji syukur"):
+        reasons.append("preface_puji_syukur")
+
+    if len(t) < 20:
+        reasons.append("too_short")
+
+    if re.match(r"^\s*\d+\.\s+", t):
+        reasons.append("looks_like_reference_row")
+
+    if t.count(",") >= 4:
+        reasons.append("too_many_commas")
+
+    if (
+        ("institut teknologi sumatera" in tl or "jurusan" in tl or "produksi dan industri" in tl)
+        and not any(k in tl for k in _DOCMETA_RESEARCH_KEYWORDS)
+    ):
+        reasons.append("institution_fragment_without_research_keywords")
+
+    for pat in _DOCMETA_SUSPICIOUS_TITLE_PATTERNS:
+        if pat.search(t):
+            reasons.append(f"pattern:{pat.pattern}")
+            break
+
+    return bool(reasons), list(dict.fromkeys(reasons))
+
+
+def _safe_year_display_from_entry(entry: Dict[str, Any]) -> str:
+    year_val = entry.get("tahun", None)
+    if isinstance(year_val, int) and year_val > 0:
+        return str(year_val)
+
+    try:
+        y = int(str(year_val or "").strip())
+        return str(y) if y > 0 else "-"
+    except Exception:
+        return "-"
+
+
+def _build_docmeta_sidecar(doc_catalog: Dict[str, Any]) -> Dict[str, Any]:
+    sidecar: Dict[str, Any] = {}
+
+    for doc_id, entry in (doc_catalog or {}).items():
+        if not isinstance(entry, dict):
+            continue
+
+        source_file = str(entry.get("source_file", "") or "").strip()
+        title_raw = _normalize_docmeta_text(entry.get("judul", ""))
+        suspicious, reasons = _is_suspicious_doc_title(title_raw)
+
+        if title_raw and not suspicious:
+            title_safe = title_raw
+            title_source = "catalog_raw"
+            title_quality = "high"
+        else:
+            title_safe = _humanize_source_file_title(source_file, str(doc_id))
+            title_source = "source_file_fallback" if source_file else "doc_id_fallback"
+            title_quality = "fallback" if not title_raw else "suspicious"
+
+        author_safe = _normalize_docmeta_text(entry.get("penulis", "")) or "-"
+        year_safe = _safe_year_display_from_entry(entry)
+        prodi_safe = _normalize_docmeta_text(entry.get("prodi", "")) or "-"
+
+        sidecar[str(doc_id)] = {
+            "doc_id": str(doc_id),
+            "source_file": source_file,
+            "title_raw": title_raw,
+            "title_safe": title_safe,
+            "title_source": title_source,
+            "title_quality": title_quality,
+            "title_reasons": reasons,
+            "author_safe": author_safe,
+            "year_safe": year_safe,
+            "prodi_safe": prodi_safe,
+        }
+
+    return sidecar
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # File system helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -521,6 +644,18 @@ def ingest(cfg: Dict[str, Any], reset: bool = False, pdf_glob: str = "*.pdf") ->
         encoding="utf-8",
     )
     logger.info("doc_catalog saved: %s | n_docs=%d", catalog_path, len(doc_catalog))
+
+    # ── Tahap 6: build + save docmeta sidecar ────────────────────────────────
+    docmeta_cfg = cfg.get("docmeta", {}) or {}
+    sidecar_filename = str(docmeta_cfg.get("sidecar_filename", "docmeta_sidecar.json") or "docmeta_sidecar.json").strip()
+    sidecar_path = persist_dir / sidecar_filename
+
+    docmeta_sidecar = _build_docmeta_sidecar(doc_catalog)
+    sidecar_path.write_text(
+        json.dumps(docmeta_sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("docmeta_sidecar saved: %s | n_docs=%d", sidecar_path, len(docmeta_sidecar))
 
     # ── Count check via raw chromadb client ──────────────────────────────────
     client     = chromadb.PersistentClient(path=str(persist_dir))

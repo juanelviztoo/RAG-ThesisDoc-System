@@ -3,6 +3,8 @@
 
 > **Status Terkini:** V3.0c (**DONE ✅ / RELEASED ✅ / tag `v3.0c-rerank`**) di branch `main` dan sudah tersinkron kembali ke `dev`. V3.0c sudah selesai difinalisasi secara code, dokumentasi, validasi, dan git strategy. Fokus pengembangan berikutnya adalah **V3.0d** (Post-Hoc Verification).
 
+> **Status Terkini:** V3.0d (**DONE ✅ / RELEASED ✅ / FINALIZED ✅ / tag `v3.0d-verification`**) di branch `main` dan sudah tersinkron kembali ke `dev`. Final git strategy V3.0d (commit ke `dev` → merge ke `main` → tag release final) sudah diselesaikan. V3.0d menutup payung pengembangan **Post-Hoc Verification + Evaluation Pipeline + Intent-Aware Answer Augmentation + Metadata/Logging Hardening**. Fokus pengembangan berikutnya bergeser ke **V3.1** (dataset expansion + evaluasi correctness/helpfulness jika mini gold set tersedia).
+
 ---
 
 ## Roadmap Versi (Bertahap)
@@ -12,27 +14,30 @@
 - **V3.0a (DONE ✅)** — `v3.0a-structured`: Structure-Aware PDF Parsing + Dual Stream (Narasi vs Sitasi) + Dual ChromaDB Collection + Citation Routing
 - **V3.0b (DONE ✅)** — `v3.0b-selfquery`: Metadata Self-Querying Filtering (Tahun, Prodi, Penulis) + Stable JSONL Self-Query Logging + Pre-check Zero-Result Fallback + Metadata Exact-Match Answer Guard + Metadata Router Natural-Language Alias Resolution
 - **V3.0c (DONE ✅)** — `v3.0c-rerank`: Cross-Encoder Reranking (`BAAI/bge-reranker-base`) + Sequential Loading + Dynamic Top-N + Anchor Reservation + Before-vs-After Audit UI + Generation Hardening + Multi-turn Stabilization + Backward-Compatibility Polish
-- **V3.0d (NEXT 🔄)** — Post-Hoc Verification (Confidence Scoring + label Hijau/Merah)
+- **V3.0d (DONE ✅)** — `v3.0d-verification`: Post-Hoc Verification (Grounding Gate v1, explainable & rule-based) + Verification UI/Logging + Evaluation Dataset Builder + RAGAS Pipeline + Evaluator-Specific LLM Override + Intent Planner + Ownership-Aware Doc Aggregation + Method Explanation Route + Single-Target Steps Handler + Comparison Formatter + Docmeta Sidecar + Safe Title Fallback + Logging Hardening + Final Audit/UI Sync Polish
+- **V3.1 (NEXT 🔄)** — Dataset Expansion + mini gold set / reference answers + evaluasi Answer Correctness / rubric helpfulness (opsional, jika sumber daya tersedia)
 
 **Pemetaan Ablation Study:**
 | Skenario | Versi | Tag | Keterangan |
 |----------|-------|-----|------------|
 | A | V1.0 | `v1.0-naive` | Naive Dense RAG |
 | B | V2.0 | `v2.0-hybrid` | Hybrid RAG (BM25+Sastrawi+RRF) |
-| C | V3.0c | `v3.0c-rerank` | Proposed Method tahap aktif (Retrieval + Self-Query + Rerank + Audit UI) |
+| C | V3.0c | `v3.0c-verification` | Proposed Method final aktif (Retrieval + Self-Query + Rerank + Verification + Intent-Aware Answer Augmentation + Audit/Eval) |
 
 ---
 
 ## Summary
 Repo ini berisi prototipe sistem **Question Answering** pada kumpulan PDF skripsi/TA.
 
-Versi **V3.0c** membangun di atas V3.0b dengan empat fondasi utama:
+Versi **V3.0d** membangun di atas V3.0c dengan enam fondasi utama:
 1. **Structure-aware dual-stream retrieval** dari V3.0a (narasi vs sitasi, dual collection, citation routing)
 2. **Metadata Self-Querying Filtering** dari V3.0b pada primary retrieval narasi
-3. **Cross-Encoder Reranking** di atas candidate pool retrieval untuk mempertajam final contexts sebelum generation
-4. **Generation + multi-turn hardening** agar query comparison/steps/follow-up singkat lebih grounded, stabil, dan mudah diaudit
+3. **Cross-Encoder Reranking** dari V3.0c di atas candidate pool retrieval untuk mempertajam final contexts sebelum generation
+4. **Post-Hoc Verification** di answer layer (Grounding Gate v1, explainable & rule-based)
+5. **Evaluation pipeline** (dataset builder + RAGAS + evaluator-specific LLM override)
+6. **Intent-aware answer augmentation policy** untuk method explanation / count-list / comparison / single-target steps + metadata/audit hardening
 
-Fitur inti yang telah tersedia hingga **V3.0c**:
+Fitur inti yang telah tersedia hingga **V3.0d**:
 - **Structure-Aware PDF Parsing**: deteksi bab (BAB I–V, Daftar Pustaka, Lampiran) via regex + filename routing — setiap chunk "tahu posisinya" dalam hierarki akademik
 - **Dual Stream**: dokumen dipecah menjadi dua aliran — narasi (BAB I–V) dan sitasi (Daftar Pustaka) — masing-masing diindeks ke ChromaDB collection terpisah
 - **Citation Routing**: sistem mendeteksi otomatis apakah query menanyakan konten (→ narasi) atau referensi/pustaka (→ sitasi), lalu merge hasilnya
@@ -55,6 +60,19 @@ Fitur inti yang telah tersedia hingga **V3.0c**:
 - **Generation Hardening (V3.0c)**: comparison/steps answer dibuat lebih grounded, lebih jujur pada coverage asimetris, dan lebih faithful terhadap final contexts
 - **Multi-turn Stabilization (V3.0c)**: follow-up singkat seperti *"Bisa lebih ringkas lagi langkah utamanya?"* dapat diperlakukan sebagai kelanjutan konteks, bukan topic shift palsu
 - **Regression / Backward-Compatibility Polish (V3.0c)**: config legacy (`v1_5.yaml`, `v2.yaml`) tetap sehat tanpa fingerprint reranker palsu di UI/log
+- **Post-Hoc Verification (V3.0d)**: verification rule-based, explainable, dan hidup di answer layer; status utama: `verified`, `partially_verified`, `low_verification`, `verification_n_a`
+- **Verification Logging + UI (V3.0d)**: object `verification` masuk ke `answers.jsonl`, disimpan ke `turn_data`, tampil stabil di latest turn maupun history replay
+- **Evaluation Dataset Builder (V3.0d)**: `build_eval_dataset.py` merekonstruksi final contexts dari run log + index/Chroma, menghasilkan `eval_dataset.json`, `ragas_rows.jsonl`, dan `ragas_rows.pretty.json`
+- **RAGAS Evaluation Pipeline (V3.0d)**: `evaluate_ragas.py` menjalankan metric `faithfulness`, `answer_relevancy`, dan `context_precision`, lengkap dengan transparency fields per-item/per-summary
+- **Evaluator-Specific LLM Override (V3.0d)**: evaluator dapat memakai provider/model berbeda dari runtime generator utama (Groq/OpenAI/Ollama-ready), sehingga tuning evaluator tidak merusak perilaku chat runtime
+- **Intent Planner + Route Names (V3.0d)**: planner membedakan intent seperti `method_explanation`, `doc_count_list`, `method_comparison`, `single_target_steps`, dll. agar jawaban tidak jatuh ke template identifikasi yang terlalu dangkal
+- **Ownership-Aware Doc Aggregation (V3.0d)**: query list/count dan doc-locked explanation kini memiliki pemilihan dokumen yang lebih disiplin dan lebih jujur
+- **Method Explanation Route + Explanation-Biased Expansion (V3.0d)**: query penjelasan metode dipisahkan dari identification dan diperluas ke konteks alasan, karakteristik, dan tahapan bila tersedia
+- **Single-Target Steps Handler (V3.0d)**: query tahapan tunggal menjadi lebih aman/jujur, mengurangi halusinasi langkah yang sebenarnya tidak eksplisit
+- **Comparison Formatter (V3.0d)**: jawaban perbandingan menjadi lebih contrastive dan lebih audit-friendly, dengan penggunaan context unik per-metode bila tersedia
+- **Docmeta Sidecar + Safe Title Fallback (V3.0d)**: `docmeta_sidecar.json` ditambahkan agar title/author/year display untuk query count/list tidak lagi tercemar metadata noisy
+- **Logging Hardening (V3.0d)**: `intent_plan`, `doc_aggregation_meta`, dan `answer_policy_audit_summary` ditambahkan agar policy internal lebih mudah diaudit
+- **Final Audit/UI Sync Polish (V3.0d)**: metadata rerank disinkronkan kembali ke final contexts/UI (CTX Mapping / After Rerank / Sources) agar audit panel jujur terhadap final nodes
 - Dense retrieval (Chroma + embeddings) dengan diversity retrieval
 - Multi-turn memory (sliding window, topic shift detection)
 - Query contextualization (rewrite sebelum retrieval)
@@ -526,48 +544,303 @@ Pada akhir V3.0c, jalur legacy dipolish agar:
 - beberapa snippet/bukti masih bisa tampak rough atau clipped
 - query citation tertentu masih bisa menghasilkan jawaban yang narasi-heavy
 
-#### Arsitektur Modul (V3.0c)
-```
+---
+
+### [V3.0d — Post-Hoc Verification + Evaluation Pipeline + Intent-Aware Answer Augmentation]
+
+#### Post-Hoc Verification Layer
+V3.0d menambahkan **lapisan verifikasi setelah generation selesai**, bukan confidence retrieval/rerank palsu. Prinsipnya:
+- verification hidup di **answer layer** terhadap **jawaban final + final contexts**
+- verification dibuat **rule-based, explainable, dan audit-friendly**
+- target utamanya adalah **groundedness signal**, bukan angka confidence pseudo-terkalibrasi
+
+Komponen utama verification V3.0d:
+- `build_verification_meta()` di `generate_utils.py`
+- public re-export di `generate.py`
+- integrasi end-to-end di `app_streamlit.py`
+- render verification box di `app_ui_render.py`
+
+Label verifikasi yang dipakai di UI/log:
+- `verified`
+- `partially_verified`
+- `low_verification`
+- `verification_n_a` / `skipped`
+
+Keputusan desain penting:
+- verification **tidak** dijadikan numeric UI confidence utama
+- `rerank_score` **bukan** verification score
+- semantic helper / reuse Cross-Encoder **tidak** dijadikan inti verification release V3.0d
+
+#### Verification Logging + History Replay
+Verification V3.0d tidak berhenti di backend; ia juga di-hardening ke log dan replay:
+- field `verification` ditambahkan ke `answers.jsonl`
+- metadata-routed path diperlakukan jujur sebagai `N/A` / `skipped`
+- `last_verification` di session state ikut sinkron
+- `turn_data[turn_id]["verification"]` ikut disimpan agar replay historis benar-benar menampilkan status verifikasi turn yang dipilih
+
+#### Evaluation Dataset Builder (V3.0d)
+V3.0d menambahkan script evaluasi baru:
+- `src/evaluation/build_eval_dataset.py`
+
+Tugas builder ini:
+- join `answers.jsonl` + `retrieval.jsonl` untuk satu `run_id`
+- merekonstruksi **final contexts** yang benar-benar dipakai answer
+- memprioritaskan full chunk dari index/Chroma, bukan preview trimmed dari log
+- memisahkan `question_user` vs `question_eval`
+- menambahkan `question_source`, `context_source`, `missing_context_chunk_ids`, dst. untuk audit
+
+Output builder:
+- `eval_dataset.json`
+- `ragas_rows.jsonl`
+- `ragas_rows.pretty.json`
+
+#### RAGAS Evaluation Pipeline
+V3.0d menambahkan evaluator penuh melalui:
+- `src/evaluation/evaluate_ragas.py`
+
+Metric aktif final V3.0d:
+- `faithfulness`
+- `answer_relevancy`
+- `context_precision`
+
+Keputusan scope evaluasi:
+- **Answer Correctness belum diaktifkan** karena dataset evaluator belum menyimpan `reference` / `reference_contexts`
+- jadi RAGAS pada V3.0d diposisikan sebagai indikator:
+  - groundedness
+  - relevansi jawaban terhadap pertanyaan
+  - kualitas ranking konteks
+- RAGAS **bukan** satu-satunya bukti bahwa jawaban sudah conversationally satisfying
+
+#### Evaluator-Specific LLM Override
+Agar evaluasi tidak merusak runtime utama, V3.0d menambahkan jalur evaluator LLM override terpisah:
+- config: `evaluation.llm_override` di `configs/base.yaml`
+- provider evaluator dapat dipilih terpisah dari runtime generator utama
+- provider yang disiapkan: **Groq / OpenAI / Ollama**
+
+Final validasi evaluator menunjukkan bahwa model evaluator dapat berbeda dari runtime generator. Pada iterasi akhir V3.0d, evaluator yang paling stabil untuk run final adalah:
+- provider: `groq`
+- model: `meta-llama/llama-4-scout-17b-16e-instruct`
+
+Ini dipilih karena lebih stabil daripada evaluator awal yang sempat menghasilkan `LLMDidNotFinishException` / row missing pada model Groq yang lebih kecil.
+
+#### Intent Planner + Route Names
+Setelah verification/evaluator selesai, fokus V3.0d bergeser ke **quality of answer augmentation**. Karena itu ditambahkan planner intent di `app_streamlit.py` untuk membedakan jalur-jalur seperti:
+- `method_explanation`
+- `doc_count_list`
+- `method_comparison`
+- `single_target_steps`
+- `metadata_routed`
+
+Tujuan planner:
+- menjaga query penjelasan tidak jatuh ke jawaban identifikasi singkat
+- menjaga compound-intent seperti *"Ada berapa ...? Jika ada, sebutkan judul dan penulisnya"* tidak direduksi jadi count-only
+- memberi audit trail yang lebih jelas untuk answer policy internal
+
+#### Ownership-Aware Doc Aggregation
+V3.0d menambahkan **ownership-aware doc aggregation** agar query list/count dan explanation doc-locked lebih disiplin dalam memilih dokumen target. Dampaknya:
+- query list/count seperti Prototyping menjadi lebih jujur dan lebih stabil
+- `accepted_docs` / `candidate_docs` dapat diaudit
+- route explanation/count tidak lagi terlalu mudah “mengambil dokumen salah”
+
+#### Method Explanation Route + Explanation-Biased Expansion
+Salah satu kritik terbesar saat review dosen adalah query penjelasan metode sering dijawab seperti query identifikasi. Untuk itu V3.0d memisahkan jalur **method explanation** dari sekadar method identification, lalu menambahkan retrieval expansion yang bias ke:
+- penjelasan metode
+- alasan penggunaan metode
+- karakteristik metode
+- tahapan metode
+- konteks penggunaan metode pada dokumen yang sedang dibahas
+
+Dampak praktisnya:
+- Q1 dan Q3 tidak lagi terlalu mudah jatuh ke jawaban template satu baris
+- answer builder menjadi lebih terasa "augmented"
+
+#### Single-Target Steps Handler
+V3.0d juga menambahkan handler khusus untuk query tahapan tunggal (single-target steps). Prinsip pentingnya:
+- sistem **lebih jujur** jika langkah lengkap tidak eksplisit di final contexts
+- lebih baik menjawab partial / safe daripada mengarang langkah
+- metadata steps tetap bisa dicatat, tetapi jawaban final tidak boleh melampaui bukti
+
+#### Comparison Formatter
+Untuk query comparison seperti RAD vs Prototyping, V3.0d menambahkan formatter comparison yang lebih contrastive:
+- per-metode dipisahkan lebih tegas
+- context unik per-metode diprioritaskan bila tersedia
+- evidence comparison tidak lagi terlalu generik
+- status comparison bisa dicatat lebih jujur (`balanced`, `partial`, dll.)
+
+#### Docmeta Sidecar + Safe Title Fallback
+Bug metadata display pada query count/list (misalnya title noisy seperti potongan tabel penelitian terdahulu) ditutup lewat:
+- `docmeta_sidecar.json`
+- heuristik `safe_title_fallback`
+
+Hasilnya:
+- title display aman untuk list/count answer
+- judul noisy seperti `8. Keluarga Stressed Out ...` tidak lagi dipakai sebagai display title
+- jika metadata mentah buruk, sistem fallback ke source-file/doc-id yang aman
+
+#### Logging intent_plan + doc_aggregation_meta
+V3.0d menambahkan telemetry policy yang lebih rapi:
+- `intent_plan`
+- `doc_aggregation_meta`
+- `answer_policy_route`
+- `answer_policy_audit_summary`
+
+Tujuannya:
+- audit trail policy internal lebih mudah dibaca
+- progres Tahap 8 / analisis query buruk lebih mudah ditelusuri
+- answer policy menjadi lebih explainable untuk kebutuhan skripsi/demo
+
+#### Final Audit/UI Sync Polish
+Pada penutupan V3.0d ditemukan bug kecil tetapi nyata: metadata rerank ada di backend/log, tetapi sebagian final contexts/UI masih tidak menampilkannya. Patch final menutup mismatch ini dengan:
+- sinkronisasi ulang metadata rerank ke final nodes
+- final hardening pada `nodes_for_answer`
+- CTX Mapping / After Rerank / Sources kini lebih jujur terhadap final contexts yang benar-benar dipakai answer
+
+Catatan penting:
+- `rerank_score` tetap **heuristic UI-only**, bukan calibrated probability
+- kombinasi `rerank_rank = #1` tetapi label raw score tampak “Lemah” di UI **bisa valid**, karena label itu hanya membaca nilai mentah dengan threshold heuristik, bukan confidence sejati
+
+#### Ringkasan Hasil Validasi V3.0d
+Validasi V3.0d berjalan dalam dua gelombang besar:
+
+**Gelombang 1 — Verification + Evaluator**
+- verification backend → PASS
+- verification logging di `answers.jsonl` → PASS
+- verification UI + history replay → PASS
+- build eval dataset → PASS
+- evaluator RAGAS → PASS setelah jalur override dimatangkan
+
+**Gelombang 2 — Answer Augmentation Policy (Tahap 1–8)**
+- Tahap 1: intent planner + new route names → PASS
+- Tahap 2: ownership-aware doc aggregation → PASS
+- Tahap 3: method explanation route + explanation-biased expansion → PASS
+- Tahap 4: single-target steps handler (+ micro-fix 4.1/4.2/4.3) → PASS
+- Tahap 5: comparison formatter (+ micro-fix 5.1/5.2) → PASS
+- Tahap 6: docmeta sidecar + safe title fallback → PASS
+- Tahap 7: logging `intent_plan` + `doc_aggregation_meta` → PASS
+- Tahap 8: rerun 8 query buruk + evaluator final → PASS
+
+#### Residual Issues Non-Blocking (Final V3.0d)
+Pada penutupan V3.0d, residual issue yang tersisa diposisikan sebagai **non-blocking**:
+- beberapa `title_display` masih safe fallback dari `source_file` / `doc_id`, sehingga aman tetapi belum humanized sempurna
+- comparison Q4 sudah contrastive, tetapi evidence masih agak noisy/truncated dan shared CTX pendukung masih bisa ikut muncul
+- Q7 single-target steps masih punya inkonsistensi internal metadata, walau jawaban final sudah aman/jujur
+- Q8 unresolved-safe answer masih dapat menghasilkan verification low / missing citation, tetapi tidak lagi salah lock ke dokumen yang keliru
+
+Kesimpulan akhir V3.0d:
+- dari sisi engineering-praktis, V3.0d **sudah matang untuk dirilis**
+- residual issue yang tersisa **tidak menahan release**
+- patch runtime besar berikutnya **tidak direkomendasikan** kecuali ada bug kritis baru
+
+#### Arsitektur Modul (V3.0d)
+```text
 src/
-├── app_streamlit.py          ← UI utama (hybrid/dense, citation routing, self-query integration, reranker integration, generation orchestration, multi-turn stabilization, metadata exact-match guard)
-├── app_ui_render.py          ← Render & display helpers (stream pill, legend CTX, hybrid score pills, rerank summary box, before/after audit panel, source snapshot, rerank gating)
+├── app_streamlit.py          ← UI utama + orchestration pipeline final V3.0d
+│                               (hybrid/dense, citation routing, self-query integration,
+│                               reranker integration, post-hoc verification, intent planner,
+│                               ownership-aware doc aggregation, method explanation route,
+│                               single-target steps handler, comparison formatter wiring,
+│                               docmeta sidecar consumption, logging hardening,
+│                               final context / rerank audit sync)
+├── app_ui_render.py          ← Render & display helpers
+│                               (stream pill, legend CTX, hybrid score pills,
+│                               rerank summary box, before/after audit panel,
+│                               source snapshot, verification box, history replay render,
+│                               rerank/anchor/verification gating, audit UI polish)
 ├── rag/
-│   ├── pdf_parser.py         ← Structure-aware parsing (regex + filename routing) - single source of truth
-│   ├── chunking.py           ← Dual strategy chunking (narasi + sitasi) - single source of truth
-│   ├── method_detection.py   ← Single source of truth query/method detection + is_citation_query + is_steps_question
-│   ├── self_query.py         ← Metadata self-querying module (V3.0b) - LLM → JSON metadata filter + semantic_query + pre-check helper
-│   ├── reranker.py           ← BARU V3.0c: Cross-Encoder reranking lifecycle (load / rerank / unload / status info)
-│   ├── generate.py           ← Thin re-export wrapper
-│   ├── generate_utils.py     ← Semua implementasi generate + guardrails + comparison/steps/multi-target hardening
-│   ├── ingest.py             ← PDF ingestion → dual stream → dual ChromaDB collection + doc_catalog
+│   ├── pdf_parser.py         ← Structure-aware parsing (regex + filename routing)
+│   │                           - single source of truth parsing bab/metadata
+│   ├── chunking.py           ← Dual strategy chunking (narasi + sitasi)
+│   │                           - single source of truth chunking
+│   ├── method_detection.py   ← Single source of truth query/method detection
+│   │                           + is_citation_query + is_steps_question
+│   ├── self_query.py         ← Metadata self-querying module (V3.0b)
+│   │                           - LLM → JSON metadata filter + semantic_query + pre-check helper
+│   ├── reranker.py           ← Cross-Encoder reranking lifecycle (V3.0c)
+│   │                           - load / rerank / unload / status info
+│   ├── generate.py           ← Thin re-export wrapper public API
+│   │                           (termasuk verification builder yang diexpose dari generate_utils.py)
+│   ├── generate_utils.py     ← Semua implementasi generate + guardrails + answer-policy helpers
+│   │                           (verification engine, method explanation builder,
+│   │                            steps/comparison formatter, deterministic safe answers,
+│   │                            post-hoc verification meta)
+│   ├── ingest.py             ← PDF ingestion → dual stream → dual ChromaDB collection
+│   │                           + doc_catalog + docmeta_sidecar
 │   ├── retrieve_dense.py     ← Dense retrieval + where_filter + stream/bab_label
 │   ├── retrieve_sparse.py    ← BM25+Sastrawi sparse + collection-aware + stream/bab_label
-│   ├── fusion_rrf.py         ← RRF fusion: List[RetrievedNode] → List[RetrievedNode] + propagate stream/bab_label
-│   └── metadata_router.py    ← Metadata intent router (page_count) + natural-language alias resolution
-└── core/
-    ├── config.py
-    ├── run_manager.py
-    ├── schemas.py            ← RetrievedNode (+ stream + bab_label + rerank_score + rerank_rank)
-    ├── ui_utils.py           ← Generic Streamlit widgets
-    └── cleanup_runs.py
-configs/  → base.yaml, v1.yaml, v1_5.yaml, v2.yaml, v3.yaml, v3_dense_test.yaml, v3_rerank_fail.yaml
+│   ├── fusion_rrf.py         ← RRF fusion: List[RetrievedNode] → List[RetrievedNode]
+│   │                           + propagate stream/bab_label
+│   └── metadata_router.py    ← Metadata intent router (page_count)
+│                               + natural-language alias resolution
+│                               + doc_catalog/docmeta_sidecar loader helpers
+├── core/
+│   ├── config.py             ← Load config YAML (deep merge base + override)
+│   ├── run_manager.py        ← run_id + manifest + logging JSONL
+│   ├── schemas.py            ← RetrievedNode
+│   │                           (+ stream + bab_label + rerank_score + rerank_rank)
+│   ├── ui_utils.py           ← Generic Streamlit widgets (download, PDF helper, dll.)
+│   └── cleanup_runs.py       ← Cleanup runs utility (manual)
+└── evaluation/
+    ├── build_eval_dataset.py ← Builder dataset evaluasi dari runs/<run_id>
+    │                           (rekonstruksi final contexts + audit rows)
+    └── evaluate_ragas.py     ← Evaluator RAGAS + evaluator-specific LLM override
+                                + transparency outputs + partial-failure handling
+
+configs/
+├── base.yaml                 ← baseline global config + evaluation.ragas
+│                               + evaluation.llm_override
+├── v1.yaml
+├── v1_5.yaml
+├── v2.yaml
+├── v3.yaml                   ← config final V3.0d
+│                               (dual collection + self_query + reranker + verification
+│                                + docmeta + answer_policy + doc_aggregation)
+├── v3_dense_test.yaml
+└── v3_rerank_fail.yaml
 ```
 
-**Dependency Graph Modul V3.0c:**
-```
-pdf_parser.py        ← ingest.py (parsing PDF per-stream)
+**Dependency Graph Modul V3.0d:**
+```text
+pdf_parser.py        ← ingest.py (structure-aware parsing per-stream)
 chunking.py          ← ingest.py (chunking per-stream)
 
-self_query.py        ← app_streamlit.py (LLM metadata extraction → semantic_query + filters)
-retrieve_dense.py    ← app_streamlit.py (narasi + sitasi + where_filter, collection-aware)
-retrieve_sparse.py   ← app_streamlit.py (narasi + sitasi, collection-aware)
-fusion_rrf.py        ← app_streamlit.py (gabungkan dense + sparse, propagate stream/bab_label)
-metadata_router.py   ← app_streamlit.py (page_count intent + natural-language alias resolution)
-method_detection.py  ← app_streamlit.py / pdf_parser.py (single source of truth query/type detection)
+self_query.py        ← app_streamlit.py
+                       (LLM metadata extraction → semantic_query + filters)
+
+retrieve_dense.py    ← app_streamlit.py
+                       (narasi + sitasi + where_filter, collection-aware)
+
+retrieve_sparse.py   ← app_streamlit.py
+                       (narasi + sitasi, collection-aware)
+
+fusion_rrf.py        ← app_streamlit.py
+                       (gabungkan dense + sparse, propagate stream/bab_label)
+
+metadata_router.py   ← app_streamlit.py
+                       (page_count intent + natural-language alias resolution
+                        + loader doc_catalog/docmeta_sidecar)
+
+method_detection.py  ← app_streamlit.py / pdf_parser.py
+                       (single source of truth query/type detection)
 
 reranker.py          ← app_streamlit.py
+                       (candidate rerank sebelum generation)
+
 generate_utils.py    ← generate.py / app_streamlit.py
+                       (answer builder, verification engine, steps/comparison formatter,
+                        deterministic safe-answer helpers)
+
 app_ui_render.py     ← app_streamlit.py
+                       (verification box, rerank audit UI, source snapshot,
+                        CTX mapping, history replay render)
+
+build_eval_dataset.py ← runs/<run_id>/answers.jsonl + retrieval.jsonl
+                        + Chroma/index/doc metadata
+                        (membangun eval_dataset.json + ragas_rows)
+
+evaluate_ragas.py    ← build_eval_dataset.py output
+                       + configs/base.yaml / current project config
+                       + evaluator.llm_override
+                       (menjalankan faithfulness, answer_relevancy, context_precision)
 
 schemas.RetrievedNode
     ↑
@@ -577,7 +850,14 @@ schemas.RetrievedNode
     ├── reranker.py
     └── app_streamlit.py
 
-_resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.py — DRY)
+_resolve_collection_name()  ← retrieve_dense.py
+                               (diimpor oleh retrieve_sparse.py — DRY)
+
+doc_catalog.json / docmeta_sidecar.json
+    ↑
+    ├── ingest.py             (membangun / menulis)
+    ├── metadata_router.py    (load helper)
+    └── app_streamlit.py      (dipakai untuk metadata routing + safe display metadata)
 ```
 
 ---
@@ -594,7 +874,8 @@ _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.
 | Reranker (V3.0c) | `BAAI/bge-reranker-base` |
 | LLM Primary | Groq API — `llama-3.1-8b-instant` |
 | LLM Secondary | Ollama — Llama-3 Quantized 4-bit (offline/privasi) |
-| Evaluasi | RAGAS (Faithfulness, Answer Relevance, Context Precision) |
+| LLM Evaluator Final (V3.0d) | Groq — `meta-llama/llama-4-scout-17b-16e-instruct` (jalur `evaluation.llm_override`) |
+| Evaluasi | RAGAS (Faithfulness, Answer Relevancy, Context Precision) + evaluation dataset builder (`build_eval_dataset.py`) |
 | Hardware | AMD Ryzen 7 5800H, RAM 32GB, RTX 3050 Ti (4GB VRAM) |
 
 > **Catatan VRAM:** Cross-Encoder dan LLM tidak boleh dimuat bersamaan. Strategi Sequential Loading wajib dipakai di V3.0c ke atas: load Cross-Encoder → rerank → unload → load LLM → generate.
@@ -628,7 +909,7 @@ _resolve_collection_name()  ← retrieve_dense.py (diimpor oleh retrieve_sparse.
     - `schemas.py` : dataclass schema (RetrievedNode + field hybrid V2.0 + `stream`/`bab_label` V3.0a + `rerank_score`/`rerank_rank` V3.0c)
     - `ui_utils.py` : download buttons, PDF viewer+highlight, clipboard, dll
     - `cleanup_runs.py` : cleanup runs utility (manual)
-  - `evaluation/` : script pondasi evaluasi (RAGAS, dsb.)
+  - `evaluation/` : script evaluasi V3.0d (`build_eval_dataset.py`, `evaluate_ragas.py`, wrapper RAGAS, transparency outputs)
 - `configs/` : config per versi (base, v1, v1_5, v2, v3)
 - `data_raw/` : PDF mentah *(gitignored)*
 - `data_index/` : storage Chroma *(gitignored)*
@@ -664,6 +945,8 @@ Gunakan `.env` lokal (jangan commit API key). Contoh variabel:
 
 > Catatan: file `env` tidak di-commit. Gunakan `.env.example` sebagai template.
 
+> **Catatan V3.0d:** Jika evaluator ingin memakai provider berbeda dari runtime utama, siapkan environment / credential yang relevan untuk jalur `evaluation.llm_override` (mis. Groq/OpenAI/Ollama) tanpa harus mengubah provider generator utama.
+
 ---
 
 ## Cara Menjalankan
@@ -671,7 +954,7 @@ Gunakan `.env` lokal (jangan commit API key). Contoh variabel:
 ### 1.) Ingest / Index (offline)
 Pastikan PDF diletakkan di `data_raw/`, lalu jalankan:
 
-**V3.0c / V3.x (Dual Stream + Self-Query + Rerank — Direkomendasikan):**
+**V3.0d / V3.x final (Dual Stream + Self-Query + Rerank + Verification + Answer-Policy Hardening — Direkomendasikan):**
 ```bash
 # Fresh ingest V3.0a — WAJIB pakai --reset untuk pertama kali
 # (menghapus collection lama dan membangun dual collection baru)
@@ -700,6 +983,8 @@ python -m src.rag.ingest --config configs/v2.yaml --reset
 
 > **Catatan V3.0a — BM25 Cache:** BM25 cache dibangun terpisah per collection (narasi dan sitasi). Setelah re-ingest, restart app atau panggil `clear_sparse_cache()` secara manual agar cache tidak stale.
 
+> **Catatan V3.0d — Docmeta Sidecar:** Setelah patch Tahap 6, proses ingest final V3.0d juga akan menulis `docmeta_sidecar.json` berdampingan dengan `doc_catalog.json`. File ini dipakai untuk safe title fallback dan display metadata yang lebih aman pada query count/list. Jika hendak mengubah heuristik docmeta, lakukan re-ingest agar sidecar sinkron.
+
 > **Catatan V2.0:** BM25 index dibangun dari ChromaDB secara otomatis saat query pertama — tidak perlu langkah ingest tambahan.
 
 ### 2.) Jalankan UI (Streamlit)
@@ -726,7 +1011,31 @@ Di sidebar UI, tersedia toggle **Mode**:
 | `configs/v1.yaml` | dense | `skripsi_structured_narasi` | Skenario A — Naive Dense RAG |
 | `configs/v1_5.yaml` | dense | `skripsi_structured_narasi` | V1.5 dengan memory (bukan skenario ablation) |
 | `configs/v2.yaml` | **hybrid** | `skripsi_structured_narasi` | **Skenario B — Hybrid RAG** |
-| `configs/v3.yaml` | **hybrid + rerank** | narasi + sitasi (dual) | **Tahap aktif Proposed Method (V3.0c)** — retrieval + self-query + rerank + audit UI |
+| `configs/v3.yaml` | **hybrid + rerank + verification + answer-policy hardening** | narasi + sitasi (dual) | **Skenario C — Proposed Method final V3.0d** |
+
+### 5.) Build Eval Dataset & Evaluator RAGAS (V3.0d)
+Setelah run log (`answers.jsonl` + `retrieval.jsonl`) terbentuk, pipeline evaluasi V3.0d dijalankan dalam dua langkah:
+
+```bash
+# 1. Bangun dataset evaluator dari run tertentu
+python -m src.evaluation.build_eval_dataset --run_id <RUN_ID>
+
+# 2. Jalankan evaluator RAGAS
+python -m src.evaluation.evaluate_ragas --run_id <RUN_ID>
+```
+
+Output utama di `runs/<run_id>/`:
+- `eval_dataset.json`
+- `ragas_rows.jsonl`
+- `ragas_rows.pretty.json`
+- `ragas_results.json`
+- `ragas_item_scores.jsonl`
+- `ragas_item_scores.pretty.json`
+
+Catatan operasional V3.0d:
+- evaluator memakai jalur `evaluation.llm_override`, terpisah dari runtime generator utama
+- untuk final validasi V3.0d, konfigurasi evaluator yang paling stabil memakai Groq `meta-llama/llama-4-scout-17b-16e-instruct`
+- jika evaluator terkena limit/provider issue, ganti **provider/model evaluator saja**; jangan terburu-buru membuka patch runtime generator utama
 
 ---
 
@@ -781,7 +1090,7 @@ memory:
   window: 4
 ```
 
-Key penting di `v3.yaml` (V3.0c — Dual Collection + Metadata Self-Querying + Cross-Encoder Reranking):
+Key penting di `v3.yaml` (V3.0d — Dual Collection + Metadata Self-Querying + Cross-Encoder Reranking + Verification + Answer-Policy Hardening):
 ```yaml
 index:
   collections:
@@ -838,14 +1147,44 @@ reranker:
   device: "auto"
   min_vram_mb: 800
   allow_in_eval: true
+
+verification:
+  enabled: true
+  show_box_in_ui: true
+
+docmeta:
+  enabled: true
+  sidecar_filename: "docmeta_sidecar.json"
+  safe_title_fallback: true
+
+answer_policy:
+  planner_enabled: true
+  log_intent_plan: true
+
+doc_aggregation:
+  enabled: true
+  log_meta: true
+
+evaluation:
+  ragas:
+    batch_size: 1
+  llm_override:
+    enabled: true
+    provider: "groq"
+    model: "meta-llama/llama-4-scout-17b-16e-instruct"
+    temperature: 0.0
+    max_tokens: 1024
+    timeout: 240
+    max_retries: 6
 ```
 
-> **Catatan V3.0c:**  
+> **Catatan V3.0d:**  
 > - `metadata_routing` tetap aktif di `v3.yaml` untuk mempertahankan jalur page-count intent pada pipeline terbaru  
 > - `self_query` tetap hanya diterapkan pada primary dense retrieval narasi  
-> - `reranker.allow_in_eval=true` dipilih karena reranking adalah bagian inti proposed method yang perlu diukur pada Skenario C  
-> - `before_after_ui_max_pre_rows` dipolish menjadi `10` agar konsisten dengan candidate pool yang diuji  
-> - `v1.yaml`, `v1_5.yaml`, dan `v2.yaml` dipertahankan sebagai baseline historis; fitur V3.0c tidak dipaksakan aktif di config versi lama
+> - `reranker.allow_in_eval=true` dipilih karena reranking tetap bagian inti proposed method yang diukur pada Skenario C  
+> - `verification`, `docmeta`, `answer_policy`, dan `doc_aggregation` kini hidup di config aktif V3.0d  
+> - `evaluation.llm_override` adalah jalur resmi untuk evaluator-only; perubahan evaluator tidak perlu memodifikasi runtime generator utama  
+> - `v1.yaml`, `v1_5.yaml`, dan `v2.yaml` dipertahankan sebagai baseline historis; fitur V3.0d tidak dipaksakan aktif di config versi lama
 
 ---
 
@@ -869,7 +1208,8 @@ Utility: `src/core/cleanup_runs.py`
 ### Git Strategy
 - Kerja harian dilakukan di branch `dev`
 - Push ke `main` + beri tag hanya saat satu versi dinyatakan final
-- Tag convention: `v{versi}-{codename}` (contoh: `v1.0-naive`, `v1.5-memory`, `v2.0-hybrid`, `v3.0a-structured`, `v3.0b-selfquery`, `v3.0c-rerank`, dst...)
+- Setelah penutupan V3.0d, asumsi README ini adalah: final git strategy **sudah selesai** (`dev` → `main` → tag final V3.0d → `dev` disinkron kembali dari `main`)
+- Tag convention: `v{versi}-{codename}` (contoh: `v1.0-naive`, `v1.5-memory`, `v2.0-hybrid`, `v3.0a-structured`, `v3.0b-selfquery`, `v3.0c-rerank`, `v3.0d-verification`, dst...)
 
 ### JSONL Schema Consistency
 Field di `retrieval.jsonl` dan `answers.jsonl` tidak boleh berubah antar run dalam satu versi — ablation study bergantung pada konsistensi ini. Jika ada field baru, pastikan diisi di **semua jalur** (normal retrieval, metadata-routed, citation-routed).
@@ -940,6 +1280,26 @@ Catatan:
 - `rerank_score` adalah heuristic UI-only, bukan confidence score
 - `None` pada `rerank_score` / `rerank_rank` dapat valid, misalnya pada reserved anchor
 
+Field V3.0d yang ditambahkan ke `answers.jsonl`:
+- `verification` — object verification post-hoc (label, explanation, chips, score internal bila relevan)
+- `answer_policy_route` — route utama answer-policy / intent primer
+- `intent_plan` — object planner intent (jika logging planner aktif)
+- `doc_aggregation_meta` — object audit doc aggregation (jika logging aggregation aktif)
+- `answer_policy_audit_summary` — compact summary audit untuk planner/doc aggregation
+
+Output builder/evaluator V3.0d di `runs/<run_id>/`:
+- `eval_dataset.json`
+- `ragas_rows.jsonl`
+- `ragas_rows.pretty.json`
+- `ragas_results.json`
+- `ragas_item_scores.jsonl`
+- `ragas_item_scores.pretty.json`
+
+Catatan V3.0d:
+- `verification` mengukur groundedness heuristik di answer layer, **bukan** conversational satisfaction
+- `intent_plan` dan `doc_aggregation_meta` diposisikan sebagai telemetry audit-friendly, bukan bagian dari prompt jawaban user-facing
+- `rerank_score` tetap heuristic UI-only; label raw-score pada pills dapat terlihat "lemah" walau `rerank_rank=#1`, dan itu bukan bug backend
+
 ### Prinsip Modifikasi (V1.5+)
 - Logika deteksi metode/query → selalu edit di `method_detection.py`
 - Logika render/display UI → selalu edit di `app_ui_render.py`
@@ -984,10 +1344,22 @@ Catatan:
 - `None` pada `rerank_score` / `rerank_rank` bisa valid untuk reserved anchor
 - Jika config legacy dipakai, UI/log legacy harus tetap **bersih** dan tidak membawa fingerprint reranker palsu
 
+### Prinsip Modifikasi Tambahan (V3.0d)
+- Logic verification rule-based → fokuskan di `src/rag/generate_utils.py`; `generate.py` hanya public re-export tipis
+- Integrasi verification, planner, doc aggregation, docmeta sidecar consumption, dan final context/UI sync → fokuskan di `src/app_streamlit.py`
+- Render verification box, pills audit, CTX Mapping, Before/After panel, dan Sources display → fokuskan di `src/app_ui_render.py`
+- Builder dataset evaluator → `src/evaluation/build_eval_dataset.py`
+- Evaluator RAGAS + provider/model override → `src/evaluation/evaluate_ragas.py` + `configs/base.yaml`
+- `docmeta_sidecar.json` dibangun saat ingest; jika heuristik display metadata diubah, lakukan re-ingest agar sidecar sinkron
+- Jangan membuka ulang retrieval/rerank/parser lama kecuali ada bug kritis; V3.0d menempatkan bottleneck utama pada answer policy / audit / evaluator, bukan pada retrieval recall dasar
+- Untuk problem evaluator, prioritaskan **override evaluator-only** (provider/model/timeout/max_tokens/retries) sebelum mempertimbangkan perubahan runtime generator utama
+- Untuk patch audit UI terakhir, final contexts harus dianggap sumber kebenaran untuk CTX Mapping / After Rerank / Sources; jika metadata rerank ada di backend tetapi hilang di UI, perbaikilah sinkronisasi final-node, bukan rerank backendnya
+
 ### Constraint Hardware (VRAM 4GB)
 - V2.0–V3.0b: BM25 berjalan di CPU, tidak ada tambahan beban VRAM signifikan dari sparse leg
 - V3.0c ke atas: Sequential Loading wajib — Cross-Encoder dan LLM tidak boleh dimuat bersamaan
   - Urutan: load Cross-Encoder → rerank → **unload** → load LLM → generate
+- V3.0d: evaluator LLM diposisikan **terpisah** dari runtime generator; tuning provider/model evaluator tidak boleh dipakai sebagai alasan untuk membuka patch runtime generator utama
 - Device strategy reranker: `device="auto"`, `min_vram_mb=800`; jika CUDA tidak aman/tidak tersedia, fallback CPU adalah perilaku yang valid
 
 ---

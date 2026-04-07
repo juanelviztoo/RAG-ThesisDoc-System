@@ -162,6 +162,16 @@ def _trim_text(s: str, max_chars: int) -> str:
     return s[:max_chars] + " ...<trimmed>"
 
 
+def _strip_doc_header(text: str) -> str:
+    """
+    Hapus header context enrichment seperti:
+        DOC: <doc_id> | <source_file> p.<page>
+
+    Supaya scoring/snippet comparison membaca isi konteks utama, bukan metadata header.
+    """
+    return re.sub(r"(?im)^DOC:\s.*\n", "", (text or "")).strip()
+
+
 def _build_context_block(
     contexts: List[str], max_ctx: int, max_chars_per_ctx: int
 ) -> Tuple[str, int]:
@@ -727,17 +737,57 @@ def _strip_doc_header_line(x: str) -> str:
     return re.sub(r"(?im)^DOC:\s.*\n", "", (x or "")).strip()
 
 
+def _is_non_step_artifact_item(item: str) -> bool:
+    s = " ".join((item or "").split()).strip().lower()
+    if not s:
+        return False
+
+    artifact_keywords = [
+        "data flow diagram",
+        "dfd",
+        "entity relationship diagram",
+        "erd",
+        "use case",
+        "activity diagram",
+        "sequence diagram",
+        "class diagram",
+        "deployment diagram",
+        "context diagram",
+        "flowmap",
+        "mockup",
+        "rancangan antarmuka",
+        "blackbox",
+        "whitebox",
+        "laporan magang",
+        "logsheet magang",
+    ]
+    return any(k in s for k in artifact_keywords)
+
+
 def _looks_like_tahapan(item: str) -> bool:
     """
-    Poin 3: Heuristik untuk membedakan tahapan/langkah eksplisit
+    Heuristik untuk membedakan tahapan/langkah eksplisit
     dari karakteristik/kelebihan/deskripsi umum suatu metode.
 
     - True  jika mengandung stage-keyword  → jelas tahapan
     - False jika mengandung characteristic-keyword tanpa stage-keyword → bukan tahapan
     - Default True (konservatif, biarkan lewat jika ambigu)
+
+    Tahap 4.1:
+    - artefak desain/diagram HARUS ditolak
+    - karakteristik metode HARUS ditolak
+    - item ambigu tidak lagi dibiarkan lolos terlalu longgar
     """
     s = " ".join((item or "").split()).strip().lower()
     if not s or len(s) < 4:
+        return False
+
+    # Guard 0: artefak desain / diagram / judul gambar bukan langkah.
+    if _is_non_step_artifact_item(s):
+        return False
+
+    # Guard 1: judul Gambar/Tabel juga bukan langkah.
+    if re.search(r"^\s*(gambar|tabel)\s+\d+\.\d+\b", s, flags=re.IGNORECASE):
         return False
 
     # Kata kunci yang khas muncul dalam nama/deskripsi tahapan proses pengembangan
@@ -753,7 +803,7 @@ def _looks_like_tahapan(item: str) -> bool:
     if any(k in s for k in _STAGE_KWS):
         return True
 
-    # Kata kunci yang khas muncul pada deskripsi karakteristik/kelebihan (bukan tahapan)
+    # Kata kunci karakteristik/kelebihan (bukan tahapan)
     _CHARACTERISTIC_KWS = [
         "singkat", "cepat", "fleksibel", "adaptif", "incremental",
         "iteratif", "efisien", "mudah", "sederhana", "ringkas",
@@ -762,8 +812,9 @@ def _looks_like_tahapan(item: str) -> bool:
     if any(k in s for k in _CHARACTERISTIC_KWS):
         return False
 
-    # Default: konservatif → anggap valid
-    return True
+    # Default 4.1:
+    # lebih ketat daripada Tahap 4 - item ambigu tidak otomatis lolos.
+    return False
 
 
 def _extract_steps_from_text(text: str, max_items: int = 5) -> List[str]:
@@ -785,7 +836,10 @@ def _extract_steps_from_text(text: str, max_items: int = 5) -> List[str]:
             if ln2:
                 enum.append(ln2)
     if len(enum) >= 2:
-        return enum[:max_items]
+        validated_enum = [p for p in enum if _looks_like_tahapan(p)]
+        if len(validated_enum) >= 2:
+            return validated_enum[:max_items]
+        return []
 
     # 2) daftar setelah connector (lebih konservatif)
     m = re.search(
@@ -901,6 +955,763 @@ def _partial_steps_note(*, is_comparison: bool = False) -> str:
     if is_comparison:
         return base + " Perbedaannya dengan metode lain hanya bisa dijelaskan secara parsial."
     return base
+
+
+def _single_target_doc_label(steps_meta: Dict[str, Any]) -> str:
+    return str(
+        (steps_meta or {}).get("target_doc_source_file")
+        or (steps_meta or {}).get("target_doc_id")
+        or "dokumen target"
+    ).strip() or "dokumen target"
+
+
+def _single_target_steps_ambiguity_answer(
+    *,
+    method_label: str,
+    steps_meta: Dict[str, Any],
+    used_ctx: int,
+) -> str:
+    doc_bits = [
+        str(x).strip()
+        for x in ((steps_meta or {}).get("ambiguous_candidate_doc_ids") or [])
+        if str(x).strip()
+    ]
+    doc_text = ", ".join(doc_bits[:3]) if doc_bits else "lebih dari satu dokumen kandidat"
+
+    # Tahap 4.1:
+    # sengaja TANPA [CTX n], karena status ambiguity berasal dari owner-disambiguation,
+    # bukan dari satu potongan konteks final tertentu.
+    return (
+        f"Jawaban: Ada lebih dari satu dokumen kandidat yang menggunakan metode {method_label}, "
+        "sehingga langkah-langkah lengkapnya belum bisa dipastikan untuk satu skripsi target.\n"
+        "Bukti:\n"
+        f"- Kandidat dokumen owner yang terdeteksi: {doc_text}"
+    )
+
+
+def _single_target_steps_unresolved_owner_answer(
+    *,
+    method_label: str,
+    steps_meta: Dict[str, Any],
+) -> str:
+    doc_bits = [
+        str(x).strip()
+        for x in ((steps_meta or {}).get("ambiguous_candidate_doc_ids") or [])
+        if str(x).strip()
+    ]
+    doc_text = ", ".join(doc_bits[:3]) if doc_bits else "belum ada dokumen owner tunggal yang terkonfirmasi"
+
+    return (
+        f"Jawaban: Dokumen skripsi target untuk metode {method_label} belum bisa dipastikan secara tunggal, "
+        "sehingga langkah-langkah lengkapnya belum dapat dijabarkan dengan aman.\n"
+        "Bukti:\n"
+        f"- Hasil disambiguasi owner document belum menghasilkan satu dokumen target yang tegas: {doc_text}"
+    )
+
+
+def _single_target_steps_status(steps_meta: Optional[Dict[str, Any]]) -> str:
+    return str((steps_meta or {}).get("status", "") or "").strip().lower()
+
+
+def _is_single_target_steps_route(
+    intent_plan: Optional[Dict[str, Any]],
+    targets: Sequence[str],
+) -> bool:
+    primary_intent = str((intent_plan or {}).get("primary_intent", "") or "").strip().lower()
+    clean_targets = [str(x).strip() for x in (targets or []) if str(x).strip()]
+    return primary_intent == "single_target_steps" and len(clean_targets) == 1
+
+
+def _should_force_single_target_steps_safe_answer(
+    intent_plan: Optional[Dict[str, Any]],
+    targets: Sequence[str],
+    steps_meta: Optional[Dict[str, Any]],
+) -> bool:
+    """
+    Tahap 4.2:
+    Jika planner route sudah memutuskan single_target_steps, dan status runtime
+    sudah mengatakan ambiguity / unresolved owner doc, maka generator HARUS
+    mengembalikan safe answer. tidak boleh lagi bergantung pada q_intent heuristik.
+    """
+    if not _is_single_target_steps_route(intent_plan, targets):
+        return False
+
+    status = _single_target_steps_status(steps_meta)
+    return status in {"ambiguous_owner_docs", "unresolved_owner_doc"}
+
+
+def _single_target_steps_partial_answer(
+    *,
+    method_label: str,
+    doc_label: str,
+    support_ctx: Optional[int],
+    steps_ctx: Optional[int],
+    used_ctx: int,
+) -> str:
+    jawaban = (
+        f"Jawaban: Pada dokumen {doc_label}, metode {method_label} memang terkonfirmasi digunakan, "
+        "tetapi langkah-langkah lengkapnya tidak tampil secara eksplisit pada potongan konteks yang tersedia."
+    )
+
+    bukti_lines: List[str] = []
+
+    ref1 = support_ctx or steps_ctx
+    if ref1 is not None:
+        bukti_lines.append(
+            f"- Pada dokumen {doc_label}, metode {method_label} terkonfirmasi digunakan dalam penelitian [CTX {ref1}]"
+        )
+
+    if steps_ctx is not None:
+        bukti_lines.append(
+            f"- Potongan konteks hanya menyebut adanya tahapan/alur {method_label}, tetapi rincian langkah lengkapnya tidak tampil pada potongan yang tersedia [CTX {steps_ctx}]"
+        )
+
+    if not bukti_lines and used_ctx > 0:
+        bukti_lines.append(
+            f"- Konteks final tidak memuat daftar langkah eksplisit {method_label} [CTX 1]"
+        )
+
+    if not bukti_lines:
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    return jawaban + "\nBukti:\n" + "\n".join(bukti_lines)
+
+
+def _deterministic_single_target_steps_answer(
+    *,
+    question: str,
+    targets: List[str],
+    contexts: List[str],
+    used_ctx: int,
+    max_bullets: int,
+    steps_meta: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Jalur deterministik Tahap 4.2 untuk query steps satu target.
+
+    Prinsip:
+    - jika owner doc ambigu / unresolved -> safe answer HARUS menang
+    - jika langkah eksplisit yang VALID ada -> ekstrak dan tampilkan
+    - jika metode ada tapi langkah tidak eksplisit -> partial answer yang jujur
+    - jangan pakai artefak diagram/desain sebagai langkah
+    """
+    if len(targets) != 1:
+        return ""
+
+    meta = dict(steps_meta or {})
+    method = targets[0]
+    method_label = _nice_method(method)
+    status = _single_target_steps_status(meta)
+    doc_label = _single_target_doc_label(meta)
+
+    # Tahap 4.2:
+    # Safe answer untuk ambiguity/unresolved owner doc TIDAK boleh bergantung
+    # pada used_ctx atau contexts final.
+    if status == "ambiguous_owner_docs":
+        return _single_target_steps_ambiguity_answer(
+            method_label=method_label,
+            steps_meta=meta,
+            used_ctx=used_ctx,
+        )
+
+    if status == "unresolved_owner_doc":
+        return _single_target_steps_unresolved_owner_answer(
+            method_label=method_label,
+            steps_meta=meta,
+        )
+
+    if used_ctx <= 0 or not contexts:
+        return ""
+
+    support_ctx_nums = [
+        int(x)
+        for x in (meta.get("method_support_ctx_nums") or [])
+        if str(x).strip().isdigit()
+    ]
+    explicit_steps_ctx_nums = [
+        int(x)
+        for x in (meta.get("explicit_steps_ctx_nums") or [])
+        if str(x).strip().isdigit()
+    ]
+    extractable_steps_ctx_nums = [
+        int(x)
+        for x in (meta.get("extractable_steps_ctx_nums") or [])
+        if str(x).strip().isdigit()
+    ]
+
+    max_items = int(max(2, min(_as_int(meta.get("max_steps"), 5), 6)))
+
+    # Tahap 4.1:
+    # hanya percaya ke extractable_steps_ctx_nums untuk numbered list final.
+    extracted_steps = (
+        _extract_steps_from_ctx_candidates(
+            contexts,
+            extractable_steps_ctx_nums,
+            max_items=max_items,
+        )
+        if extractable_steps_ctx_nums
+        else []
+    )
+
+    if status == "steps_found" and len(extracted_steps) >= 2:
+        jaw_lines: List[str] = [
+            f"Jawaban: Pada dokumen {doc_label}, langkah-langkah {method_label} yang tampil eksplisit adalah:"
+        ]
+        for i, step in enumerate(extracted_steps[:max_items], start=1):
+            jaw_lines.append(f"{i}. {step}")
+
+        bukti_lines: List[str] = []
+        refs = extractable_steps_ctx_nums[: max(1, min(max_bullets, 2))]
+        for ctx_i in refs:
+            items = _extract_steps_from_text(contexts[ctx_i - 1] or "", max_items=max_items)
+            if items:
+                joined = "; ".join(items[:max_items])
+                bukti_lines.append(
+                    f"- Potongan konteks menjabarkan langkah/tahapan {method_label}: {joined} [CTX {ctx_i}]"
+                )
+            else:
+                bukti_lines.append(
+                    f"- Potongan konteks mendukung keberadaan langkah/tahapan {method_label} [CTX {ctx_i}]"
+                )
+
+        if not bukti_lines:
+            bukti_lines.append(
+                f"- Langkah/tahapan {method_label} tampil eksplisit pada dokumen {doc_label} [CTX 1]"
+            )
+
+        return "\n".join(jaw_lines) + "\nBukti:\n" + "\n".join(bukti_lines[:max_bullets])
+
+    if status == "method_not_found":
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    support_ref = support_ctx_nums[0] if support_ctx_nums else None
+    steps_ref = (
+        extractable_steps_ctx_nums[0]
+        if extractable_steps_ctx_nums
+        else (
+            explicit_steps_ctx_nums[0]
+            if explicit_steps_ctx_nums
+            else support_ref
+        )
+    )
+
+    if support_ref is None and steps_ref is None:
+        return "Jawaban: Tidak ditemukan pada dokumen.\nBukti: -"
+
+    return _single_target_steps_partial_answer(
+        method_label=method_label,
+        doc_label=doc_label,
+        support_ctx=support_ref,
+        steps_ctx=steps_ref,
+        used_ctx=used_ctx,
+    )
+
+
+# =========================
+# Method comparison formatter (Tahap 5)
+# =========================
+
+_COMPARISON_NOISE_PATTERNS = [
+    r"\bpenelitian\s+terdahulu\b",
+    r"\bstudi\s+terdahulu\b",
+    r"\bperbedaan\s+skripsi\b",
+    r"\bno\s+penulis\b",
+    r"\bjudul\b.*\btahun\b",
+    r"\bhasil\s+penelitian\b",
+]
+
+_COMPARISON_USAGE_CUES = [
+    r"\bdigunakan\b",
+    r"\bmenggunakan\b",
+    r"\bmenerapkan\b",
+    r"\bpengembangan\s+sistem\b",
+    r"\bpenelitian\s+ini\b",
+]
+
+_COMPARISON_REASON_CUES = [
+    r"\bkarena\b",
+    r"\bkelebihan\b",
+    r"\bmemungkinkan\b",
+    r"\bfleksibel\b",
+    r"\bcepat\b",
+    r"\bincremental\b",
+    r"\befektif\b",
+    r"\bsesuai\s+kebutuhan\b",
+]
+
+_COMPARISON_PROCESS_CUES = [
+    r"\btahapan?\b",
+    r"\blangkah(?:-langkah)?\b",
+    r"\bplanning\b",
+    r"\bdesign\b",
+    r"\bcoding\b",
+    r"\btesting\b",
+    r"\bprototype\b",
+    r"\bevaluasi\b",
+]
+
+_COMPARISON_STYLE_CUES: Dict[str, List[str]] = {
+    "RAD": [
+        r"\bcepat\b",
+        r"\bfleksibel\b",
+        r"\bincremental\b",
+        r"\bwaktu\s+pengembangan\b",
+    ],
+    "PROTOTYPING": [
+        r"\bprototype\b",
+        r"\bprototipe\b",
+        r"\bevaluasi\b",
+        r"\bkebutuhan\s+pengguna\b",
+        r"\bsesuai\s+kebutuhan\b",
+    ],
+}
+
+
+def _looks_like_comparison_noise(text: str) -> bool:
+    t = " ".join((text or "").split()).strip().lower()
+    if not t:
+        return False
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in _COMPARISON_NOISE_PATTERNS)
+
+
+def _comparison_ctx_indices_from_meta(
+    method: str,
+    comparison_meta: Optional[Dict[str, Any]],
+    *,
+    used_ctx: int,
+    max_candidates: int,
+) -> List[int]:
+    """
+    Tahap 5.2:
+    Prioritas CTX untuk comparison:
+    1) per-method unique ctx
+    2) fallback ctx_map_per_method biasa
+    3) shared ctx hanya sebagai pelengkap terakhir
+
+    Tujuan:
+    - comparison evidence tidak terus-menerus bertumpu pada shared CTX yang sama
+    - jika ada CTX unik milik metode tersebut, pakai dulu itu
+    """
+    meta = comparison_meta or {}
+
+    unique_raw = (meta.get("per_method_unique_ctx_map") or {}).get(method, [])
+    ctx_map_raw = (meta.get("ctx_map_per_method") or {}).get(method, [])
+    shared_raw = meta.get("shared_ctx_nums") or []
+
+    ordered_raw: List[Any] = []
+    ordered_raw.extend(unique_raw)
+    ordered_raw.extend(ctx_map_raw)
+    ordered_raw.extend(shared_raw)
+
+    out: List[int] = []
+    for x in ordered_raw:
+        try:
+            idx = int(x)
+        except Exception:
+            continue
+        if not (1 <= idx <= used_ctx):
+            continue
+        if idx in out:
+            continue
+        out.append(idx)
+        if len(out) >= int(max_candidates):
+            break
+
+    return out
+
+
+def _comparison_unique_ctx_count(meta: Optional[Dict[str, Any]]) -> int:
+    try:
+        return int((meta or {}).get("unique_context_count", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _comparison_shared_ctx_nums(meta: Optional[Dict[str, Any]]) -> List[int]:
+    raw = (meta or {}).get("shared_ctx_nums") or []
+    out: List[int] = []
+    for x in raw:
+        try:
+            idx = int(x)
+        except Exception:
+            continue
+        if idx not in out:
+            out.append(idx)
+    return out
+
+
+def _clean_comparison_contrast_line(text: str) -> str:
+    t = " ".join((text or "").split()).strip()
+    if not t:
+        return ""
+    # Tahap 5.1:
+    # jangan biarkan "Perbedaan utama: Perbedaan utama: ..."
+    t = re.sub(r"^(Perbedaan utama:\s*)+", "", t, flags=re.IGNORECASE).strip()
+    return t
+
+
+def _candidate_ctx_indices_for_method_comparison(
+    method: str,
+    contexts: List[str],
+    used_ctx: int,
+    *,
+    max_candidates: int = 2,
+) -> List[int]:
+    pats = _METHOD_MATCH_PATTERNS.get(method, [])
+    if not pats:
+        return []
+
+    scored: List[Tuple[int, int]] = []
+
+    for i, raw in enumerate((contexts or [])[:used_ctx], start=1):
+        text = _strip_doc_header(raw or "")
+        if not text:
+            continue
+
+        if not any(re.search(p, text, flags=re.IGNORECASE) for p in pats):
+            continue
+
+        score = 0
+        score += 4
+
+        if any(re.search(p, text, flags=re.IGNORECASE) for p in _COMPARISON_USAGE_CUES):
+            score += 2
+        if any(re.search(p, text, flags=re.IGNORECASE) for p in _COMPARISON_REASON_CUES):
+            score += 2
+        if any(re.search(p, text, flags=re.IGNORECASE) for p in _COMPARISON_PROCESS_CUES):
+            score += 1
+        if _looks_like_comparison_noise(text):
+            score -= 4
+
+        scored.append((score, i))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out: List[int] = []
+    for score, idx in scored:
+        if score < 1:
+            continue
+        out.append(idx)
+        if len(out) >= int(max_candidates):
+            break
+    return out
+
+
+def _extract_method_comparison_signals(
+    method: str,
+    contexts: List[str],
+    ctx_indices: List[int],
+) -> Dict[str, Any]:
+    signals: Dict[str, Any] = {
+        "usage": None,     # Tuple[idx, snippet]
+        "reason": None,    # Tuple[idx, snippet]
+        "process": None,   # Tuple[idx, snippet]
+        "best": None,      # Tuple[idx, snippet]
+        "style_tags": [],
+    }
+
+    seen_tags: set[str] = set()
+
+    for idx in ctx_indices:
+        if not (1 <= idx <= len(contexts)):
+            continue
+
+        raw = _strip_doc_header(contexts[idx - 1] or "")
+        low = raw.lower()
+
+        snippet = _quote_snippet(
+            raw,
+            _METHOD_MATCH_PATTERNS.get(method, []),
+            max_len=220,
+        )
+
+        if snippet and signals["best"] is None:
+            signals["best"] = (idx, snippet)
+
+        if (
+            signals["usage"] is None
+            and any(re.search(p, low, flags=re.IGNORECASE) for p in _COMPARISON_USAGE_CUES)
+        ):
+            signals["usage"] = (idx, snippet)
+
+        if (
+            signals["reason"] is None
+            and any(re.search(p, low, flags=re.IGNORECASE) for p in _COMPARISON_REASON_CUES)
+        ):
+            signals["reason"] = (idx, snippet)
+
+        if (
+            signals["process"] is None
+            and (
+                any(re.search(p, low, flags=re.IGNORECASE) for p in _COMPARISON_PROCESS_CUES)
+                or _has_steps_signal_local(raw)
+            )
+        ):
+            signals["process"] = (idx, snippet)
+
+        for pat in _COMPARISON_STYLE_CUES.get(method, []):
+            if re.search(pat, low, flags=re.IGNORECASE):
+                sig = str(pat)
+                if sig not in seen_tags:
+                    seen_tags.add(sig)
+                    signals["style_tags"].append(sig)
+
+    return signals
+
+
+def _method_comparison_summary_line(
+    method: str,
+    *,
+    signals: Dict[str, Any],
+    weak: bool = False,
+) -> str:
+    lab = _nice_method(method)
+
+    if method == "RAD":
+        if signals.get("style_tags"):
+            return (
+                f"{lab}: Pada konteks final, {lab} ditonjolkan sebagai metode yang "
+                "mendukung pengembangan sistem yang cepat/fleksibel."
+            )
+    if method == "PROTOTYPING":
+        if signals.get("style_tags"):
+            return (
+                f"{lab}: Pada konteks final, {lab} ditonjolkan melalui pembuatan "
+                "serta evaluasi prototipe sesuai kebutuhan pengguna."
+            )
+
+    if signals.get("usage"):
+        return f"{lab}: {lab} terkonfirmasi digunakan dalam penelitian, tetapi detail pembeda yang eksplisit masih terbatas."
+
+    if weak:
+        return f"{lab}: Metode ini hanya muncul secara lemah pada konteks final, sehingga pembeda spesifiknya belum kuat."
+
+    return f"{lab}: Tidak ditemukan pembeda yang cukup jelas pada konteks final."
+
+
+def _build_comparison_contrast_line(
+    *,
+    left_method: str,
+    right_method: str,
+    left_signals: Dict[str, Any],
+    right_signals: Dict[str, Any],
+) -> str:
+    if left_method == "RAD" and right_method == "PROTOTYPING":
+        if left_signals.get("style_tags") and right_signals.get("style_tags"):
+            return (
+                "RAD pada konteks ini lebih ditekankan pada kecepatan/fleksibilitas "
+                "pengembangan, sedangkan Prototyping lebih ditekankan pada "
+                "pembuatan dan evaluasi purwarupa sesuai kebutuhan pengguna."
+            )
+
+    if left_method == "PROTOTYPING" and right_method == "RAD":
+        if left_signals.get("style_tags") and right_signals.get("style_tags"):
+            return (
+                "Prototyping pada konteks ini lebih ditekankan pada pembuatan dan "
+                "evaluasi purwarupa sesuai kebutuhan pengguna, sedangkan RAD lebih "
+                "ditekankan pada kecepatan/fleksibilitas pengembangan."
+            )
+
+    return ""
+
+
+def _method_comparison_bukti_lines(
+    method: str,
+    signals: Dict[str, Any],
+    *,
+    preferred_ctx_nums: Optional[List[int]] = None,
+) -> List[str]:
+    lab = _nice_method(method)
+    entries: List[Tuple[int, str]] = []
+
+    # Kumpulkan semua kandidat line dulu
+    for key in ("best", "usage", "reason", "process"):
+        val = signals.get(key)
+        if not val:
+            continue
+        idx, snippet = val
+        if not snippet:
+            continue
+        entries.append((int(idx), f"- ({lab}) {snippet} [CTX {idx}]"))
+
+    # Dedupe preserve order awal
+    dedup_entries: List[Tuple[int, str]] = []
+    seen_sig: set[str] = set()
+    for idx, ln in entries:
+        sig = re.sub(r"\s+", " ", ln.strip().lower())
+        if sig in seen_sig:
+            continue
+        seen_sig.add(sig)
+        dedup_entries.append((idx, ln))
+
+    # Tahap 5.2:
+    # Urutkan agar CTX yang diprioritaskan (terutama unique ctx) muncul lebih dulu.
+    pref = [int(x) for x in (preferred_ctx_nums or []) if str(x).strip().isdigit()]
+
+    def _sort_key(item: Tuple[int, str]) -> Tuple[int, int, int]:
+        idx, ln = item
+        if idx in pref:
+            return (0, pref.index(idx), idx)
+        return (1, 9999, idx)
+
+    dedup_entries.sort(key=_sort_key)
+
+    return [ln for _, ln in dedup_entries]
+
+
+def _deterministic_method_comparison_answer(
+    *,
+    question: str,
+    targets: List[str],
+    contexts: List[str],
+    used_ctx: int,
+    max_bullets: int,
+    comparison_meta: Optional[Dict[str, Any]] = None,
+) -> str:
+    if used_ctx <= 0 or not contexts or len(targets) < 2:
+        return ""
+
+    meta = dict(comparison_meta or {})
+    supported = [str(x).strip() for x in (meta.get("supported_methods") or []) if str(x).strip()]
+    weak = [str(x).strip() for x in (meta.get("weak_methods") or []) if str(x).strip()]
+    comparison_status = str(meta.get("comparison_status", "") or "").strip().lower()
+
+    all_present = supported + weak
+    if len(all_present) < 2:
+        return ""
+
+    signals_by_method: Dict[str, Dict[str, Any]] = {}
+    for m in targets:
+        idxs = _comparison_ctx_indices_from_meta(
+            m,
+            meta,
+            used_ctx=used_ctx,
+            max_candidates=2,
+        )
+        if not idxs:
+            idxs = _candidate_ctx_indices_for_method_comparison(
+                m,
+                contexts,
+                used_ctx,
+                max_candidates=2,
+            )
+        signals_by_method[m] = _extract_method_comparison_signals(m, contexts, idxs)
+
+    unique_ctx_count = _comparison_unique_ctx_count(meta)
+    shared_ctx_nums = _comparison_shared_ctx_nums(meta)
+
+    balanced = bool(comparison_status == "balanced_comparison")
+    if balanced:
+        jaw_lines: List[str] = [
+            f"Jawaban: Berdasarkan konteks final, perbedaan utama {_nice_method(targets[0])} dan {_nice_method(targets[1])} yang digunakan pada dokumen adalah sebagai berikut:"
+        ]
+    else:
+        jaw_lines = [
+            f"Jawaban: Perbandingan {_nice_method(targets[0])} dan {_nice_method(targets[1])} hanya dapat dijelaskan secara parsial dari konteks final yang tersedia."
+        ]
+
+    for m in targets[: max(2, min(len(targets), 3))]:
+        jaw_lines.append(
+            _method_comparison_summary_line(
+                m,
+                signals=signals_by_method.get(m, {}),
+                weak=(m in weak),
+            )
+        )
+
+    contrast_line = _clean_comparison_contrast_line(
+        _build_comparison_contrast_line(
+            left_method=targets[0],
+            right_method=targets[1],
+            left_signals=signals_by_method.get(targets[0], {}),
+            right_signals=signals_by_method.get(targets[1], {}),
+        )
+    )
+    if contrast_line:
+        jaw_lines.append(f"Perbedaan utama: {contrast_line}")
+
+    # Tahap 5.1:
+    # Jika comparison belum balanced dan evidence masih banyak reuse CTX yang sama,
+    # tambahkan note jujur agar output tidak terkesan terlalu yakin.
+    if (not balanced) and (unique_ctx_count <= 1 or bool(shared_ctx_nums)):
+        if shared_ctx_nums:
+            ctx_note = (
+                " dan sebagian bukti masih bertumpu pada CTX yang sama"
+            )
+        else:
+            ctx_note = ""
+
+        jaw_lines.append(
+            "Catatan: Bukti pembanding yang tersedia masih terbatas"
+            f"{ctx_note}, sehingga perbedaan lengkapnya belum bisa ditegaskan secara kuat."
+        )
+
+    bukti_lines: List[str] = []
+    seen_line: set[str] = set()
+    seen_ctx: set[int] = set()
+
+    # Prefer bukti dari CTX yang berbeda antar metode lebih dulu
+    for m in targets[: max(2, min(len(targets), 3))]:
+        preferred_ctx_nums = _comparison_ctx_indices_from_meta(
+            m,
+            meta,
+            used_ctx=used_ctx,
+            max_candidates=2,
+        )
+
+        for ln in _method_comparison_bukti_lines(
+            m,
+            signals_by_method.get(m, {}),
+            preferred_ctx_nums=preferred_ctx_nums,
+        ):
+            sig = re.sub(r"\s+", " ", ln.strip().lower())
+            if sig in seen_line:
+                continue
+
+            ctx_nums = _extract_ctx_nums(ln)
+            ctx_num = ctx_nums[0] if ctx_nums else None
+
+            if ctx_num is not None and ctx_num in seen_ctx:
+                continue
+
+            seen_line.add(sig)
+            if ctx_num is not None:
+                seen_ctx.add(ctx_num)
+            bukti_lines.append(ln)
+
+            if len(bukti_lines) >= max(1, min(max_bullets, 5)):
+                break
+        if len(bukti_lines) >= max(1, min(max_bullets, 5)):
+            break
+
+    # Fallback kedua: kalau belum cukup, baru izinkan reuse CTX yang sama
+    if len(bukti_lines) < max(1, min(max_bullets, 5)):
+        for m in targets[: max(2, min(len(targets), 3))]:
+            preferred_ctx_nums = _comparison_ctx_indices_from_meta(
+                m,
+                meta,
+                used_ctx=used_ctx,
+                max_candidates=2,
+            )
+
+            for ln in _method_comparison_bukti_lines(
+                m,
+                signals_by_method.get(m, {}),
+                preferred_ctx_nums=preferred_ctx_nums,
+            ):
+                sig = re.sub(r"\s+", " ", ln.strip().lower())
+                if sig in seen_line:
+                    continue
+                seen_line.add(sig)
+                bukti_lines.append(ln)
+                if len(bukti_lines) >= max(1, min(max_bullets, 5)):
+                    break
+            if len(bukti_lines) >= max(1, min(max_bullets, 5)):
+                break
+
+    if not bukti_lines:
+        return ""
+
+    return "\n".join(jaw_lines).strip() + "\nBukti:\n" + "\n".join(bukti_lines)
 
 
 def _deterministic_steps_answer(
@@ -2611,10 +3422,6 @@ def _extractive_fallback_from_contexts(
         "prosedur",
     ]
 
-    def _strip_doc_header(x: str) -> str:
-        # hapus "DOC: ...\n" supaya snippet lebih bersih
-        return re.sub(r"(?im)^DOC:\s.*\n", "", (x or "")).strip()
-
     def _has_steps_signal_local(x: str) -> bool:
         t = (x or "").lower()
         # sinyal eksplisit
@@ -2724,6 +3531,9 @@ def generate_answer(
     force_per_method: bool = False,
     per_method_bullets: int = 2,
     max_total_bullets: int = 6,
+    intent_plan: Optional[Dict[str, Any]] = None,
+    single_target_steps_meta: Optional[Dict[str, Any]] = None,
+    method_comparison_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Generate jawaban berbasis konteks (RAG) dengan aturan:
@@ -2752,22 +3562,40 @@ def generate_answer(
         contexts, max_ctx=max_ctx, max_chars_per_ctx=max_chars_per_ctx
     )
 
-    # intent hint agar LLM tidak menganggap "tahapan" sebagai "metode"
+    # intent hint agar LLM generator mengikuti planner baru terlebih dahulu,
+    # lalu fallback ke heuristic lama jika planner belum dikirim.
     ql = (question or "").lower()
-    is_steps = bool(re.search(r"\b(tahap|tahapan)\w*\b|\b(langkah|alur|prosedur)\w*\b", ql))
+    plan = dict(intent_plan or {})
+    primary_intent = str(plan.get("primary_intent", "") or "").strip().lower()
+
+    is_steps = bool(
+        plan.get("is_steps_query")
+        if "is_steps_query" in plan
+        else re.search(r"\b(tahap|tahapan)\w*\b|\b(langkah|alur|prosedur)\w*\b", ql)
+    )
     is_method_list = bool(re.search(r"\bmetode\b.*\bapa\s+saja\b|\bmetode\s+apa\s+saja\b", ql))
 
-    if is_steps:
+    if primary_intent == "single_target_steps":
+        q_intent = "TAHAP"
+    elif primary_intent == "method_identification":
+        q_intent = "METODE"
+    elif primary_intent == "method_explanation":
+        q_intent = "METHOD_EXPLANATION"
+    elif primary_intent == "method_comparison":
+        q_intent = "COMPARISON"
+    elif primary_intent in {"doc_count_list", "doc_listing"}:
+        q_intent = "DOC_LIST"
+    elif is_steps:
         q_intent = "TAHAP"
     elif re.search(r"\b(metode|model)\b", ql):
         q_intent = "METODE"
     else:
         q_intent = "UMUM"
 
-    targets = [m for m in (target_methods or []) if m]
+    targets = [m for m in (target_methods or plan.get("target_methods") or []) if m]
     multi_method_mode = bool(force_per_method and len(targets) >= 2)
 
-    support_relaxed = bool(used_ctx > 0 and q_intent in {"TAHAP", "METODE"} and len(targets) > 0)
+    support_relaxed = bool(used_ctx > 0 and q_intent != "UMUM" and len(targets) > 0)
 
     # ===== fallback targets untuk deterministic =====
     # Kalau app tidak mengirim target_methods (targets kosong), fallback ke daftar metode yang dikenal.
@@ -2796,6 +3624,14 @@ def generate_answer(
     out = ""
 
     det_on = _get_cfg(cfg, ["generation", "deterministic_method_answer"], True)
+
+    # Tahap 4.2:
+    # planner route harus bisa mengalahkan q_intent heuristik lama untuk case
+    # single_target_steps yang bersifat compound (mis. list + steps).
+    single_target_steps_route = _is_single_target_steps_route(intent_plan, targets)
+
+    # Jalur deterministic method answer sengaja HANYA untuk method_identification.
+    # method_explanation tidak boleh jatuh ke sini, agar tidak direduksi menjadi identifikasi singkat.
     if bool(det_on) and used_ctx > 0 and q_intent == "METODE":
         det = _deterministic_method_answer(
             question=question,
@@ -2806,6 +3642,63 @@ def generate_answer(
         )
         if det:
             out = det
+
+    # ===== Tahap 4.2: HARD SAFE OVERRIDE untuk single_target_steps =====
+    # Jika meta runtime sudah menyatakan ambiguous / unresolved owner doc,
+    # generator HARUS tunduk pada status ini dan TIDAK boleh jatuh ke LLM generik.
+    if (not out) and _should_force_single_target_steps_safe_answer(
+        intent_plan,
+        targets,
+        single_target_steps_meta,
+    ):
+        det_single_steps = _deterministic_single_target_steps_answer(
+            question=question,
+            targets=targets,
+            contexts=contexts,
+            used_ctx=used_ctx,
+            max_bullets=max_bullets,
+            steps_meta=single_target_steps_meta,
+        )
+        if det_single_steps:
+            out = det_single_steps
+
+    # ===== Tahap 4.2: deterministic handler untuk single_target_steps =====
+    # Route planner lebih dipercaya daripada q_intent heuristik.
+    if (not out) and used_ctx > 0 and (
+        single_target_steps_route or (q_intent == "TAHAP" and len(targets) == 1)
+    ):
+        det_single_steps = _deterministic_single_target_steps_answer(
+            question=question,
+            targets=targets,
+            contexts=contexts,
+            used_ctx=used_ctx,
+            max_bullets=max_bullets,
+            steps_meta=single_target_steps_meta,
+        )
+        if det_single_steps:
+            out = det_single_steps
+
+    # ===== Tahap 5: deterministic formatter untuk COMPARISON =====
+    det_cmp_on = _get_cfg(cfg, ["comparison_formatter", "enabled"], True)
+    comparison_route = str((intent_plan or {}).get("primary_intent", "") or "").strip().lower() == "method_comparison"
+
+    if (
+        (not out)
+        and bool(det_cmp_on)
+        and used_ctx > 0
+        and comparison_route
+        and len(targets) >= 2
+    ):
+        det_cmp = _deterministic_method_comparison_answer(
+            question=question,
+            targets=targets,
+            contexts=contexts,
+            used_ctx=used_ctx,
+            max_bullets=max_bullets,
+            comparison_meta=method_comparison_meta,
+        )
+        if det_cmp:
+            out = det_cmp
 
     # ===== Stabilizer: deterministic untuk pertanyaan TAHAP + multi-metode =====
     det_steps_on = _get_cfg(cfg, ["generation", "deterministic_steps_answer"], False)
@@ -2844,7 +3737,33 @@ def generate_answer(
     missing_str = ", ".join([_nice_method(m) for m in missing]) if missing else "-"
 
     # ===== Prompting =====
-    if multi_method_mode and (q_intent == "TAHAP"):
+    # ===== Prompting =====
+    if q_intent == "DOC_LIST":
+        format_hint = (
+            "Format jawaban WAJIB (ikuti persis):\n"
+            "Jawaban: <jumlah/daftar dokumen yang relevan secara ringkas dan langsung>\n"
+            "Bukti:\n"
+            "- <dokumen 1 / fakta penting> [CTX n]\n"
+            "- <dokumen 2 / fakta penting> [CTX n]\n"
+        )
+    elif q_intent == "COMPARISON":
+        format_hint = (
+            "Format jawaban WAJIB (ikuti persis):\n"
+            "Jawaban: <ringkasan perbandingan yang langsung menyebut masing-masing metode>\n"
+            "Bukti:\n"
+            f"- ({_nice_method(targets[0]) if targets else 'METODE'}) <fakta pembanding> [CTX n]\n"
+            f"- ({_nice_method(targets[1]) if len(targets) > 1 else 'METODE'}) <fakta pembanding> [CTX n]\n"
+        )
+    elif q_intent == "METHOD_EXPLANATION":
+        format_hint = (
+            "Format jawaban WAJIB (ikuti persis):\n"
+            "Jawaban: <2-3 kalimat yang menjelaskan metode dalam konteks dokumen: metode apa yang dipakai, digunakan untuk apa, dan alasan/karakteristik/tahapan ringkas jika didukung CTX>\n"
+            "Bukti:\n"
+            "- <identifikasi metode / konteks penggunaan> [CTX n]\n"
+            "- <alasan pemilihan / karakteristik / manfaat> [CTX n]\n"
+            "- <tahapan / proses jika eksplisit> [CTX n]\n"
+        )
+    elif multi_method_mode and (q_intent == "TAHAP"):
         format_hint = (
             "Format jawaban WAJIB (ikuti persis):\n"
             "Jawaban:\n"
@@ -2884,6 +3803,9 @@ def generate_answer(
         )
 
     steps_rules = ""
+    explanation_rules = ""
+    list_rules = ""
+    comparison_rules = ""
     if q_intent == "TAHAP":
         steps_rules = (
             "\nKhusus TAHAPAN/LANGKAH:\n"
@@ -2892,6 +3814,39 @@ def generate_answer(
             "- Jika CTX hanya mengonfirmasi metode atau menjelaskan karakteristik umum tanpa daftar/urutan tahapan yang eksplisit,\n"
             "- jangan mengarang langkah. Tulis secara jujur bahwa daftar tahapan eksplisit tidak tampil pada potongan konteks yang tersedia.\n"
             "- Gunakan 'Tidak ditemukan pada dokumen.' hanya jika memang tidak ada dukungan konteks untuk metode tersebut.\n"
+        )
+
+    if q_intent == "METHOD_EXPLANATION":
+        explanation_rules = (
+            "\nKhusus METHOD_EXPLANATION:\n"
+            "- Jangan berhenti pada kalimat 'metode yang digunakan adalah ...'.\n"
+            "- Prioritaskan urutan isi: (1) metode yang dipakai, (2) digunakan untuk apa dalam dokumen, (3) alasan/karakteristik utama, (4) tahapan jika eksplisit.\n"
+            "- Jika CTX memuat frasa sebab/alasan seperti 'digunakan karena', 'dipilih karena', atau menjelaskan karakteristik metode, masukkan itu ke Jawaban.\n"
+            "- Jika CTX memuat tahapan yang eksplisit, sebutkan secara ringkas sebagai bagian penjelasan, bukan sekadar daftar metode.\n"
+            "- Jika CTX hanya cukup untuk identifikasi metode tetapi belum cukup untuk penjelasan kaya, katakan itu secara jujur tanpa mengarang.\n"
+        )
+
+    if q_intent == "DOC_LIST":
+        list_rules = (
+            "\nKhusus DOC_LIST / DOC_COUNT_LIST:\n"
+            "- Pertahankan compound intent user. Jika user meminta jumlah DAN daftar, jawab keduanya.\n"
+            "- Jika user meminta judul dan/atau penulis, tampilkan hanya jika didukung konteks/metadata di CTX.\n"
+            "- Jika CTX memuat baris seperti TITLE:, AUTHOR:, YEAR:, prioritaskan field metadata itu secara eksplisit dalam jawaban.\n"
+            "- Satu CTX ringkasan dokumen mewakili SATU dokumen; jangan menghitung satu dokumen lebih dari sekali.\n"
+            "- Jangan mengubah query list/count menjadi jawaban metode tunggal.\n"
+        )
+
+    if q_intent == "COMPARISON":
+        comparison_rules = (
+            "\nKhusus COMPARISON:\n"
+            "- Jawaban harus benar-benar membandingkan, bukan sekadar mengatakan 'informasi relevan ditemukan'.\n"
+            "- Sebutkan masing-masing metode secara eksplisit pada bagian Jawaban.\n"
+            "- Jika evidence cukup, tampilkan format seperti:\n"
+            "  RAD: ...\n"
+            "  Prototyping: ...\n"
+            "  Perbedaan utama: ...\n"
+            "- Jika evidence salah satu metode lemah/asimetris, katakan secara jujur bahwa perbandingan hanya bisa dijelaskan parsial.\n"
+            "- Dilarang memakai jawaban template generik tanpa kontras eksplisit antar metode.\n"
         )
 
     prompt = ChatPromptTemplate.from_messages(
@@ -2918,6 +3873,9 @@ def generate_answer(
                 "jawab secara TERPISAH per metode (contoh: 'RAD: ...; Prototyping: ...') dengan baris baru (line break).\n"
                 "- Jika pertanyaan bertanya METODE, jangan mengubah daftar tahapan menjadi 'metode'.\n"
                 f"{steps_rules}"
+                f"{explanation_rules}"
+                f"{list_rules}"
+                f"{comparison_rules}"
                 "Khusus kasus (multi-metode):\n"
                 f"- Target metode: {targets_str}\n"
                 f"- Metode yang (di sisi retrieval) terindikasi tidak punya dukungan konteks: {missing_str}\n"
@@ -3662,6 +4620,486 @@ def build_generation_meta(
         meta["status"] = "ok"
 
     return meta
+
+
+# ============================================================================
+# V3.0d — Post-Hoc Verification (Grounding Gate v1)
+# ----------------------------------------------------------------------------
+# Prinsip:
+# - explainable
+# - rule-based
+# - answer-layer only
+# - tidak memakai rerank_score sebagai confidence
+# - semantic helper hanya hook opsional (belum dipakai di Phase 1A)
+# ============================================================================
+
+_VERIFICATION_SCORE_NAME = "heuristic_support_score"
+
+# Cue untuk menandai jawaban yang tampak supported, tetapi coverage-nya
+# parsial / asimetris / berhati-hati.
+# Penting untuk kasus seperti T02:
+# "RAD disebut, tetapi urutan tahapannya tidak ditampilkan eksplisit."
+_VERIFICATION_CAUTION_PATTERNS = [
+    r"tidak\s+menampilkan[^.\n]{0,80}eksplisit",
+    r"tidak\s+dijelaskan[^.\n]{0,80}eksplisit",
+    r"tidak\s+disebutkan[^.\n]{0,80}eksplisit",
+    r"hanya\s+menyebut",
+    r"belum\s+menjelaskan",
+    r"coverage\s+masih\s+parsial",
+    r"parsial",
+    r"asimetris",
+]
+
+
+def _verification_stub(
+    *,
+    enabled: bool,
+    method: str,
+    semantic_helper_enabled: bool,
+    skipped_reason: Optional[str],
+    explanation: str,
+    used_ctx: int,
+) -> Dict[str, Any]:
+    """
+    Shape object verification yang STABIL untuk semua jalur skipped/N/A.
+    Dipakai agar schema answers.jsonl nantinya konsisten di semua path.
+    """
+    return {
+        "enabled": bool(enabled),
+        "applied": False,
+        "method": method,
+        "label": "skipped",
+        "badge_text": "Verification N/A",
+        "explanation": explanation,
+        "score": None,
+        "score_name": _VERIFICATION_SCORE_NAME,
+        "skipped_reason": skipped_reason,
+        "signals": {
+            "supported_heuristic": False,
+            "format_ok": False,
+            "bukti_ok": False,
+            "citations_present": False,
+            "citations_in_range": False,
+            "grounding_ok": False,
+            "answer_grounding_ok": False,
+            "partial_not_found": False,
+            "coverage_caution": False,
+        },
+        "evidence_summary": {
+            "used_ctx": int(max(0, used_ctx)),
+            "bullet_total": 0,
+            "bullet_with_citation": 0,
+            "bullet_valid_citation": 0,
+            "bullet_grounded": 0,
+            "citation_ratio": 0.0,
+            "grounded_ratio": 0.0,
+            "cited_ctx_nums": [],
+            "cited_chunk_ids": [],
+        },
+        "semantic_helper": {
+            "enabled": bool(semantic_helper_enabled),
+            "used": False,
+            "score": None,
+            "label": None,
+        },
+    }
+
+
+def _valid_ctx_nums(nums: List[int], used_ctx: int) -> List[int]:
+    """
+    Filter + dedupe nomor CTX agar tetap berada pada rentang valid [1..used_ctx].
+    """
+    out: List[int] = []
+    upper = int(max(0, used_ctx))
+    for n in nums or []:
+        try:
+            i = int(n)
+        except Exception:
+            continue
+        if 1 <= i <= upper and i not in out:
+            out.append(i)
+    return out
+
+
+def _ctx_nums_to_chunk_ids(
+    ctx_nums: List[int],
+    used_context_chunk_ids: Optional[List[str]],
+) -> List[str]:
+    """
+    Mapping CTX n -> chunk_id final context yang benar-benar dikirim ke generator.
+    Asumsi urutan used_context_chunk_ids selaras dengan urutan contexts / [CTX n].
+    """
+    ids = used_context_chunk_ids or []
+    out: List[str] = []
+
+    for n in ctx_nums or []:
+        if 1 <= int(n) <= len(ids):
+            cid = str(ids[int(n) - 1] or "").strip()
+            if cid and cid not in out:
+                out.append(cid)
+
+    return out
+
+
+def _has_coverage_caution(answer_text: str) -> bool:
+    """
+    True jika isi Jawaban mengandung cue bahwa coverage jawaban bersifat
+    parsial / asimetris / hati-hati.
+    """
+    head = (_extract_jawaban_text(answer_text) or "").lower()
+    if not head:
+        return False
+
+    return any(
+        re.search(pat, head, flags=re.IGNORECASE)
+        for pat in _VERIFICATION_CAUTION_PATTERNS
+    )
+
+
+def _summarize_bukti_support(
+    *,
+    answer_text: str,
+    contexts: List[str],
+    used_ctx: int,
+    used_context_chunk_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Ringkasan level-bukti:
+    - berapa bullet ada
+    - berapa bullet punya sitasi
+    - berapa sitasi valid
+    - berapa bullet grounded
+    - CTX mana saja yang benar-benar dirujuk
+    - chunk_id mana saja yang terlibat
+
+    Tujuan:
+    - explainable
+    - ringan untuk logging
+    - tidak menyimpan detail per-bullet berlebihan
+    """
+    bullets = _extract_bukti_lines(answer_text)
+    bullet_total = len(bullets)
+
+    bullet_with_citation = 0
+    bullet_valid_citation = 0
+    bullet_grounded = 0
+
+    cited_ctx_nums: List[int] = []
+    cited_chunk_ids: List[str] = []
+
+    for bullet in bullets:
+        raw_ctx_nums = _extract_ctx_nums(bullet)
+        valid_ctx_nums = _valid_ctx_nums(raw_ctx_nums, used_ctx)
+
+        has_citation = len(raw_ctx_nums) > 0
+        citation_valid = bool(raw_ctx_nums) and all(
+            1 <= int(n) <= int(max(0, used_ctx))
+            for n in raw_ctx_nums
+        )
+        grounded = _bullet_grounded(bullet, contexts, used_ctx) if citation_valid else False
+
+        if has_citation:
+            bullet_with_citation += 1
+        if citation_valid:
+            bullet_valid_citation += 1
+        if grounded:
+            bullet_grounded += 1
+
+        for n in valid_ctx_nums:
+            if n not in cited_ctx_nums:
+                cited_ctx_nums.append(n)
+
+        for cid in _ctx_nums_to_chunk_ids(valid_ctx_nums, used_context_chunk_ids):
+            if cid not in cited_chunk_ids:
+                cited_chunk_ids.append(cid)
+
+    citation_ratio = (
+        round(float(bullet_valid_citation / bullet_total), 6)
+        if bullet_total > 0
+        else 0.0
+    )
+    grounded_ratio = (
+        round(float(bullet_grounded / bullet_total), 6)
+        if bullet_total > 0
+        else 0.0
+    )
+
+    return {
+        "used_ctx": int(max(0, used_ctx)),
+        "bullet_total": int(bullet_total),
+        "bullet_with_citation": int(bullet_with_citation),
+        "bullet_valid_citation": int(bullet_valid_citation),
+        "bullet_grounded": int(bullet_grounded),
+        "citation_ratio": float(citation_ratio),
+        "grounded_ratio": float(grounded_ratio),
+        "cited_ctx_nums": cited_ctx_nums,
+        "cited_chunk_ids": cited_chunk_ids,
+    }
+
+
+def _compute_verification_score(
+    *,
+    generator_meta: Dict[str, Any],
+    evidence_summary: Dict[str, Any],
+    coverage_caution: bool,
+) -> float:
+    """
+    Score numerik OPSIONAL / diagnostic only.
+    BUKAN confidence score.
+    BUKAN calibrated probability.
+
+    Label utama tetap diputuskan oleh RULES, bukan angka ini.
+    """
+    gm = generator_meta or {}
+    ev = evidence_summary or {}
+
+    score = 0.0
+    score += 0.10 if bool(gm.get("format_ok")) else 0.0
+    score += 0.10 if bool(gm.get("bukti_ok")) else 0.0
+    score += 0.15 if bool(gm.get("citations_present")) else 0.0
+    score += 0.15 if bool(gm.get("citations_in_range")) else 0.0
+    score += 0.20 * float(ev.get("citation_ratio", 0.0) or 0.0)
+    score += 0.20 * float(ev.get("grounded_ratio", 0.0) or 0.0)
+    score += 0.10 if bool(gm.get("answer_grounding_ok")) else 0.0
+
+    score = max(0.0, min(score, 1.0))
+
+    # Jika coverage memang hati-hati/parsial, cap agar tidak terlihat "terlalu tinggi".
+    if coverage_caution or bool(gm.get("partial_not_found")):
+        score = min(score, 0.79)
+
+    return round(float(score), 6)
+
+
+def _verification_badge_text(label: str) -> str:
+    mapping = {
+        "verified": "Verified",
+        "partial": "Partially Verified",
+        "low": "Low Verification",
+        "not_found": "Verification N/A",
+        "skipped": "Verification N/A",
+    }
+    return mapping.get(str(label or "").strip().lower(), "Verification N/A")
+
+
+def _verification_explanation(
+    *,
+    label: str,
+    generator_meta: Dict[str, Any],
+    evidence_summary: Dict[str, Any],
+    coverage_caution: bool,
+    skipped_reason: Optional[str] = None,
+) -> str:
+    """
+    Explanation singkat yang nanti aman ditampilkan di UI.
+    """
+    gm = generator_meta or {}
+    ev = evidence_summary or {}
+
+    if label == "skipped":
+        if skipped_reason == "disabled_in_config":
+            return "Verification dinonaktifkan pada config aktif."
+        if skipped_reason == "metadata_route_skipped":
+            return "Verification tidak diterapkan pada jalur metadata routing."
+        return "Verification tidak diterapkan pada jalur ini."
+
+    if label == "not_found":
+        return (
+            "Jawaban berada pada jalur canonical not_found; verification "
+            "tidak diberi label positif atau negatif."
+        )
+
+    if label == "verified":
+        return "Bukti tersitasi valid dan klaim utama terdukung oleh CTX final."
+
+    if label == "partial":
+        if coverage_caution or bool(gm.get("partial_not_found")):
+            return "Dukungan konteks ada, tetapi coverage jawaban masih parsial atau asimetris."
+        if not bool(gm.get("answer_grounding_ok")):
+            return "Bukti tersedia, tetapi grounding bagian Jawaban masih parsial."
+        return "Jawaban memiliki dukungan konteks, tetapi belum cukup kuat untuk label verified."
+
+    # LOW
+    if not bool(gm.get("format_ok")) or not bool(gm.get("bukti_ok")):
+        return "Format jawaban atau bagian Bukti belum cukup valid untuk verification yang kuat."
+    if int(ev.get("bullet_total", 0) or 0) == 0:
+        return "Bagian Bukti tidak memuat bullet yang cukup untuk diverifikasi."
+    if not bool(gm.get("citations_present")):
+        return "Jawaban belum menyertakan sitasi CTX yang memadai."
+    if not bool(gm.get("citations_in_range")):
+        return "Sebagian sitasi CTX berada di luar rentang konteks yang valid."
+    if float(ev.get("grounded_ratio", 0.0) or 0.0) <= 0.0:
+        return "Bukti tidak terdukung kuat oleh CTX final yang dirujuk."
+    return "Grounding jawaban terhadap CTX final masih lemah."
+
+
+def build_verification_meta(
+    *,
+    question: str,
+    contexts: List[str],
+    answer_text: str,
+    used_ctx: int,
+    used_context_chunk_ids: Optional[List[str]] = None,
+    generator_meta: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    metadata_route_handled: bool = False,
+) -> Dict[str, Any]:
+    """
+    Public API V3.0d untuk post-hoc verification.
+
+    Fase ini SENGAJA:
+    - rule-based
+    - explainable
+    - bekerja pada answer layer
+    - tidak menggunakan rerank_score sebagai confidence
+    - semantic helper hanya hook (belum dipakai di Phase 1A)
+
+    Output sengaja stabil agar nanti bisa langsung dipakai di:
+    - answers.jsonl
+    - session_state / turn_data
+    - UI badge (Phase 2)
+    """
+    cfg_eff = cfg or {}
+
+    enabled = bool(_get_cfg(cfg_eff, ["verification", "enabled"], False))
+    method = str(
+        _get_cfg(cfg_eff, ["verification", "method"], "grounding_gate_v1")
+        or "grounding_gate_v1"
+    )
+    skip_on_metadata_route = bool(
+        _get_cfg(cfg_eff, ["verification", "skip_on_metadata_route"], True)
+    )
+    semantic_helper_enabled = bool(
+        _get_cfg(cfg_eff, ["verification", "semantic_helper_enabled"], False)
+    )
+
+    used_ctx_eff = int(max(0, min(int(used_ctx or 0), len(contexts or []))))
+
+    # ── Disabled path (legacy-safe) ─────────────────────────────────────────
+    if not enabled:
+        return _verification_stub(
+            enabled=False,
+            method=method,
+            semantic_helper_enabled=semantic_helper_enabled,
+            skipped_reason="disabled_in_config",
+            explanation="Verification dinonaktifkan pada config aktif.",
+            used_ctx=used_ctx_eff,
+        )
+
+    # ── Metadata route path = N/A / skipped ─────────────────────────────────
+    if metadata_route_handled and skip_on_metadata_route:
+        return _verification_stub(
+            enabled=True,
+            method=method,
+            semantic_helper_enabled=semantic_helper_enabled,
+            skipped_reason="metadata_route_skipped",
+            explanation="Verification tidak diterapkan pada jalur metadata routing.",
+            used_ctx=used_ctx_eff,
+        )
+
+    # Jika caller belum memberi generator_meta, bangun fallback minimal di sini.
+    gm = generator_meta or build_generation_meta(
+        question=question,
+        contexts=contexts,
+        answer_text=answer_text,
+        used_ctx=used_ctx_eff,
+        max_bullets=3,
+    )
+
+    evidence_summary = _summarize_bukti_support(
+        answer_text=answer_text,
+        contexts=contexts,
+        used_ctx=used_ctx_eff,
+        used_context_chunk_ids=used_context_chunk_ids,
+    )
+    coverage_caution = _has_coverage_caution(answer_text)
+
+    status = str(gm.get("status", "") or "").strip().lower()
+    label = "low"
+    score: Optional[float] = None
+
+    # ────────────────────────────────────────────────────────────────────────
+    # RULE-BASED LABEL DECISION
+    # ────────────────────────────────────────────────────────────────────────
+    if status == "not_found":
+        label = "not_found"
+
+    elif (not bool(gm.get("format_ok"))) or (not bool(gm.get("bukti_ok"))):
+        label = "low"
+
+    elif used_ctx_eff > 0 and (
+        (not bool(gm.get("citations_present")))
+        or (not bool(gm.get("citations_in_range")))
+    ):
+        label = "low"
+
+    elif int(evidence_summary.get("bullet_total", 0) or 0) <= 0:
+        label = "low"
+
+    elif (
+        float(evidence_summary.get("grounded_ratio", 0.0) or 0.0) >= 0.999999
+        and bool(gm.get("answer_grounding_ok"))
+        and (not coverage_caution)
+        and (not bool(gm.get("partial_not_found")))
+    ):
+        label = "verified"
+
+    elif (
+        float(evidence_summary.get("grounded_ratio", 0.0) or 0.0) >= 0.5
+        and (
+            bool(gm.get("answer_grounding_ok"))
+            or bool(gm.get("citations_in_range"))
+            or bool(gm.get("supported_heuristic"))
+        )
+    ):
+        label = "partial"
+
+    else:
+        label = "low"
+
+    # Score hanya untuk non-skipped & non-not_found.
+    if label not in {"skipped", "not_found"}:
+        score = _compute_verification_score(
+            generator_meta=gm,
+            evidence_summary=evidence_summary,
+            coverage_caution=coverage_caution,
+        )
+
+    return {
+        "enabled": True,
+        "applied": True,
+        "method": method,
+        "label": label,
+        "badge_text": _verification_badge_text(label),
+        "explanation": _verification_explanation(
+            label=label,
+            generator_meta=gm,
+            evidence_summary=evidence_summary,
+            coverage_caution=coverage_caution,
+            skipped_reason=None,
+        ),
+        "score": score,
+        "score_name": _VERIFICATION_SCORE_NAME,
+        "skipped_reason": None,
+        "signals": {
+            "supported_heuristic": bool(gm.get("supported_heuristic")),
+            "format_ok": bool(gm.get("format_ok")),
+            "bukti_ok": bool(gm.get("bukti_ok")),
+            "citations_present": bool(gm.get("citations_present")),
+            "citations_in_range": bool(gm.get("citations_in_range")),
+            "grounding_ok": bool(gm.get("grounding_ok")),
+            "answer_grounding_ok": bool(gm.get("answer_grounding_ok")),
+            "partial_not_found": bool(gm.get("partial_not_found")),
+            "coverage_caution": bool(coverage_caution),
+        },
+        "evidence_summary": evidence_summary,
+        "semantic_helper": {
+            "enabled": bool(semantic_helper_enabled),
+            "used": False,
+            "score": None,
+            "label": None,
+        },
+    }
 
 
 def _format_history_pairs(history_pairs: Sequence[Dict[str, Any]], max_chars: int = 1200) -> str:
