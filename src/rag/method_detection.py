@@ -24,7 +24,8 @@ V3.0b (Konsolidasi):
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Sequence
 
 # =========================
 # Konstanta — single source of truth
@@ -115,6 +116,305 @@ _CITATION_KEYWORDS: List[str] = [
     # ── Bahasa Inggris (dokumen bilingual / query campur) ──
     r"\b(cited|citation|bibliography|references?)\b",
 ]
+
+
+# =========================
+# V3.0d lanjutan — Intent planning
+# =========================
+
+@dataclass
+class IntentPlan:
+    """
+    Planner output untuk answer policy V3.0d lanjutan.
+
+    Catatan desain:
+    - primary_intent = route utama generator/runtime
+    - requested_actions = sub-intent / aksi yang harus dipertahankan
+    - target_methods = metode yang secara eksplisit terdeteksi dari query/history
+    - comparison_targets = alias yang lebih semantik untuk comparison route
+    """
+
+    primary_intent: str = "general_qa"
+    requested_actions: List[str] = field(default_factory=list)
+
+    target_methods: List[str] = field(default_factory=list)
+    comparison_targets: List[str] = field(default_factory=list)
+
+    doc_locked: bool = False
+    allowed_doc_ids: List[str] = field(default_factory=list)
+
+    needs_doc_aggregation: bool = False
+    needs_explanation_expansion: bool = False
+    needs_steps_expansion: bool = False
+
+    is_multi_doc: bool = False
+    is_compound: bool = False
+    is_count_query: bool = False
+    is_list_query: bool = False
+    is_explanation_query: bool = False
+    is_steps_query: bool = False
+    is_comparison_query: bool = False
+
+    requested_fields: List[str] = field(default_factory=list)
+    planner_reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _query_has_any(text: str, patterns: Sequence[str]) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t, flags=re.IGNORECASE) for p in (patterns or []))
+
+
+def is_method_identification_question(q: str) -> bool:
+    """
+    True bila user terutama meminta IDENTIFIKASI nama metode,
+    bukan penjelasan atau tahapan.
+    """
+    ql = (q or "").lower()
+    if not is_method_question(ql):
+        return False
+    if is_steps_question(ql):
+        return False
+    if is_method_explanation_question(ql):
+        return False
+    return bool(
+        re.search(
+            r"\b(metode|model)\b.*\b(apa|apakah)\b|\bapa\b.*\b(metode|model)\b|\bmenggunakan\b.*\bmetode\s+apa\b",
+            ql,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_method_explanation_question(q: str) -> bool:
+    """
+    True bila user meminta PENJELASAN metode dalam konteks dokumen,
+    bukan sekadar nama metodenya.
+    """
+    ql = (q or "").lower()
+    explain_patterns = [
+        r"\bjelaskan\b",
+        r"\bpenjelasan\b",
+        r"\bdigunakan\s+seperti\s+apa\b",
+        r"\bbagaimana\b[^\n]{0,40}\bdigunakan\b",
+        r"\balasan\b[^\n]{0,20}\bmenggunakan\b",
+        r"\bkarakteristik\b",
+        r"\bkonteks\b[^\n]{0,20}\bpenggunaan\b",
+        r"\bterkait\b",
+    ]
+    if not _query_has_any(ql, explain_patterns):
+        return False
+
+    # Query count/list yang kebetulan mengandung
+    # "Jika ada, jelaskan ..." tetap ditangani sebagai compound intent di planner utama.
+    return True
+
+
+def is_count_query(q: str) -> bool:
+    ql = (q or "").lower()
+    return bool(
+        re.search(
+            r"\b(ada\s+berapa|berapa\s+(skripsi|dokumen|file)|jumlah\s+(skripsi|dokumen|file)|adakah)\b",
+            ql,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_listing_query(q: str) -> bool:
+    ql = (q or "").lower()
+    return bool(
+        re.search(
+            r"\b(sebutkan|daftarkan|tampilkan|skripsi\s+yang\s+menggunakan|dokumen\s+yang\s+menggunakan|judul(?:nya)?|penulis(?:nya)?)\b",
+            ql,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_comparison_question(q: str) -> bool:
+    ql = (q or "").lower()
+    if re.search(r"\b(perbedaan|perbandingan|bandingkan|dibandingkan)\b", ql, flags=re.IGNORECASE):
+        return True
+    methods = detect_methods_in_text(ql)
+    return len(methods) >= 2 and bool(
+        re.search(r"\b(vs|versus|dan|&|antara)\b", ql, flags=re.IGNORECASE)
+    )
+
+
+def _prefer_method_explanation_over_listing(
+    *,
+    is_explanation: bool,
+    is_count: bool,
+    is_steps: bool,
+    is_comparison: bool,
+    requested_fields: Sequence[str],
+    methods: Sequence[str],
+) -> bool:
+    """
+    True jika query lebih tepat diperlakukan sebagai single-method explanation daripada doc listing.
+
+    Kasus target:
+    - "Pada skripsi yang menggunakan metode RAD, tolong jelaskan RAD yang digunakan di sana!"
+    - "Pada dokumen yang memakai XP, jelaskan XP yang dipakai di sana!"
+
+    Prinsip:
+    - explanation tunggal harus menang atas listing semu yang hanya muncul
+        karena frasa seperti 'skripsi yang menggunakan ...'
+    - tetapi TIDAK boleh mengambil alih query count/list yang memang eksplisit
+    """
+    if not is_explanation:
+        return False
+    if is_count or is_steps or is_comparison:
+        return False
+    if requested_fields:
+        return False
+
+    method_count = len([m for m in (methods or []) if m])
+    return method_count <= 1
+
+
+def build_intent_plan(
+    query: str,
+    *,
+    history_window: Optional[Sequence[Dict[str, Any]]] = None,
+    doc_focus: Optional[Sequence[str]] = None,
+) -> IntentPlan:
+    """
+    Intent planner sederhana namun eksplisit untuk Tahap 1.
+
+    Scope Tahap 1:
+    - menentukan route utama yang benar
+    - menjaga compound intent agar tidak hilang
+    - belum melakukan doc aggregation / explanation expansion itu sendiri
+    """
+    q = (query or "").strip()
+    ql = q.lower()
+
+    methods = detect_methods_in_text(q)
+    if (not methods) and history_window:
+        # fallback ringan untuk anaphora/steps
+        hist_blob = " ".join(
+            f"{h.get('query', '')} {h.get('answer_preview', '')}"
+            for h in (history_window or [])
+            if isinstance(h, dict)
+        )
+        if is_anaphora_question(q) or is_steps_question(q):
+            methods = detect_methods_in_text(hist_blob)
+
+    methods = list(dict.fromkeys([m for m in methods if m]))
+
+    is_steps = is_steps_question(q)
+    is_comparison = is_comparison_question(q)
+    is_count = is_count_query(q)
+    is_list = is_listing_query(q)
+    is_explanation = is_method_explanation_question(q)
+    is_multi_doc = is_multi_doc_question(q) or bool(
+        re.search(
+            r"\b(beberapa\s+skripsi|di\s+beberapa\s+skripsi|dokumen\s+skripsi\s+yang\s+ada|lintas\s+dokumen)\b",
+            ql,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    requested_fields: List[str] = []
+    if re.search(r"\bjudul(?:nya)?\b", ql, flags=re.IGNORECASE):
+        requested_fields.append("title")
+    if re.search(r"\bpenulis(?:nya)?\b", ql, flags=re.IGNORECASE):
+        requested_fields.append("author")
+
+    actions: List[str] = ["show_evidence"]
+    reasons: List[str] = []
+
+    if is_count:
+        actions.append("count_docs")
+        reasons.append("count_signal")
+    if is_list or requested_fields:
+        actions.append("list_docs")
+        reasons.append("list_signal")
+    if is_explanation:
+        actions.append("explain_method")
+        reasons.append("explanation_signal")
+    if is_steps:
+        actions.append("extract_steps")
+        reasons.append("steps_signal")
+    if is_comparison:
+        actions.append("compare_methods")
+        reasons.append("comparison_signal")
+    if re.search(r"\b(metode|model)\b", ql, flags=re.IGNORECASE):
+        actions.append("identify_method")
+
+    if "title" in requested_fields:
+        actions.append("show_title")
+    if "author" in requested_fields:
+        actions.append("show_author")
+
+    actions = list(dict.fromkeys(actions))
+
+    prefer_explanation_over_listing = _prefer_method_explanation_over_listing(
+        is_explanation=is_explanation,
+        is_count=is_count,
+        is_steps=is_steps,
+        is_comparison=is_comparison,
+        requested_fields=requested_fields,
+        methods=methods,
+    )
+
+    if prefer_explanation_over_listing:
+        reasons.append("explanation_preempts_listing")
+
+    primary_intent = "general_qa"
+    if is_comparison:
+        primary_intent = "method_comparison"
+    elif is_steps and len(methods) <= 1:
+        primary_intent = "single_target_steps"
+    elif is_count and (is_list or requested_fields or is_multi_doc or is_explanation):
+        primary_intent = "doc_count_list"
+    elif prefer_explanation_over_listing:
+        primary_intent = "method_explanation"
+    elif is_list and (is_multi_doc or bool(methods)):
+        primary_intent = "doc_listing"
+    elif is_explanation and bool(methods or is_method_question(q)):
+        primary_intent = "method_explanation"
+    elif is_method_identification_question(q):
+        primary_intent = "method_identification"
+
+    allowed_doc_ids = [str(x).strip() for x in (doc_focus or []) if str(x).strip()]
+    allowed_doc_ids = list(dict.fromkeys(allowed_doc_ids))
+
+    needs_doc_aggregation = primary_intent in {"doc_count_list", "doc_listing"}
+    if primary_intent == "method_explanation" and is_multi_doc:
+        needs_doc_aggregation = True
+
+    # Tahap 4:
+    # single_target_steps yang BELUM doc-locked perlu doc aggregation agar runtime bisa:
+    # - resolve owner doc tunggal, atau
+    # - gagal aman sebagai ambiguous_owner_docs
+    if primary_intent == "single_target_steps" and (not allowed_doc_ids):
+        needs_doc_aggregation = True
+
+    return IntentPlan(
+        primary_intent=primary_intent,
+        requested_actions=actions,
+        target_methods=methods,
+        comparison_targets=(methods[:] if is_comparison else []),
+        doc_locked=bool(allowed_doc_ids),
+        allowed_doc_ids=allowed_doc_ids,
+        needs_doc_aggregation=bool(needs_doc_aggregation),
+        needs_explanation_expansion=bool(primary_intent == "method_explanation"),
+        needs_steps_expansion=bool(primary_intent == "single_target_steps"),
+        is_multi_doc=bool(is_multi_doc),
+        is_compound=bool(len(actions) > 2),
+        is_count_query=bool(is_count),
+        is_list_query=bool(is_list),
+        is_explanation_query=bool(is_explanation),
+        is_steps_query=bool(is_steps),
+        is_comparison_query=bool(is_comparison),
+        requested_fields=requested_fields,
+        planner_reason="; ".join(reasons) if reasons else "fallback_general",
+    )
 
 
 # =========================

@@ -47,6 +47,16 @@ metadata_routing:
   allow_in_eval: false
   doc_catalog_filename: doc_catalog.json
 
+# ── V3.0d lanjutan: Docmeta sidecar (Tahap 6) ──────────────────────────
+docmeta:
+  enabled: true
+
+  # File sidecar hasil normalisasi display metadata.
+  sidecar_filename: "docmeta_sidecar.json"
+
+  # Aktifkan fallback judul aman di runtime walau sidecar belum ada / belum termuat.
+  safe_title_fallback: true
+
 # ── V3.0b: Metadata Self-Querying Filtering ──────────────────────────────────
 self_query:
   # Aktifkan self-querying filtering
@@ -129,6 +139,77 @@ reranker:
   #         bagian inti proposed method yang justru harus diukur kontribusinya di RAGAS.
   # false = matikan reranking saat eval.
   allow_in_eval: true
+
+# ── V3.0d lanjutan: Answer policy / intent planner (Tahap 1) ────────────────
+answer_policy:
+  # Tahap 1: planner intent eksplisit sebelum generation.
+  planner_enabled: true
+
+  # Simpan hasil planner ke answers/retrieval log untuk audit.
+  log_intent_plan: true
+
+  # Mode ini belum dipakai agresif pada Tahap 1,
+  # tetapi disiapkan agar route planner menjadi source of truth saat Tahap 2–3 mulai masuk.
+  strict_planner_routes: true
+
+# ── V3.0d lanjutan: Ownership-aware document aggregation (Tahap 2 & 7) ─────────
+doc_aggregation:
+  # Aktifkan agregasi level dokumen untuk query count/list dan disambiguasi method explanation.
+  enabled: true
+
+  # Simpan object meta Tahap 2 ke retrieval/answers log untuk audit.
+  log_meta: true
+
+  # Untuk method_explanation satu metode yang kandidat dokumennya masih bercampur,
+  # izinkan agregasi dipakai sebagai resolver owner dokumen.
+  allow_for_method_explanation: true
+
+  # Maksimum jumlah dokumen owner yang dikirim ke generator sebagai ringkasan dokumen.
+  max_docs_for_generation: 5
+
+  # Panjang snippet evidensi per dokumen di summary context.
+  max_evidence_chars: 280
+
+# ── V3.0d lanjutan: Method explanation route + explanation expansion (Tahap 3) ──
+method_explanation:
+  # Aktifkan explanation-biased context expansion setelah owner document dipilih.
+  expansion_enabled: true
+
+  # Jumlah query tambahan maksimum untuk memperkaya konteks explanation.
+  max_expansion_queries: 5
+
+  # Jumlah node final explanation maksimum yang dipertahankan untuk generation.
+  max_added_nodes: 4
+
+# ── V3.0d lanjutan: Single-target steps handler (Tahap 4) ───────────────────
+single_target_steps:
+  # Aktifkan steps-biased expansion untuk query tahapan/langkah satu metode.
+  expansion_enabled: true
+
+  # Jumlah query tambahan maksimum untuk memperkaya konteks langkah/tahapan.
+  max_expansion_queries: 6
+
+  # Jumlah node final steps maksimum yang dipertahankan untuk generation.
+  max_added_nodes: 4
+
+  # Batas item langkah yang boleh dirangkum pada jawaban final.
+  max_steps: 5
+
+# ── V3.0d lanjutan: Comparison formatter (Tahap 5) ──────────────────────────
+comparison_formatter:
+  enabled: true
+
+  # Maksimum CTX per metode yang dibawa ke formatter comparison.
+  max_ctx_per_method: 2
+
+  # Maksimum jumlah point contrastive yang akan ditulis.
+  max_points: 3
+
+  # Minimal 2 point contrastive agar comparison dianggap cukup kuat.
+  min_contrast_points: 2
+
+  # Jika evidence dua metode tidak seimbang, jawab partial secara jujur.
+  allow_asymmetric_partial: true
 
 # ── V3.0d: Post-Hoc Verification ────────────────────────────────────────────
 verification:

@@ -214,6 +214,34 @@ def load_doc_catalog(
         return {}, catalog_path
 
 
+def load_docmeta_sidecar(
+    persist_dir: Path,
+    *,
+    filename: str = "docmeta_sidecar.json",
+) -> Tuple[Dict[str, Any], Path]:
+    """
+    Loader additive untuk metadata display sidecar Tahap 6.
+
+    Berbeda dari doc_catalog:
+    - doc_catalog.json = raw metadata / source of truth legacy
+    - docmeta_sidecar.json = metadata display-safe hasil normalisasi
+    """
+    sidecar_path = Path(persist_dir) / filename
+
+    if not sidecar_path.exists():
+        return {}, sidecar_path
+
+    try:
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, sidecar_path
+
+    if not isinstance(data, dict):
+        return {}, sidecar_path
+
+    return data, sidecar_path
+
+
 def _find_doc_in_catalog(catalog: Dict[str, Any], doc_ref: str) -> Optional[Dict[str, Any]]:
     """
     Cari dokumen berdasarkan:

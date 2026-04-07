@@ -66,15 +66,15 @@ evaluation:
 
     # Model evaluator.
     # Kosongkan jika ingin memakai fallback provider default.
-    model: "llama-3.1-8b-instant"
+    model: "meta-llama/llama-4-scout-17b-16e-instruct"
 
     # Evaluator biasanya lebih stabil jika temperature = 0.0
     temperature: 0.0
 
     # Lebih longgar daripada runtime default agar metric RAGAS tidak mudah terpotong
     max_tokens: 1024
-    timeout: 120
-    max_retries: 4
+    timeout: 240
+    max_retries: 6
 
     # Khusus Ollama
     ollama_base_url: "http://localhost:11434"
