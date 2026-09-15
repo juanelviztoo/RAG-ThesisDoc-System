@@ -379,16 +379,36 @@ def audit_file(e: ExpectedFile) -> QcResult:
             r.encrypted = "NO"
             return r
 
-        for page_index, page in enumerate(doc):
+        for page_index in range(page_count):
+            try:
+                page = doc.load_page(page_index)
+            except Exception as exc:
+                # Jika satu halaman bahkan gagal dimuat, catat sebagai anomaly
+                # tetapi jangan hentikan pemeriksaan seluruh PDF/corpus.
+                texts.append("")
+                chars.append(0)
+                words.append(0)
+                imgs.append(0)
+
+                extraction_error_pages.append(page_index + 1)
+                extraction_error_notes.append(
+                    f"p{page_index + 1}:"
+                    f"PAGE_LOAD_ERROR:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+                continue
+
             try:
                 text = extract_page_text(page)
             except Exception as exc:
-                # Isolasi kegagalan per halaman: satu page anomali tidak boleh
-                # menghentikan QC terhadap seluruh batch corpus.
+                # Isolasi kegagalan ekstraksi teks per halaman:
+                # satu halaman anomali tidak boleh menghentikan seluruh batch.
                 text = ""
                 extraction_error_pages.append(page_index + 1)
                 extraction_error_notes.append(
-                    f"p{page_index + 1}:{type(exc).__name__}:{exc}"
+                    f"p{page_index + 1}:"
+                    f"TEXT_EXTRACTION_ERROR:"
+                    f"{type(exc).__name__}:{exc}"
                 )
 
             texts.append(text)
