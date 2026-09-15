@@ -1,8 +1,8 @@
 """Read-only Automated PDF-QC for Corpus v1.
 
-Utility ini sengaja dipisahkan dari runtime RAG: tidak mengimpor ``src.*``,
-tidak menyentuh Chroma/BM25/embedding/LLM, tidak menjalankan OCR, dan tidak
-memodifikasi PDF sumber maupun Google Sheet.
+This utility is intentionally isolated from the RAG runtime: it does not import
+``src.*`` modules, does not touch Chroma/BM25/embeddings/LLM, does not run OCR,
+and never modifies the source PDFs or Google Sheet.
 """
 from __future__ import annotations
 
@@ -132,9 +132,9 @@ def norm_key(text: str) -> str:
 
 def row_get(row: Dict[str, str], name: str) -> str:
     target = norm_key(name)
-    for key, value in row.items():
-        if norm_key(key) == target:
-            return (value or "").strip()
+    for k, v in row.items():
+        if norm_key(k) == target:
+            return (v or "").strip()
     return ""
 
 
@@ -154,11 +154,11 @@ def rel(path: Path, root: Path) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def git_hash(root: Path) -> str:
@@ -174,62 +174,48 @@ def expected_contract(
     corpus_root: Path, project_root: Path, selected: set[str]
 ) -> Tuple[List[ExpectedFile], List[str]]:
     dirs = [
-        path
-        for path in sorted(corpus_root.iterdir())
-        if path.is_dir()
-        and DOC_ID_RE.match(path.name)
-        and (not selected or path.name in selected)
+        p for p in sorted(corpus_root.iterdir())
+        if p.is_dir() and DOC_ID_RE.match(p.name) and (not selected or p.name in selected)
     ]
-    found = {path.name for path in dirs}
+    found = {p.name for p in dirs}
     missing_dirs = sorted(selected - found)
     if missing_dirs:
         raise RuntimeError(f"Doc ID folder tidak ditemukan: {', '.join(missing_dirs)}")
     if not dirs:
         raise RuntimeError(f"Tidak ada folder UNS_INF_* pada {corpus_root}")
 
-    output: List[ExpectedFile] = []
+    out: List[ExpectedFile] = []
     unexpected: List[str] = []
-    expected_names = {part.filename for part in PARTS}
-    for directory in dirs:
-        nim = directory.name.removeprefix("UNS_INF_")
+    expected_names = {x.filename for x in PARTS}
+    for d in dirs:
+        nim = d.name.removeprefix("UNS_INF_")
         for spec in PARTS:
-            path = directory / spec.filename
-            output.append(
-                ExpectedFile(
-                    f"{directory.name}__{spec.part_type}",
-                    directory.name,
-                    nim,
-                    spec.part_type,
-                    spec.filename,
-                    rel(path, project_root),
-                    path,
-                )
-            )
-        for path in sorted(directory.iterdir()):
-            if path.is_file() and path.suffix.lower() == ".pdf" and path.name not in expected_names:
-                unexpected.append(rel(path, project_root))
-
-    # Penting: file PDF lama yang berada langsung di data_raw/ tidak dipindai.
-    # Hanya corpus_root yang menjadi scope QC.
-    for path in sorted(corpus_root.iterdir()):
-        if path.is_file() and path.suffix.lower() == ".pdf":
-            unexpected.append(rel(path, project_root))
-    return output, unexpected
+            p = d / spec.filename
+            out.append(ExpectedFile(
+                f"{d.name}__{spec.part_type}", d.name, nim, spec.part_type,
+                spec.filename, rel(p, project_root), p,
+            ))
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() == ".pdf" and p.name not in expected_names:
+                unexpected.append(rel(p, project_root))
+    for p in sorted(corpus_root.iterdir()):
+        if p.is_file() and p.suffix.lower() == ".pdf":
+            unexpected.append(rel(p, project_root))
+    return out, unexpected
 
 
 def expected_manifest(
     csv_path: Path, project_root: Path, corpus_root: Path, selected: set[str]
 ) -> Tuple[List[ExpectedFile], List[str]]:
-    output: List[ExpectedFile] = []
+    out: List[ExpectedFile] = []
     seen_ids: set[str] = set()
     seen_paths: set[Path] = set()
     matched_docs: set[str] = set()
-
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
         if not reader.fieldnames:
             raise RuntimeError("Manifest CSV tidak memiliki header")
-        for row_number, row in enumerate(reader, start=2):
+        for n, row in enumerate(reader, start=2):
             doc_id = row_get(row, "Doc ID")
             if not doc_id or (selected and doc_id not in selected):
                 continue
@@ -237,80 +223,58 @@ def expected_manifest(
                 continue
             if row_get(row, "Indexing Policy").upper() not in ("", "INDEXED"):
                 continue
-
-            part_type = row_get(row, "Part Type").upper()
-            if part_type not in PART_BY_TYPE:
-                raise RuntimeError(f"Row {row_number}: Part Type tidak valid: {part_type}")
-            spec = PART_BY_TYPE[part_type]
+            part = row_get(row, "Part Type").upper()
+            if part not in PART_BY_TYPE:
+                raise RuntimeError(f"Row {n}: Part Type tidak valid: {part}")
+            spec = PART_BY_TYPE[part]
             filename = row_get(row, "Canonical Filename") or spec.filename
             if filename != spec.filename:
-                raise RuntimeError(f"Row {row_number}: filename {filename} != {spec.filename}")
-
+                raise RuntimeError(f"Row {n}: filename {filename} != {spec.filename}")
             planned = row_get(row, "Planned Relative Path")
-            path = (
-                (project_root / planned).resolve()
-                if planned
-                else (corpus_root / doc_id / filename).resolve()
-            )
+            path = (project_root / planned).resolve() if planned else (corpus_root / doc_id / filename).resolve()
             if not inside(path, corpus_root):
-                raise RuntimeError(f"Row {row_number}: path keluar corpus_root: {path}")
-
-            file_id = row_get(row, "File ID") or f"{doc_id}__{part_type}"
+                raise RuntimeError(f"Row {n}: path keluar corpus_root: {path}")
+            file_id = row_get(row, "File ID") or f"{doc_id}__{part}"
             if file_id in seen_ids or path in seen_paths:
-                raise RuntimeError(f"Row {row_number}: duplicate File ID/path")
-            seen_ids.add(file_id)
-            seen_paths.add(path)
-            matched_docs.add(doc_id)
+                raise RuntimeError(f"Row {n}: duplicate File ID/path")
+            seen_ids.add(file_id); seen_paths.add(path); matched_docs.add(doc_id)
             nim = row_get(row, "NIM") or doc_id.removeprefix("UNS_INF_")
-            output.append(
-                ExpectedFile(
-                    file_id,
-                    doc_id,
-                    nim,
-                    part_type,
-                    filename,
-                    planned or rel(path, project_root),
-                    path,
-                )
-            )
-
+            out.append(ExpectedFile(file_id, doc_id, nim, part, filename, planned or rel(path, project_root), path))
     missing_docs = sorted(selected - matched_docs)
     if missing_docs:
         raise RuntimeError(f"Doc ID tidak ditemukan pada manifest: {', '.join(missing_docs)}")
-    if not output:
+    if not out:
         raise RuntimeError("Tidak ada row CORE_INDEXED/INDEXED yang terpilih")
 
-    expected_paths = {item.path.resolve() for item in output}
+    expected_paths = {x.path.resolve() for x in out}
     unexpected: List[str] = []
-    for doc_id in sorted({item.doc_id for item in output}):
-        directory = corpus_root / doc_id
-        if not directory.exists():
+    for doc_id in sorted({x.doc_id for x in out}):
+        d = corpus_root / doc_id
+        if not d.exists():
             continue
-        for path in sorted(directory.iterdir()):
-            if path.is_file() and path.suffix.lower() == ".pdf" and path.resolve() not in expected_paths:
-                unexpected.append(rel(path, project_root))
-    return output, unexpected
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() == ".pdf" and p.resolve() not in expected_paths:
+                unexpected.append(rel(p, project_root))
+    return out, unexpected
 
 
 def marker_found(text: str, spec: PartSpec) -> bool:
-    return any(re.search(pattern, text, re.I) for pattern in spec.patterns)
+    return any(re.search(p, text, re.I) for p in spec.patterns)
 
 
 def first_marker(text: str) -> str:
     hits: List[Tuple[int, str]] = []
     for label, pattern in ANY_MARKERS:
-        match = re.search(pattern, text, re.I)
-        if match:
-            hits.append((match.start(), label))
+        m = re.search(pattern, text, re.I)
+        if m:
+            hits.append((m.start(), label))
     return min(hits)[1] if hits else ""
 
 
-def text_class(
-    total_chars: int, page_count: int, substantive_pages: int, median_chars: float
-) -> Tuple[str, str, List[str]]:
-    coverage = substantive_pages / page_count if page_count else 0.0
+def text_class(total: int, pages: int, substantive: int, median_chars: float) -> Tuple[str, str, List[str]]:
+    coverage = substantive / pages if pages else 0.0
     flags: List[str] = []
-    if total_chars < MIN_TOTAL_CHARS or coverage < TEXT_COVERAGE_PARTIAL:
+    if total < MIN_TOTAL_CHARS or coverage < TEXT_COVERAGE_PARTIAL:
         return "NO", "REQUIRED", ["CORE_TEXT_NOT_SUFFICIENTLY_EXTRACTABLE"]
     if coverage < TEXT_COVERAGE_YES or median_chars < MIN_MEDIAN_CHARS_YES:
         if coverage < TEXT_COVERAGE_YES:
@@ -321,268 +285,259 @@ def text_class(
     return "YES", "NO", flags
 
 
-def structure_class(
-    spec: PartSpec, first_text: str, full_text: str
-) -> Tuple[str, str, str, str, List[str]]:
+def structure_class(spec: PartSpec, first_text: str, full_text: str) -> Tuple[str, str, str, str, List[str]]:
     first_ok = marker_found(first_text, spec)
-    anywhere_ok = first_ok or marker_found(full_text, spec)
+    any_ok = first_ok or marker_found(full_text, spec)
     detected = first_marker(first_text)
     if first_ok:
         return "YES", "YES", "YES", detected, []
-    if anywhere_ok:
+    if any_ok:
         return "REVIEW", "NO", "YES", detected, ["EXPECTED_SECTION_MARKER_FOUND_LATE"]
     if detected and detected != spec.bab_label:
-        reference_equivalent = (
-            spec.bab_label == "DAFTAR_PUSTAKA" and detected in {"REFERENCES", "BIBLIOGRAPHY"}
-        )
-        if not reference_equivalent:
+        ref_eq = spec.bab_label == "DAFTAR_PUSTAKA" and detected in {"REFERENCES", "BIBLIOGRAPHY"}
+        if not ref_eq:
             return "NO", "NO", "NO", detected, [f"WRONG_SECTION_MARKER:{detected}"]
     return "REVIEW", "NO", "NO", detected, ["EXPECTED_SECTION_MARKER_NOT_FOUND"]
 
 
-def blank_result(expected: ExpectedFile, flag: str, status: str = "FAIL") -> QcResult:
+def blank_result(e: ExpectedFile, flag: str, status: str = "FAIL") -> QcResult:
     return QcResult(
-        SPEC_VERSION,
-        expected.file_id,
-        expected.doc_id,
-        expected.nim,
-        expected.part_type,
-        expected.filename,
-        expected.relpath,
-        "NO",
-        0,
-        0,
-        "NO",
-        "UNKNOWN",
-        0,
-        0,
-        0.0,
-        0.0,
-        0,
-        0,
-        0,
-        0.0,
-        0,
-        0,
-        0.0,
-        0,
-        "NO",
-        "REQUIRED",
-        "NO",
-        "NO",
-        "",
-        "PENDING",
-        "",
-        "",
-        status,
-        "BLOCKED",
-        flag,
-        "",
+        SPEC_VERSION, e.file_id, e.doc_id, e.nim, e.part_type, e.filename, e.relpath,
+        "NO", 0, 0, "NO", "UNKNOWN", 0, 0, 0.0, 0.0, 0, 0, 0, 0.0, 0, 0, 0.0, 0,
+        "NO", "REQUIRED", "NO", "NO", "", "PENDING", "", "", status, "BLOCKED", flag, "",
     )
 
 
-def audit_file(expected: ExpectedFile) -> QcResult:
-    path = expected.path
-    if not path.is_file():
-        return blank_result(expected, "MISSING_FILE")
+def extract_page_text(page: Any) -> str:
+    """Extract plain text from one PyMuPDF page with runtime type narrowing.
 
-    size = int(path.stat().st_size)
+    PyMuPDF's type stubs expose ``Page.get_text`` as a union because other
+    extraction modes can return lists or dictionaries. In ``"text"`` mode the
+    runtime contract we require is ``str``. Any unexpected type is treated as
+    a page-level extraction anomaly instead of being silently coerced.
+    """
+    raw_text = page.get_text("text")
+    if raw_text is None:
+        return ""
+    if not isinstance(raw_text, str):
+        raise TypeError(
+            "PyMuPDF get_text('text') menghasilkan tipe tak terduga: "
+            f"{type(raw_text).__name__}"
+        )
+    return norm_text(raw_text)
+
+
+def audit_file(e: ExpectedFile) -> QcResult:
+    p = e.path
+    if not p.is_file():
+        return blank_result(e, "MISSING_FILE")
+
+    size = int(p.stat().st_size)
     try:
-        digest = sha256_file(path)
+        digest = sha256_file(p)
     except Exception as exc:
-        result = blank_result(expected, "HASH_READ_ERROR")
-        result.file_exists = "YES"
-        result.file_size_bytes = size
-        result.notes = str(exc)
-        return result
+        r = blank_result(e, "HASH_READ_ERROR")
+        r.file_exists = "YES"
+        r.file_size_bytes = size
+        r.notes = str(exc)
+        return r
 
     try:
-        document = fitz.open(str(path))
+        doc = fitz.open(str(p))
     except Exception as exc:
-        result = blank_result(expected, "PDF_OPEN_ERROR")
-        result.file_exists = "YES"
-        result.file_size_bytes = size
-        result.sha256 = digest
-        result.notes = str(exc)
-        return result
+        r = blank_result(e, "PDF_OPEN_ERROR")
+        r.file_exists = "YES"
+        r.file_size_bytes = size
+        r.sha256 = digest
+        r.notes = str(exc)
+        return r
+
+    texts: List[str] = []
+    chars: List[int] = []
+    words: List[int] = []
+    imgs: List[int] = []
+    extraction_error_pages: List[int] = []
+    extraction_error_notes: List[str] = []
 
     try:
-        if bool(getattr(document, "needs_pass", False)):
-            result = blank_result(expected, "PDF_PASSWORD_REQUIRED")
-            result.file_exists = "YES"
-            result.file_size_bytes = size
-            result.sha256 = digest
-            result.encrypted = "YES"
-            return result
+        if bool(getattr(doc, "needs_pass", False)):
+            r = blank_result(e, "PDF_PASSWORD_REQUIRED")
+            r.file_exists = "YES"
+            r.file_size_bytes = size
+            r.sha256 = digest
+            r.encrypted = "YES"
+            return r
 
-        page_count = int(document.page_count)
+        page_count = int(doc.page_count)
         if page_count <= 0:
-            result = blank_result(expected, "ZERO_PAGE_PDF")
-            result.file_exists = "YES"
-            result.file_size_bytes = size
-            result.sha256 = digest
-            result.encrypted = "NO"
-            return result
+            r = blank_result(e, "ZERO_PAGE_PDF")
+            r.file_exists = "YES"
+            r.file_size_bytes = size
+            r.sha256 = digest
+            r.encrypted = "NO"
+            return r
 
-        texts: List[str] = []
-        chars_per_page: List[int] = []
-        words_per_page: List[int] = []
-        images_per_page: List[int] = []
-        for page in document:
-            text = norm_text(page.get_text("text") or "")
-            texts.append(text)
-            chars_per_page.append(len(text))
-            words_per_page.append(len(text.split()))
+        for page_index, page in enumerate(doc):
             try:
-                images_per_page.append(len(page.get_images(full=True)))
+                text = extract_page_text(page)
+            except Exception as exc:
+                # Isolasi kegagalan per halaman: satu page anomali tidak boleh
+                # menghentikan QC terhadap seluruh batch corpus.
+                text = ""
+                extraction_error_pages.append(page_index + 1)
+                extraction_error_notes.append(
+                    f"p{page_index + 1}:{type(exc).__name__}:{exc}"
+                )
+
+            texts.append(text)
+            chars.append(len(text))
+            words.append(len(text.split()))
+
+            try:
+                imgs.append(len(page.get_images(full=True)))
             except Exception:
-                images_per_page.append(0)
+                imgs.append(0)
     finally:
-        document.close()
+        doc.close()
 
-    total_chars = sum(chars_per_page)
-    total_words = sum(words_per_page)
-    median_chars = float(statistics.median(chars_per_page)) if chars_per_page else 0.0
-    mean_chars = float(statistics.mean(chars_per_page)) if chars_per_page else 0.0
-    substantive_pages = sum(value >= SUBSTANTIVE_CHARS_PER_PAGE for value in chars_per_page)
-    coverage = substantive_pages / page_count
-
+    total = sum(chars)
+    total_words = sum(words)
+    median_chars = float(statistics.median(chars)) if chars else 0.0
+    mean_chars = float(statistics.mean(chars)) if chars else 0.0
+    substantive = sum(x >= SUBSTANTIVE_CHARS_PER_PAGE for x in chars)
+    coverage = substantive / page_count
     text_extractable, ocr_flag, flags = text_class(
-        total_chars, page_count, substantive_pages, median_chars
+        total, page_count, substantive, median_chars
     )
-    spec = PART_BY_TYPE[expected.part_type]
+
+    if extraction_error_pages:
+        flags.append(f"PAGE_TEXT_EXTRACTION_ERROR:{len(extraction_error_pages)}")
+        # Sebagian halaman gagal diekstrak => jangan otomatis FAIL selama
+        # core text lainnya masih usable. Flag ke REVIEW untuk inspeksi manusia.
+        if len(extraction_error_pages) < page_count and ocr_flag == "NO":
+            ocr_flag = "POSSIBLE"
+        # Semua halaman gagal => core text secara praktis tidak tersedia.
+        if len(extraction_error_pages) == page_count:
+            text_extractable = "NO"
+            ocr_flag = "REQUIRED"
+
+    spec = PART_BY_TYPE[e.part_type]
     first_text = "\n".join(texts[:STRUCTURE_SCAN_PAGES])
     full_text = "\n".join(texts)
-    structure_ok, found_first, found_anywhere, detected_marker, structure_flags = structure_class(
+    structure, exp_first, exp_any, detected, sflags = structure_class(
         spec, first_text, full_text
     )
-    flags += structure_flags
+    flags += sflags
+
     if size < MIN_FILE_BYTES:
         flags.append("FILE_TOO_SMALL")
 
-    status = (
-        "PASS"
-        if not flags and text_extractable == "YES" and structure_ok == "YES"
-        else "REVIEW"
-    )
-    recommendation = "ELIGIBLE" if status == "PASS" else "MANUAL_REVIEW"
-    image_pages = sum(value > 0 for value in images_per_page)
-    note = ""
+    if len(extraction_error_pages) == page_count:
+        status = "FAIL"
+        recommendation = "BLOCKED"
+    else:
+        status = (
+            "PASS"
+            if not flags and text_extractable == "YES" and structure == "YES"
+            else "REVIEW"
+        )
+        recommendation = "ELIGIBLE" if status == "PASS" else "MANUAL_REVIEW"
+
+    image_pages = sum(x > 0 for x in imgs)
+    note_parts: List[str] = []
     if image_pages:
-        note = (
+        note_parts.append(
             f"Komponen visual terdeteksi pada {image_pages}/{page_count} halaman; "
             "tidak otomatis memengaruhi PASS selama teks inti tetap extractable."
+        )
+    if extraction_error_pages:
+        shown_pages = ",".join(str(x) for x in extraction_error_pages[:10])
+        suffix = "..." if len(extraction_error_pages) > 10 else ""
+        note_parts.append(
+            "Text extraction gagal pada halaman "
+            f"{shown_pages}{suffix}; batch QC tetap dilanjutkan. "
+            f"Detail: {' | '.join(extraction_error_notes[:3])}"
         )
 
     return QcResult(
         SPEC_VERSION,
-        expected.file_id,
-        expected.doc_id,
-        expected.nim,
-        expected.part_type,
-        expected.filename,
-        expected.relpath,
+        e.file_id,
+        e.doc_id,
+        e.nim,
+        e.part_type,
+        e.filename,
+        e.relpath,
         "YES",
         size,
         page_count,
         "YES",
         "NO",
-        total_chars,
+        total,
         total_words,
         round(median_chars, 2),
         round(mean_chars, 2),
-        min(chars_per_page),
-        max(chars_per_page),
-        substantive_pages,
+        min(chars),
+        max(chars),
+        substantive,
         round(coverage, 4),
-        page_count - substantive_pages,
+        page_count - substantive,
         image_pages,
         round(image_pages / page_count, 4),
-        sum(images_per_page),
+        sum(imgs),
         text_extractable,
         ocr_flag,
-        found_first,
-        found_anywhere,
-        detected_marker,
-        structure_ok,
+        exp_first,
+        exp_any,
+        detected,
+        structure,
         digest,
         "",
         status,
         recommendation,
         ";".join(dict.fromkeys(flags)),
-        note,
+        " ".join(note_parts),
     )
 
 
 def apply_duplicates(results: List[QcResult]) -> Dict[str, List[str]]:
     groups: Dict[str, List[QcResult]] = {}
-    for result in results:
-        if result.sha256:
-            groups.setdefault(result.sha256, []).append(result)
-
+    for r in results:
+        if r.sha256:
+            groups.setdefault(r.sha256, []).append(r)
     duplicates: Dict[str, List[str]] = {}
     for digest, group in groups.items():
         if len(group) < 2:
             continue
-        ids = [result.file_id for result in group]
-        duplicates[digest] = ids
-        anchor = ids[0]
-        for result in group[1:]:
-            result.duplicate_of = anchor
-            result.qc_flags = ";".join(
-                value for value in [result.qc_flags, "EXACT_DUPLICATE_SHA256"] if value
-            )
-            if result.file_qc_status == "PASS":
-                result.file_qc_status = "REVIEW"
-                result.qc_inclusion_recommendation = "MANUAL_REVIEW"
+        ids = [r.file_id for r in group]; duplicates[digest] = ids; anchor = ids[0]
+        for r in group[1:]:
+            r.duplicate_of = anchor
+            r.qc_flags = ";".join(x for x in [r.qc_flags, "EXACT_DUPLICATE_SHA256"] if x)
+            if r.file_qc_status == "PASS":
+                r.file_qc_status = "REVIEW"; r.qc_inclusion_recommendation = "MANUAL_REVIEW"
     return duplicates
 
 
 def write_csv(path: Path, rows: Iterable[Dict[str, Any]], fields: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields))
-        writer.writeheader()
-        writer.writerows(rows)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(fields)); w.writeheader(); w.writerows(rows)
 
 
 def make_summary(
-    results: List[QcResult],
-    expected: List[ExpectedFile],
-    unexpected: List[str],
-    duplicates: Dict[str, List[str]],
-    mode: str,
-    project_root: Path,
-    corpus_root: Path,
+    results: List[QcResult], expected: List[ExpectedFile], unexpected: List[str],
+    duplicates: Dict[str, List[str]], mode: str, project_root: Path, corpus_root: Path,
     manifest: Optional[Path],
 ) -> Dict[str, Any]:
-    status = {
-        value: sum(result.file_qc_status == value for result in results)
-        for value in ("PASS", "REVIEW", "FAIL")
-    }
-    text_status = {
-        value: sum(result.text_extractable == value for result in results)
-        for value in ("YES", "PARTIAL", "NO")
-    }
-    ocr_status = {
-        value: sum(result.ocr_dependency_flag == value for result in results)
-        for value in ("NO", "POSSIBLE", "REQUIRED")
-    }
-    structure_status = {
-        value: sum(result.structure_ok == value for result in results)
-        for value in ("YES", "REVIEW", "NO", "PENDING")
-    }
-
+    status = {x: sum(r.file_qc_status == x for r in results) for x in ("PASS", "REVIEW", "FAIL")}
+    text = {x: sum(r.text_extractable == x for r in results) for x in ("YES", "PARTIAL", "NO")}
+    ocr = {x: sum(r.ocr_dependency_flag == x for r in results) for x in ("NO", "POSSIBLE", "REQUIRED")}
+    structure = {x: sum(r.structure_ok == x for r in results) for x in ("YES", "REVIEW", "NO", "PENDING")}
     per_doc: Dict[str, Dict[str, Any]] = {}
-    for result in results:
-        doc = per_doc.setdefault(
-            result.doc_id, {"expected": 0, "pass": 0, "review": 0, "fail": 0}
-        )
-        doc["expected"] += 1
-        doc[result.file_qc_status.lower()] += 1
-    for doc in per_doc.values():
-        doc["all_core_pass"] = doc["expected"] == len(PARTS) and doc["pass"] == len(PARTS)
-
+    for r in results:
+        d = per_doc.setdefault(r.doc_id, {"expected": 0, "pass": 0, "review": 0, "fail": 0})
+        d["expected"] += 1; d[r.file_qc_status.lower()] += 1
+    for d in per_doc.values():
+        d["all_core_pass"] = d["expected"] == len(PARTS) and d["pass"] == len(PARTS)
     return {
         "qc_spec_version": SPEC_VERSION,
         "timestamp": datetime.now().astimezone().isoformat(),
@@ -602,16 +557,16 @@ def make_summary(
         },
         "counts": {
             "expected_files": len(expected),
-            "found_files": sum(result.file_exists == "YES" for result in results),
-            "missing_files": sum(result.file_exists == "NO" for result in results),
-            "total_pages": sum(result.page_count for result in results),
+            "found_files": sum(r.file_exists == "YES" for r in results),
+            "missing_files": sum(r.file_exists == "NO" for r in results),
+            "total_pages": sum(r.page_count for r in results),
             "status": status,
-            "text_extractable": text_status,
-            "ocr_dependency_flag": ocr_status,
-            "structure_ok": structure_status,
+            "text_extractable": text,
+            "ocr_dependency_flag": ocr,
+            "structure_ok": structure,
             "unexpected_pdf_count": len(unexpected),
             "duplicate_hash_groups": len(duplicates),
-            "docs_all_core_pass": sum(bool(doc["all_core_pass"]) for doc in per_doc.values()),
+            "docs_all_core_pass": sum(bool(d["all_core_pass"]) for d in per_doc.values()),
             "docs_total": len(per_doc),
         },
         "unexpected_pdfs": unexpected,
@@ -629,95 +584,55 @@ def make_summary(
 def run(args: argparse.Namespace) -> Tuple[List[QcResult], Dict[str, Any], Path]:
     project_root = Path(args.project_root).resolve()
     corpus_root = Path(args.corpus_root)
-    corpus_root = (
-        (project_root / corpus_root).resolve()
-        if not corpus_root.is_absolute()
-        else corpus_root.resolve()
-    )
+    corpus_root = (project_root / corpus_root).resolve() if not corpus_root.is_absolute() else corpus_root.resolve()
     if not corpus_root.exists():
         raise FileNotFoundError(f"Corpus root tidak ditemukan: {corpus_root}")
     if not inside(corpus_root, project_root) and not args.allow_external_corpus_root:
-        raise RuntimeError(
-            "corpus_root di luar project_root; gunakan --allow-external-corpus-root jika disengaja"
-        )
-
-    selected = {value.strip() for value in (args.doc_id or []) if value.strip()}
+        raise RuntimeError("corpus_root di luar project_root; gunakan --allow-external-corpus-root jika disengaja")
+    selected = {x.strip() for x in (args.doc_id or []) if x.strip()}
     manifest: Optional[Path] = None
     if args.manifest:
         manifest = Path(args.manifest)
-        manifest = (
-            (project_root / manifest).resolve()
-            if not manifest.is_absolute()
-            else manifest.resolve()
-        )
+        manifest = (project_root / manifest).resolve() if not manifest.is_absolute() else manifest.resolve()
         expected, unexpected = expected_manifest(manifest, project_root, corpus_root, selected)
         mode = "manifest"
     else:
         expected, unexpected = expected_contract(corpus_root, project_root, selected)
         mode = "contract"
-
-    results = [audit_file(item) for item in expected]
+    results = [audit_file(x) for x in expected]
     duplicates = apply_duplicates(results)
-    summary = make_summary(
-        results, expected, unexpected, duplicates, mode, project_root, corpus_root, manifest
-    )
+    summary = make_summary(results, expected, unexpected, duplicates, mode, project_root, corpus_root, manifest)
 
     output_root = Path(args.output_dir)
-    output_root = (
-        (project_root / output_root).resolve()
-        if not output_root.is_absolute()
-        else output_root.resolve()
-    )
+    output_root = (project_root / output_root).resolve() if not output_root.is_absolute() else output_root.resolve()
     run_dir = output_root / (args.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = [asdict(result) for result in results]
-    fields = list(rows[0].keys())
+    rows = [asdict(x) for x in results]; fields = list(rows[0].keys())
     write_csv(run_dir / "qc_report.csv", rows, fields)
-    write_csv(
-        run_dir / "qc_review_queue.csv",
-        [row for row in rows if row["file_qc_status"] != "PASS"],
-        fields,
-    )
-    (run_dir / "qc_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    write_csv(run_dir / "qc_review_queue.csv", [r for r in rows if r["file_qc_status"] != "PASS"], fields)
+    (run_dir / "qc_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    counts = summary["counts"]
-    status = counts["status"]
+    c = summary["counts"]; s = c["status"]
     print("\nCorpus PDF-QC Summary\n---------------------")
-    print(f"QC spec           : {SPEC_VERSION}")
-    print(f"Mode              : {mode}")
-    print(f"Expected files    : {counts['expected_files']}")
-    print(f"Found / Missing   : {counts['found_files']} / {counts['missing_files']}")
-    print(f"Total pages       : {counts['total_pages']}")
-    print(f"PASS/REVIEW/FAIL  : {status['PASS']}/{status['REVIEW']}/{status['FAIL']}")
-    print(f"Unexpected PDFs   : {counts['unexpected_pdf_count']}")
-    print(f"Duplicate groups  : {counts['duplicate_hash_groups']}")
-    print(f"Docs all-core PASS: {counts['docs_all_core_pass']}/{counts['docs_total']}")
-    print(f"Output            : {run_dir}")
+    print(f"QC spec           : {SPEC_VERSION}\nMode              : {mode}\nExpected files    : {c['expected_files']}")
+    print(f"Found / Missing   : {c['found_files']} / {c['missing_files']}\nTotal pages       : {c['total_pages']}")
+    print(f"PASS/REVIEW/FAIL  : {s['PASS']}/{s['REVIEW']}/{s['FAIL']}")
+    print(f"Unexpected PDFs   : {c['unexpected_pdf_count']}\nDuplicate groups  : {c['duplicate_hash_groups']}")
+    print(f"Docs all-core PASS: {c['docs_all_core_pass']}/{c['docs_total']}\nOutput            : {run_dir}")
     return results, summary, run_dir
 
 
 def parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Read-only Automated PDF-QC for Corpus v1 (no OCR, no RAG ingest)."
-    )
-    parser.add_argument("--project-root", default=".")
-    parser.add_argument("--corpus-root", default="data_raw/corpus_v1")
-    parser.add_argument(
-        "--manifest", default=None, help="Optional CSV export dari Corpus v1 - File Manifest"
-    )
-    parser.add_argument(
-        "--doc-id", action="append", default=None, help="Batasi ke Doc ID tertentu; dapat diulang"
-    )
-    parser.add_argument("--output-dir", default="runs/corpus_qc")
-    parser.add_argument("--run-name", default=None)
-    parser.add_argument("--allow-external-corpus-root", action="store_true")
-    parser.add_argument(
-        "--fail-on-qc", action="store_true", help="Exit 2 jika ada REVIEW/FAIL/anomali"
-    )
-    return parser
+    p = argparse.ArgumentParser(description="Read-only Automated PDF-QC for Corpus v1 (no OCR, no RAG ingest).")
+    p.add_argument("--project-root", default=".")
+    p.add_argument("--corpus-root", default="data_raw/corpus_v1")
+    p.add_argument("--manifest", default=None, help="Optional CSV export dari Corpus v1 - File Manifest")
+    p.add_argument("--doc-id", action="append", default=None, help="Batasi ke Doc ID tertentu; dapat diulang")
+    p.add_argument("--output-dir", default="runs/corpus_qc")
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--allow-external-corpus-root", action="store_true")
+    p.add_argument("--fail-on-qc", action="store_true", help="Exit 2 jika ada REVIEW/FAIL/anomali")
+    return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -727,17 +642,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         print(f"[FATAL] Corpus QC gagal: {exc}", file=sys.stderr)
         return 1
-
     if args.fail_on_qc:
-        counts = summary["counts"]
-        status = counts["status"]
-        if (
-            counts["missing_files"]
-            or status["REVIEW"]
-            or status["FAIL"]
-            or counts["unexpected_pdf_count"]
-            or counts["duplicate_hash_groups"]
-        ):
+        c = summary["counts"]; s = c["status"]
+        if c["missing_files"] or s["REVIEW"] or s["FAIL"] or c["unexpected_pdf_count"] or c["duplicate_hash_groups"]:
             return 2
     return 0
 
