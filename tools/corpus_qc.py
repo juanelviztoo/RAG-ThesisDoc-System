@@ -237,7 +237,9 @@ def expected_manifest(
             file_id = row_get(row, "File ID") or f"{doc_id}__{part}"
             if file_id in seen_ids or path in seen_paths:
                 raise RuntimeError(f"Row {n}: duplicate File ID/path")
-            seen_ids.add(file_id); seen_paths.add(path); matched_docs.add(doc_id)
+            seen_ids.add(file_id)
+            seen_paths.add(path)
+            matched_docs.add(doc_id)
             nim = row_get(row, "NIM") or doc_id.removeprefix("UNS_INF_")
             out.append(ExpectedFile(file_id, doc_id, nim, part, filename, planned or rel(path, project_root), path))
     missing_docs = sorted(selected - matched_docs)
@@ -360,7 +362,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
     extraction_error_notes: List[str] = []
 
     try:
-        if bool(getattr(doc, "needs_pass", False)):
+        if bool(doc.needs_pass):
             r = blank_result(e, "PDF_PASSWORD_REQUIRED")
             r.file_exists = "YES"
             r.file_size_bytes = size
@@ -508,19 +510,24 @@ def apply_duplicates(results: List[QcResult]) -> Dict[str, List[str]]:
     for digest, group in groups.items():
         if len(group) < 2:
             continue
-        ids = [r.file_id for r in group]; duplicates[digest] = ids; anchor = ids[0]
+        ids = [r.file_id for r in group]
+        duplicates[digest] = ids
+        anchor = ids[0]
         for r in group[1:]:
             r.duplicate_of = anchor
             r.qc_flags = ";".join(x for x in [r.qc_flags, "EXACT_DUPLICATE_SHA256"] if x)
             if r.file_qc_status == "PASS":
-                r.file_qc_status = "REVIEW"; r.qc_inclusion_recommendation = "MANUAL_REVIEW"
+                r.file_qc_status = "REVIEW"
+                r.qc_inclusion_recommendation = "MANUAL_REVIEW"
     return duplicates
 
 
 def write_csv(path: Path, rows: Iterable[Dict[str, Any]], fields: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(fields)); w.writeheader(); w.writerows(rows)
+        w = csv.DictWriter(f, fieldnames=list(fields))
+        w.writeheader()
+        w.writerows(rows)
 
 
 def make_summary(
@@ -535,7 +542,8 @@ def make_summary(
     per_doc: Dict[str, Dict[str, Any]] = {}
     for r in results:
         d = per_doc.setdefault(r.doc_id, {"expected": 0, "pass": 0, "review": 0, "fail": 0})
-        d["expected"] += 1; d[r.file_qc_status.lower()] += 1
+        d["expected"] += 1
+        d[r.file_qc_status.lower()] += 1
     for d in per_doc.values():
         d["all_core_pass"] = d["expected"] == len(PARTS) and d["pass"] == len(PARTS)
     return {
@@ -607,12 +615,14 @@ def run(args: argparse.Namespace) -> Tuple[List[QcResult], Dict[str, Any], Path]
     output_root = (project_root / output_root).resolve() if not output_root.is_absolute() else output_root.resolve()
     run_dir = output_root / (args.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
-    rows = [asdict(x) for x in results]; fields = list(rows[0].keys())
+    rows = [asdict(x) for x in results]
+    fields = list(rows[0].keys())
     write_csv(run_dir / "qc_report.csv", rows, fields)
     write_csv(run_dir / "qc_review_queue.csv", [r for r in rows if r["file_qc_status"] != "PASS"], fields)
     (run_dir / "qc_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    c = summary["counts"]; s = c["status"]
+    c = summary["counts"]
+    s = c["status"]
     print("\nCorpus PDF-QC Summary\n---------------------")
     print(f"QC spec           : {SPEC_VERSION}\nMode              : {mode}\nExpected files    : {c['expected_files']}")
     print(f"Found / Missing   : {c['found_files']} / {c['missing_files']}\nTotal pages       : {c['total_pages']}")
@@ -643,7 +653,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[FATAL] Corpus QC gagal: {exc}", file=sys.stderr)
         return 1
     if args.fail_on_qc:
-        c = summary["counts"]; s = c["status"]
+        c = summary["counts"]
+        s = c["status"]
         if c["missing_files"] or s["REVIEW"] or s["FAIL"] or c["unexpected_pdf_count"] or c["duplicate_hash_groups"]:
             return 2
     return 0
