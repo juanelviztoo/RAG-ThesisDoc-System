@@ -24,7 +24,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("PyMuPDF belum tersedia. Install requirements.txt terlebih dahulu.") from exc
 
-SPEC_VERSION = "1.0.0"
+SPEC_VERSION = "1.1.0"
 MIN_FILE_BYTES = 1024
 MIN_TOTAL_CHARS = 500
 SUBSTANTIVE_CHARS_PER_PAGE = 100
@@ -55,7 +55,12 @@ PARTS: Tuple[PartSpec, ...] = (
         "daftar_pustaka.pdf",
         "sitasi",
         "DAFTAR_PUSTAKA",
-        (r"\bDAFTAR\s+(?:PUSTAKA|REFERENSI)\b", r"\bREFERENCES?\b", r"\bBIBLIOGRAPHY\b"),
+        (
+            r"\bDAFTAR\s+(?:PUSTAKA|REFERENSI)\b",
+            r"\bREFERENSI\b",
+            r"\bREFERENCES?\b",
+            r"\bBIBLIOGRAPHY\b",
+        ),
     ),
 )
 PART_BY_TYPE = {x.part_type: x for x in PARTS}
@@ -66,6 +71,7 @@ ANY_MARKERS = (
     ("BAB_IV", r"\bBAB\s*(?:IV|4)\b"),
     ("BAB_V", r"\bBAB\s*(?:V|5)\b"),
     ("DAFTAR_PUSTAKA", r"\bDAFTAR\s+(?:PUSTAKA|REFERENSI)\b"),
+    ("REFERENSI", r"\bREFERENSI\b"),
     ("REFERENCES", r"\bREFERENCES?\b"),
     ("BIBLIOGRAPHY", r"\bBIBLIOGRAPHY\b"),
 )
@@ -296,7 +302,7 @@ def structure_class(spec: PartSpec, first_text: str, full_text: str) -> Tuple[st
     if any_ok:
         return "REVIEW", "NO", "YES", detected, ["EXPECTED_SECTION_MARKER_FOUND_LATE"]
     if detected and detected != spec.bab_label:
-        ref_eq = spec.bab_label == "DAFTAR_PUSTAKA" and detected in {"REFERENCES", "BIBLIOGRAPHY"}
+        ref_eq = spec.bab_label == "DAFTAR_PUSTAKA" and detected in {"REFERENSI", "REFERENCES", "BIBLIOGRAPHY"}
         if not ref_eq:
             return "NO", "NO", "NO", detected, [f"WRONG_SECTION_MARKER:{detected}"]
     return "REVIEW", "NO", "NO", detected, ["EXPECTED_SECTION_MARKER_NOT_FOUND"]
