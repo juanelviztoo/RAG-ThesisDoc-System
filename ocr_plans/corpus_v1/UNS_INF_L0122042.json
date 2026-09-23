@@ -1,0 +1,24 @@
+{
+  "plan_version": "0.1",
+  "doc_id": "UNS_INF_L0122042",
+  "decision": "SELECTIVE_OCR_ELIGIBLE",
+  "rationale": "OCR burden = 34/79 core pages (43.0%) across 3/6 core parts; below OCR-dominant threshold. Preserve thesis and recover only rasterized narrative text in BAB IV, BAB V, and Daftar Pustaka.",
+  "copy_unlisted_parts": true,
+  "parts": {
+    "BAB_4": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire part contains rasterized narrative text with only minimal existing digital watermark text."
+    },
+    "BAB_5": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire part contains rasterized narrative text with only minimal existing digital watermark text."
+    },
+    "DAFTAR_PUSTAKA": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire bibliography part is rasterized and requires searchable text recovery for citation stream."
+    }
+  }
+}

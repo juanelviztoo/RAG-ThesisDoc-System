@@ -20,6 +20,11 @@ data_index/
 runs/
 runs_archive/
 
+# OCR preprocessing environment & derived artifacts
+.venv_ocr/
+data_derived/
+ocr_assets/
+
 # Notebooks
 .ipynb_checkpoints/
 
