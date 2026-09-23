@@ -1,0 +1,3 @@
+ocrmypdf==17.12.1
+pymupdf==1.28.2
+pypdfium2==5.13.0
