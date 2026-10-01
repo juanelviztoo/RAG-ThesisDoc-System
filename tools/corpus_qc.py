@@ -4,6 +4,7 @@ This utility is intentionally isolated from the RAG runtime: it does not import
 ``src.*`` modules, does not touch Chroma/BM25/embeddings/LLM, does not run OCR,
 and never modifies the source PDFs or Google Sheet.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("PyMuPDF belum tersedia. Install requirements.txt terlebih dahulu.") from exc
 
-SPEC_VERSION = "1.1.0"
+SPEC_VERSION = "1.2.0"
 MIN_FILE_BYTES = 1024
 MIN_TOTAL_CHARS = 500
 SUBSTANTIVE_CHARS_PER_PAGE = 100
@@ -167,11 +168,169 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def load_structure_overrides(
+    raw_path: Optional[str],
+    project_root: Path,
+) -> Tuple[Dict[str, Dict[str, str]], Optional[Path]]:
+    """Load explicit SHA-bound manual structure overrides."""
+
+    if not raw_path:
+        return {}, None
+
+    path = Path(raw_path)
+    path = (project_root / path).resolve() if not path.is_absolute() else path.resolve()
+
+    if not inside(path, project_root):
+        raise RuntimeError("Structure override file harus berada di dalam project_root")
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Structure override file tidak ditemukan: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    if payload.get("override_spec_version") != "1.0":
+        raise RuntimeError("Structure override spec version tidak didukung")
+
+    raw_overrides = payload.get("overrides")
+
+    if not isinstance(raw_overrides, list):
+        raise RuntimeError("Field 'overrides' harus berupa list")
+
+    overrides: Dict[str, Dict[str, str]] = {}
+
+    for index, item in enumerate(raw_overrides, start=1):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Override #{index} harus berupa object")
+
+        file_id = str(item.get("file_id", "")).strip()
+        digest = str(item.get("sha256", "")).strip().lower()
+        decision = str(item.get("decision", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+
+        if not file_id:
+            raise RuntimeError(f"Override #{index}: file_id wajib")
+
+        if file_id in overrides:
+            raise RuntimeError(f"Duplicate override file_id: {file_id}")
+
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(f"Override {file_id}: SHA256 tidak valid")
+
+        if decision != "ACCEPT_STRUCTURE":
+            raise RuntimeError(f"Override {file_id}: decision tidak didukung")
+
+        if not reason:
+            raise RuntimeError(f"Override {file_id}: reason wajib")
+
+        overrides[file_id] = {
+            "sha256": digest,
+            "decision": decision,
+            "reason": reason,
+        }
+
+    return overrides, path
+
+
+def structure_only_flags(value: str) -> bool:
+    """Return True only when all QC flags are structure-marker anomalies."""
+
+    flags = [item for item in (value or "").split(";") if item]
+
+    if not flags:
+        return False
+
+    for flag in flags:
+        if flag in {
+            "EXPECTED_SECTION_MARKER_NOT_FOUND",
+            "EXPECTED_SECTION_MARKER_FOUND_LATE",
+        }:
+            continue
+
+        if flag.startswith("WRONG_SECTION_MARKER:"):
+            continue
+
+        return False
+
+    return True
+
+
+def apply_structure_overrides(
+    results: List[QcResult],
+    overrides: Dict[str, Dict[str, str]],
+) -> List[str]:
+    """Apply fail-closed manual structure decisions.
+
+    Overrides may only convert structure-only REVIEW results into PASS.
+    Integrity, extraction, OCR, duplicate, or other anomalies cannot be
+    overridden here.
+    """
+
+    applied: List[str] = []
+    by_id = {result.file_id: result for result in results}
+
+    for file_id, override in overrides.items():
+        result = by_id.get(file_id)
+
+        # Targeted QC may legitimately exclude files contained in the
+        # shared override ledger.
+        if result is None:
+            continue
+
+        if result.sha256.lower() != override["sha256"]:
+            raise RuntimeError(f"Structure override SHA mismatch: {file_id}")
+
+        if result.file_qc_status != "REVIEW":
+            raise RuntimeError(
+                "Structure override hanya boleh diterapkan " f"pada REVIEW: {file_id}"
+            )
+
+        if (
+            result.file_exists != "YES"
+            or result.openable != "YES"
+            or result.text_extractable != "YES"
+            or result.ocr_dependency_flag != "NO"
+        ):
+            raise RuntimeError(
+                "Structure override ditolak karena terdapat "
+                f"integrity/text/OCR blocker: {file_id}"
+            )
+
+        if not structure_only_flags(result.qc_flags):
+            raise RuntimeError(
+                "Structure override ditolak karena REVIEW " f"bukan structure-only: {file_id}"
+            )
+
+        original_flags = result.qc_flags
+
+        result.structure_ok = "YES"
+        result.file_qc_status = "PASS"
+        result.qc_inclusion_recommendation = "ELIGIBLE"
+
+        result.qc_flags = ";".join(
+            [
+                original_flags,
+                "MANUAL_STRUCTURE_OVERRIDE",
+            ]
+        )
+
+        result.notes = (
+            f"{result.notes} " "Manual structure override ACCEPTED: " f"{override['reason']}"
+        ).strip()
+
+        applied.append(file_id)
+
+    return applied
+
+
 def git_hash(root: Path) -> str:
     try:
-        return subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+        return (
+            subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         return "unknown"
 
@@ -180,7 +339,8 @@ def expected_contract(
     corpus_root: Path, project_root: Path, selected: set[str]
 ) -> Tuple[List[ExpectedFile], List[str]]:
     dirs = [
-        p for p in sorted(corpus_root.iterdir())
+        p
+        for p in sorted(corpus_root.iterdir())
         if p.is_dir() and DOC_ID_RE.match(p.name) and (not selected or p.name in selected)
     ]
     found = {p.name for p in dirs}
@@ -197,10 +357,17 @@ def expected_contract(
         nim = d.name.removeprefix("UNS_INF_")
         for spec in PARTS:
             p = d / spec.filename
-            out.append(ExpectedFile(
-                f"{d.name}__{spec.part_type}", d.name, nim, spec.part_type,
-                spec.filename, rel(p, project_root), p,
-            ))
+            out.append(
+                ExpectedFile(
+                    f"{d.name}__{spec.part_type}",
+                    d.name,
+                    nim,
+                    spec.part_type,
+                    spec.filename,
+                    rel(p, project_root),
+                    p,
+                )
+            )
         for p in sorted(d.iterdir()):
             if p.is_file() and p.suffix.lower() == ".pdf" and p.name not in expected_names:
                 unexpected.append(rel(p, project_root))
@@ -237,7 +404,11 @@ def expected_manifest(
             if filename != spec.filename:
                 raise RuntimeError(f"Row {n}: filename {filename} != {spec.filename}")
             planned = row_get(row, "Planned Relative Path")
-            path = (project_root / planned).resolve() if planned else (corpus_root / doc_id / filename).resolve()
+            path = (
+                (project_root / planned).resolve()
+                if planned
+                else (corpus_root / doc_id / filename).resolve()
+            )
             if not inside(path, corpus_root):
                 raise RuntimeError(f"Row {n}: path keluar corpus_root: {path}")
             file_id = row_get(row, "File ID") or f"{doc_id}__{part}"
@@ -247,7 +418,11 @@ def expected_manifest(
             seen_paths.add(path)
             matched_docs.add(doc_id)
             nim = row_get(row, "NIM") or doc_id.removeprefix("UNS_INF_")
-            out.append(ExpectedFile(file_id, doc_id, nim, part, filename, planned or rel(path, project_root), path))
+            out.append(
+                ExpectedFile(
+                    file_id, doc_id, nim, part, filename, planned or rel(path, project_root), path
+                )
+            )
     missing_docs = sorted(selected - matched_docs)
     if missing_docs:
         raise RuntimeError(f"Doc ID tidak ditemukan pada manifest: {', '.join(missing_docs)}")
@@ -279,7 +454,9 @@ def first_marker(text: str) -> str:
     return min(hits)[1] if hits else ""
 
 
-def text_class(total: int, pages: int, substantive: int, median_chars: float) -> Tuple[str, str, List[str]]:
+def text_class(
+    total: int, pages: int, substantive: int, median_chars: float
+) -> Tuple[str, str, List[str]]:
     coverage = substantive / pages if pages else 0.0
     flags: List[str] = []
     if total < MIN_TOTAL_CHARS or coverage < TEXT_COVERAGE_PARTIAL:
@@ -293,7 +470,9 @@ def text_class(total: int, pages: int, substantive: int, median_chars: float) ->
     return "YES", "NO", flags
 
 
-def structure_class(spec: PartSpec, first_text: str, full_text: str) -> Tuple[str, str, str, str, List[str]]:
+def structure_class(
+    spec: PartSpec, first_text: str, full_text: str
+) -> Tuple[str, str, str, str, List[str]]:
     first_ok = marker_found(first_text, spec)
     any_ok = first_ok or marker_found(full_text, spec)
     detected = first_marker(first_text)
@@ -302,7 +481,11 @@ def structure_class(spec: PartSpec, first_text: str, full_text: str) -> Tuple[st
     if any_ok:
         return "REVIEW", "NO", "YES", detected, ["EXPECTED_SECTION_MARKER_FOUND_LATE"]
     if detected and detected != spec.bab_label:
-        ref_eq = spec.bab_label == "DAFTAR_PUSTAKA" and detected in {"REFERENSI", "REFERENCES", "BIBLIOGRAPHY"}
+        ref_eq = spec.bab_label == "DAFTAR_PUSTAKA" and detected in {
+            "REFERENSI",
+            "REFERENCES",
+            "BIBLIOGRAPHY",
+        }
         if not ref_eq:
             return "NO", "NO", "NO", detected, [f"WRONG_SECTION_MARKER:{detected}"]
     return "REVIEW", "NO", "NO", detected, ["EXPECTED_SECTION_MARKER_NOT_FOUND"]
@@ -310,9 +493,42 @@ def structure_class(spec: PartSpec, first_text: str, full_text: str) -> Tuple[st
 
 def blank_result(e: ExpectedFile, flag: str, status: str = "FAIL") -> QcResult:
     return QcResult(
-        SPEC_VERSION, e.file_id, e.doc_id, e.nim, e.part_type, e.filename, e.relpath,
-        "NO", 0, 0, "NO", "UNKNOWN", 0, 0, 0.0, 0.0, 0, 0, 0, 0.0, 0, 0, 0.0, 0,
-        "NO", "REQUIRED", "NO", "NO", "", "PENDING", "", "", status, "BLOCKED", flag, "",
+        SPEC_VERSION,
+        e.file_id,
+        e.doc_id,
+        e.nim,
+        e.part_type,
+        e.filename,
+        e.relpath,
+        "NO",
+        0,
+        0,
+        "NO",
+        "UNKNOWN",
+        0,
+        0,
+        0.0,
+        0.0,
+        0,
+        0,
+        0,
+        0.0,
+        0,
+        0,
+        0.0,
+        0,
+        "NO",
+        "REQUIRED",
+        "NO",
+        "NO",
+        "",
+        "PENDING",
+        "",
+        "",
+        status,
+        "BLOCKED",
+        flag,
+        "",
     )
 
 
@@ -329,8 +545,7 @@ def extract_page_text(page: Any) -> str:
         return ""
     if not isinstance(raw_text, str):
         raise TypeError(
-            "PyMuPDF get_text('text') menghasilkan tipe tak terduga: "
-            f"{type(raw_text).__name__}"
+            "PyMuPDF get_text('text') menghasilkan tipe tak terduga: " f"{type(raw_text).__name__}"
         )
     return norm_text(raw_text)
 
@@ -398,9 +613,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
 
                 extraction_error_pages.append(page_index + 1)
                 extraction_error_notes.append(
-                    f"p{page_index + 1}:"
-                    f"PAGE_LOAD_ERROR:"
-                    f"{type(exc).__name__}:{exc}"
+                    f"p{page_index + 1}:" f"PAGE_LOAD_ERROR:" f"{type(exc).__name__}:{exc}"
                 )
                 continue
 
@@ -412,9 +625,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
                 text = ""
                 extraction_error_pages.append(page_index + 1)
                 extraction_error_notes.append(
-                    f"p{page_index + 1}:"
-                    f"TEXT_EXTRACTION_ERROR:"
-                    f"{type(exc).__name__}:{exc}"
+                    f"p{page_index + 1}:" f"TEXT_EXTRACTION_ERROR:" f"{type(exc).__name__}:{exc}"
                 )
 
             texts.append(text)
@@ -434,9 +645,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
     mean_chars = float(statistics.mean(chars)) if chars else 0.0
     substantive = sum(x >= SUBSTANTIVE_CHARS_PER_PAGE for x in chars)
     coverage = substantive / page_count
-    text_extractable, ocr_flag, flags = text_class(
-        total, page_count, substantive, median_chars
-    )
+    text_extractable, ocr_flag, flags = text_class(total, page_count, substantive, median_chars)
 
     if extraction_error_pages:
         flags.append(f"PAGE_TEXT_EXTRACTION_ERROR:{len(extraction_error_pages)}")
@@ -452,9 +661,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
     spec = PART_BY_TYPE[e.part_type]
     first_text = "\n".join(texts[:STRUCTURE_SCAN_PAGES])
     full_text = "\n".join(texts)
-    structure, exp_first, exp_any, detected, sflags = structure_class(
-        spec, first_text, full_text
-    )
+    structure, exp_first, exp_any, detected, sflags = structure_class(spec, first_text, full_text)
     flags += sflags
 
     if size < MIN_FILE_BYTES:
@@ -465,9 +672,7 @@ def audit_file(e: ExpectedFile) -> QcResult:
         recommendation = "BLOCKED"
     else:
         status = (
-            "PASS"
-            if not flags and text_extractable == "YES" and structure == "YES"
-            else "REVIEW"
+            "PASS" if not flags and text_extractable == "YES" and structure == "YES" else "REVIEW"
         )
         recommendation = "ELIGIBLE" if status == "PASS" else "MANUAL_REVIEW"
 
@@ -557,14 +762,23 @@ def write_csv(path: Path, rows: Iterable[Dict[str, Any]], fields: Sequence[str])
 
 
 def make_summary(
-    results: List[QcResult], expected: List[ExpectedFile], unexpected: List[str],
-    duplicates: Dict[str, List[str]], mode: str, project_root: Path, corpus_root: Path,
+    results: List[QcResult],
+    expected: List[ExpectedFile],
+    unexpected: List[str],
+    duplicates: Dict[str, List[str]],
+    mode: str,
+    project_root: Path,
+    corpus_root: Path,
     manifest: Optional[Path],
 ) -> Dict[str, Any]:
     status = {x: sum(r.file_qc_status == x for r in results) for x in ("PASS", "REVIEW", "FAIL")}
     text = {x: sum(r.text_extractable == x for r in results) for x in ("YES", "PARTIAL", "NO")}
-    ocr = {x: sum(r.ocr_dependency_flag == x for r in results) for x in ("NO", "POSSIBLE", "REQUIRED")}
-    structure = {x: sum(r.structure_ok == x for r in results) for x in ("YES", "REVIEW", "NO", "PENDING")}
+    ocr = {
+        x: sum(r.ocr_dependency_flag == x for r in results) for x in ("NO", "POSSIBLE", "REQUIRED")
+    }
+    structure = {
+        x: sum(r.structure_ok == x for r in results) for x in ("YES", "REVIEW", "NO", "PENDING")
+    }
     per_doc: Dict[str, Dict[str, Any]] = {}
     for r in results:
         d = per_doc.setdefault(r.doc_id, {"expected": 0, "pass": 0, "review": 0, "fail": 0})
@@ -618,56 +832,132 @@ def make_summary(
 def run(args: argparse.Namespace) -> Tuple[List[QcResult], Dict[str, Any], Path]:
     project_root = Path(args.project_root).resolve()
     corpus_root = Path(args.corpus_root)
-    corpus_root = (project_root / corpus_root).resolve() if not corpus_root.is_absolute() else corpus_root.resolve()
+    corpus_root = (
+        (project_root / corpus_root).resolve()
+        if not corpus_root.is_absolute()
+        else corpus_root.resolve()
+    )
     if not corpus_root.exists():
         raise FileNotFoundError(f"Corpus root tidak ditemukan: {corpus_root}")
     if not inside(corpus_root, project_root) and not args.allow_external_corpus_root:
-        raise RuntimeError("corpus_root di luar project_root; gunakan --allow-external-corpus-root jika disengaja")
+        raise RuntimeError(
+            "corpus_root di luar project_root; gunakan --allow-external-corpus-root jika disengaja"
+        )
     selected = {x.strip() for x in (args.doc_id or []) if x.strip()}
     manifest: Optional[Path] = None
     if args.manifest:
         manifest = Path(args.manifest)
-        manifest = (project_root / manifest).resolve() if not manifest.is_absolute() else manifest.resolve()
+        manifest = (
+            (project_root / manifest).resolve()
+            if not manifest.is_absolute()
+            else manifest.resolve()
+        )
         expected, unexpected = expected_manifest(manifest, project_root, corpus_root, selected)
         mode = "manifest"
     else:
         expected, unexpected = expected_contract(corpus_root, project_root, selected)
         mode = "contract"
+    overrides, override_path = load_structure_overrides(
+        args.structure_overrides,
+        project_root,
+    )
+
     results = [audit_file(x) for x in expected]
+
+    applied_overrides = apply_structure_overrides(
+        results,
+        overrides,
+    )
+
+    # Duplicate detection tetap dijalankan SESUDAH manual structure
+    # override sehingga duplicate anomaly tetap dapat menurunkan PASS
+    # kembali menjadi REVIEW.
     duplicates = apply_duplicates(results)
-    summary = make_summary(results, expected, unexpected, duplicates, mode, project_root, corpus_root, manifest)
+
+    summary = make_summary(
+        results,
+        expected,
+        unexpected,
+        duplicates,
+        mode,
+        project_root,
+        corpus_root,
+        manifest,
+    )
+
+    summary["structure_overrides"] = {
+        "path": (str(override_path) if override_path else None),
+        "sha256": (sha256_file(override_path) if override_path else None),
+        "configured_count": len(overrides),
+        "configured_file_ids": sorted(overrides),
+        "applied_count": len(applied_overrides),
+        "applied_file_ids": sorted(applied_overrides),
+    }
+
+    if override_path:
+        summary["policy"].append(
+            "Manual structure overrides are explicit, SHA-bound, "
+            "structure-only, and fail closed on integrity/text/OCR anomalies."
+        )
 
     output_root = Path(args.output_dir)
-    output_root = (project_root / output_root).resolve() if not output_root.is_absolute() else output_root.resolve()
+    output_root = (
+        (project_root / output_root).resolve()
+        if not output_root.is_absolute()
+        else output_root.resolve()
+    )
     run_dir = output_root / (args.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
     rows = [asdict(x) for x in results]
     fields = list(rows[0].keys())
     write_csv(run_dir / "qc_report.csv", rows, fields)
-    write_csv(run_dir / "qc_review_queue.csv", [r for r in rows if r["file_qc_status"] != "PASS"], fields)
-    (run_dir / "qc_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(
+        run_dir / "qc_review_queue.csv", [r for r in rows if r["file_qc_status"] != "PASS"], fields
+    )
+    (run_dir / "qc_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     c = summary["counts"]
     s = c["status"]
     print("\nCorpus PDF-QC Summary\n---------------------")
-    print(f"QC spec           : {SPEC_VERSION}\nMode              : {mode}\nExpected files    : {c['expected_files']}")
-    print(f"Found / Missing   : {c['found_files']} / {c['missing_files']}\nTotal pages       : {c['total_pages']}")
+    print(
+        f"QC spec           : {SPEC_VERSION}\nMode              : {mode}\nExpected files    : {c['expected_files']}"
+    )
+    print(
+        f"Found / Missing   : {c['found_files']} / {c['missing_files']}\nTotal pages       : {c['total_pages']}"
+    )
     print(f"PASS/REVIEW/FAIL  : {s['PASS']}/{s['REVIEW']}/{s['FAIL']}")
-    print(f"Unexpected PDFs   : {c['unexpected_pdf_count']}\nDuplicate groups  : {c['duplicate_hash_groups']}")
-    print(f"Docs all-core PASS: {c['docs_all_core_pass']}/{c['docs_total']}\nOutput            : {run_dir}")
+    print(
+        f"Unexpected PDFs   : {c['unexpected_pdf_count']}\nDuplicate groups  : {c['duplicate_hash_groups']}"
+    )
+    print(
+        f"Docs all-core PASS: {c['docs_all_core_pass']}/{c['docs_total']}\nOutput            : {run_dir}"
+    )
     return results, summary, run_dir
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Read-only Automated PDF-QC for Corpus v1 (no OCR, no RAG ingest).")
+    p = argparse.ArgumentParser(
+        description="Read-only Automated PDF-QC for Corpus v1 (no OCR, no RAG ingest)."
+    )
     p.add_argument("--project-root", default=".")
     p.add_argument("--corpus-root", default="data_raw/corpus_v1")
-    p.add_argument("--manifest", default=None, help="Optional CSV export dari Corpus v1 - File Manifest")
-    p.add_argument("--doc-id", action="append", default=None, help="Batasi ke Doc ID tertentu; dapat diulang")
+    p.add_argument(
+        "--manifest", default=None, help="Optional CSV export dari Corpus v1 - File Manifest"
+    )
+    p.add_argument(
+        "--doc-id", action="append", default=None, help="Batasi ke Doc ID tertentu; dapat diulang"
+    )
     p.add_argument("--output-dir", default="runs/corpus_qc")
     p.add_argument("--run-name", default=None)
     p.add_argument("--allow-external-corpus-root", action="store_true")
     p.add_argument("--fail-on-qc", action="store_true", help="Exit 2 jika ada REVIEW/FAIL/anomali")
+    p.add_argument(
+        "--structure-overrides",
+        default=None,
+        help=("Optional JSON ledger untuk explicit SHA-bound " "manual structure overrides."),
+    )
     return p
 
 
@@ -681,7 +971,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.fail_on_qc:
         c = summary["counts"]
         s = c["status"]
-        if c["missing_files"] or s["REVIEW"] or s["FAIL"] or c["unexpected_pdf_count"] or c["duplicate_hash_groups"]:
+        if (
+            c["missing_files"]
+            or s["REVIEW"]
+            or s["FAIL"]
+            or c["unexpected_pdf_count"]
+            or c["duplicate_hash_groups"]
+        ):
             return 2
     return 0
 
