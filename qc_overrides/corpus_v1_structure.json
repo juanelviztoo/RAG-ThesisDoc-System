@@ -1,0 +1,41 @@
+{
+  "override_spec_version": "1.0",
+  "overrides": [
+    {
+      "file_id": "UNS_INF_M0515011__BAB_5",
+      "sha256": "4925e8450b12d85dee17c8b035223eb72a69cf144408fcab3c5a3e3f7a68abcf",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Manual visual inspection confirms this is the canonical BAB V file. The source document contains an author/source typo 'BAB IV PENUTUP', while section numbering 5.1 Kesimpulan and 5.2 Saran confirms BAB V content."
+    },
+    {
+      "file_id": "UNS_INF_M0518027__BAB_1",
+      "sha256": "98e173b176e87e40627aa5c422b8c696f337425683d752efdfb4207db90d17b0",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Visual inspection confirms BAB I; the decorative BAB I heading is absent from the text layer while substantive narrative text is fully extractable."
+    },
+    {
+      "file_id": "UNS_INF_M0518027__BAB_2",
+      "sha256": "f553cf908334038a36d4507d8580a690156b777703eef3395caea7f8803ba0c5",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Visual inspection confirms BAB II; the decorative BAB II heading is absent from the text layer while substantive narrative text is fully extractable."
+    },
+    {
+      "file_id": "UNS_INF_M0518027__BAB_3",
+      "sha256": "2f63dcb5286232e4bd9353456f44ef89ed8ef5b8d1f7d1d65a8c28fea773646f",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Visual inspection confirms BAB III; the decorative BAB III heading is absent from the text layer while substantive narrative text is fully extractable."
+    },
+    {
+      "file_id": "UNS_INF_M0518027__BAB_4",
+      "sha256": "f415971917c81642a50f4f4cc12b3344f19347490a28ebc3b619af1fc79211cc",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Visual inspection confirms BAB IV; the decorative BAB IV heading is absent from the text layer while substantive narrative text is fully extractable."
+    },
+    {
+      "file_id": "UNS_INF_M0518027__BAB_5",
+      "sha256": "d76db6997cdacfeb36d23dcbc2b40460e86d1dd506126e6dce5308df95926cdf",
+      "decision": "ACCEPT_STRUCTURE",
+      "reason": "Visual inspection confirms BAB V; the decorative BAB V heading is absent from the text layer while substantive narrative text is fully extractable."
+    }
+  ]
+}
