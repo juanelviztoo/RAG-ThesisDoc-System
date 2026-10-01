@@ -1,0 +1,39 @@
+{
+  "plan_version": "0.1",
+  "doc_id": "UNS_INF_M0518007",
+  "decision": "OCR_DOMINANT_CONTROLLED_FALLBACK",
+  "rationale": "Raw QC found 36/36 core pages OCR-dependent across 6/6 core parts. No same-subfield RESERVE_V1 exists for Expert System because the Open Access stratum is full-inclusion; controlled full OCR is required to preserve corpus coverage.",
+  "copy_unlisted_parts": true,
+  "parts": {
+    "BAB_1": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire core part contains rasterized narrative text."
+    },
+    "BAB_2": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire core part contains rasterized narrative text."
+    },
+    "BAB_3": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire core part contains rasterized narrative text."
+    },
+    "BAB_4": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire core part contains rasterized narrative text."
+    },
+    "BAB_5": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire core part contains rasterized narrative text."
+    },
+    "DAFTAR_PUSTAKA": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "Entire bibliography part contains rasterized citation text."
+    }
+  }
+}
