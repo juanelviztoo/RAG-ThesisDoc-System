@@ -36,6 +36,12 @@
       "sha256": "d76db6997cdacfeb36d23dcbc2b40460e86d1dd506126e6dce5308df95926cdf",
       "decision": "ACCEPT_STRUCTURE",
       "reason": "Visual inspection confirms BAB V; the decorative BAB V heading is absent from the text layer while substantive narrative text is fully extractable."
+    },
+    {
+    "file_id": "UNS_INF_M0518007__BAB_5",
+    "sha256": "2ca15b2a4a8a248b61b16a8cd1d8415d730a4ae2290b5d9997c908104be626a9",
+    "decision": "ACCEPT_STRUCTURE",
+    "reason": "Manual visual inspection confirms this OCR-derived file is the canonical BAB V. The visible page heading is 'BAB 5' followed by 'PENUTUP', with sections 5.1 Kesimpulan and 5.2 Saran. The OCR text layer misrecognized only the heading token 'BAB 5' as 'BABS'; substantive narrative text is fully extractable and no OCR dependency remains."
     }
   ]
 }
