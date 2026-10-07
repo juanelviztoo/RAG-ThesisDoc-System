@@ -1,0 +1,14 @@
+{
+  "plan_version": "0.1",
+  "doc_id": "UNS_INF_M0516004",
+  "decision": "SELECTIVE_OCR",
+  "rationale": "Raw Batch 4 QC found BAB II fully rasterized: 22/22 BAB II pages contain no substantive machine-readable narrative text, while BAB I, III, IV, V, and Daftar Pustaka are healthy born-digital parts. OCR burden is 22/73 core pages (30.14%) across 1/6 core parts, below the OCR-dominant threshold. Selective full-part OCR of BAB II preserves the original thesis and corpus coverage.",
+  "copy_unlisted_parts": true,
+  "parts": {
+    "BAB_2": {
+      "pages": "all",
+      "mode": "redo",
+      "reason": "All 22 BAB II pages contain rasterized narrative text; the existing text layer consists essentially only of Digital Library watermark text."
+    }
+  }
+}
